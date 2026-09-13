@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Archives
+*.zip
+
+# Local agent / dev tooling
+.pi/
+.claude/
+.codex/
+.codex-plugin/
+.cursor/
+.windsurf/
+.aider*
+.continue/
+.copilot/
+
+# Local dev notes & agent-specific files
+CLAUDE.md
+GEMINI.md
+AGENTS.local.md
+*.local.md
+TODO.md
+NOTES.md
+.work/

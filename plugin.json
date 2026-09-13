@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "subagent-pi",
+  "version": "0.1.0",
+  "description": "Persistent Pi coding subagents for Codex: bounded inspection, steering, interruption and recovery through MCP and CLI.",
+  "license": "MIT",
+  "keywords": ["pi", "subagent", "codex", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Subagent Pi",
+        "shortDescription": "Control persistent Pi coding subagents",
+        "longDescription": "Local Linux/WSL2 Pi RPC workers with a shared MCP/CLI runtime, durable results and a minimal skill. No hooks.",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "defaultPrompt": ["Use Subagent Pi to delegate a bounded task in the current workspace."]
+      }
+    }
+  }
+}

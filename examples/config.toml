@@ -1,0 +1,36 @@
+# Copy to ~/.local/state/subagent-pi/config.toml, or $PI_AGENTS_HOME/config.toml.
+# Restart the daemon after changing configuration. Never store secrets in a repository.
+# pi_command = ["/absolute/path/to/pi"]
+max_resident_agents = 4
+max_agents_per_scope = 16
+rpc_timeout_seconds = 20
+startup_timeout_seconds = 30
+default_run_timeout_seconds = 1800
+max_wait_seconds = 600
+event_max_count_per_agent = 20000
+
+[profiles.default]
+ambient_extensions = false
+ambient_skills = false
+extensions = []
+skills = []
+tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
+# model = "provider/model-id"
+# provider = "your-provider"
+# thinking = "medium"
+
+[profiles.reader]
+ambient_extensions = false
+ambient_skills = false
+extensions = []
+skills = []
+tools = ["read", "grep", "find", "ls"]
+
+# Optional explicitly selected provider extension. It runs trusted code.
+# [profiles.custom-provider]
+# ambient_extensions = false
+# ambient_skills = false
+# extensions = ["/home/you/.pi/agent/extensions/provider.ts"]
+# skills = []
+# tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
+# model = "your-provider/your-model"

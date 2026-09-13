@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "subagent-pi": {
+      "command": "subagent-pi",
+      "args": ["mcp"]
+    }
+  }
+}
