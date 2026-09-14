@@ -256,6 +256,16 @@ def _tool_policy(server: dict, name: str) -> tuple[dict, list[Diagnostic]]:
     return {'default': default, 'tools': tools, 'denied': sorted(denied), 'budgets': budgets}, diagnostics
 
 
+def _num_field(server: dict, key: str, default: float, maximum: float = 3600) -> tuple[float, list[Diagnostic]]:
+    """Floating-point seconds: current Codex accepts 0.5/1.5-style timeout values."""
+    value = server.get(key, default)
+    diagnostics: list[Diagnostic] = []
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0 or value > maximum:
+        diagnostics.append(Diagnostic('mcp', server.get('name', '?'), f'invalid {key}; using default'))
+        return default, diagnostics
+    return value, diagnostics
+
+
 def _int_field(server: dict, key: str, default: int, maximum: int = 3600) -> tuple[int, list[Diagnostic]]:
     value = server.get(key, default)
     diagnostics: list[Diagnostic] = []
@@ -379,7 +389,7 @@ def parse_mcp_servers(codex_home: Path, raw: dict, protocol_mode: str = 'auto') 
             diagnostics.extend(pdiag)
             if server.get('startup_timeout_sec') is not None:
                 # sec wins over ms when both are present (current Codex semantics)
-                timeout, tdiag = _int_field(server, 'startup_timeout_sec', 10)
+                timeout, tdiag = _num_field(server, 'startup_timeout_sec', 10)
                 entry['startup_timeout_sec'] = timeout
                 if server.get('startup_timeout_ms') is not None:
                     diagnostics.append(Diagnostic('mcp', name,
@@ -389,17 +399,12 @@ def parse_mcp_servers(codex_home: Path, raw: dict, protocol_mode: str = 'auto') 
                 ms, mdiag = _int_field(server, 'startup_timeout_ms', 10000, maximum=3600000)
                 entry['startup_timeout_sec'] = ms / 1000
                 diagnostics.extend(mdiag)
-            tool_timeout, ttdiag = _int_field(server, 'tool_timeout_sec', 60)
+            tool_timeout, ttdiag = _num_field(server, 'tool_timeout_sec', 60)
             entry['tool_timeout_sec'] = tool_timeout
             entry['tool_output_limits'] = policy['budgets']
             diagnostics.extend(ttdiag)
             if is_http:
                 entry['protocol_mode'] = protocol_mode if protocol_mode in ('auto', 'legacy_2025_06_18', 'modern_2026_07_28') else 'auto'
-            else:
-                entry['protocol_mode'] = 'legacy_2025_06_18'
-                if protocol_mode == 'modern_2026_07_28':
-                    diagnostics.append(Diagnostic('mcp', name,
-                                                  'stdio uses legacy 2025-06-18; modern requires the CODEX_MCP_PROTOCOL_VERSION env opt-in, which managed children do not forward'))
             if is_http:
                 entry['transport'] = 'http'
                 url = server['url']
@@ -438,6 +443,21 @@ def parse_mcp_servers(codex_home: Path, raw: dict, protocol_mode: str = 'auto') 
                         raise AgentError('invalid_argument', f"env_vars source=remote ({ref.get('name')}) requires remote executor")
                     else:
                         raise AgentError('invalid_argument', 'env_vars entries must be names')
+                # CODEX_MCP_PROTOCOL_VERSION is a Codex CLIENT-side protocol
+                # selection marker: consume it here to pick the stdio era and never
+                # forward it to the server process (current Codex removes the marker
+                # from the env before spawning the MCP server).
+                marker = env_static.get('CODEX_MCP_PROTOCOL_VERSION')
+                env_static = {k: v for k, v in env_static.items() if k != 'CODEX_MCP_PROTOCOL_VERSION'}
+                if marker is not None and marker != '2026-07-28':
+                    raise AgentError('invalid_argument',
+                                     f'unsupported CODEX_MCP_PROTOCOL_VERSION {marker!r} (only 2026-07-28 is supported)')
+                if marker == '2026-07-28' and protocol_mode == 'legacy_2025_06_18':
+                    diagnostics.append(Diagnostic('mcp', name,
+                                                  'global protocol_mode legacy_2025_06_18 keeps this stdio server on the 2025-06-18 handshake; the Codex modern opt-in marker is stripped and not forwarded'))
+                entry['protocol_mode'] = ('legacy_2025_06_18'
+                                          if marker != '2026-07-28' or protocol_mode == 'legacy_2025_06_18'
+                                          else 'modern_2026_07_28')
                 cwd = server.get('cwd')
                 if cwd is not None:
                     if not isinstance(cwd, str) or not cwd.strip():

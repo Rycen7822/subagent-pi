@@ -69,6 +69,9 @@ if DYNAMIC and DYN_FILE:
         with open(DYN_FILE, 'w') as f:
             f.write(DYN_NAME)
 event('server-start', pid=os.getpid())
+# P1-A evidence: the Codex client-side protocol marker must be consumed by the
+# parent and NEVER reach the server process env.
+event('env-marker', present=str('CODEX_MCP_PROTOCOL_VERSION' in os.environ))
 TOOLS = [t for t in base_tools() if t['name'] not in TOOLS_HIDDEN]
 if DYNAMIC:
     TOOLS = TOOLS + [{
@@ -170,7 +173,9 @@ for raw in sys.stdin:
     elif method == 'notifications/initialized':
         event('initialized-received')
     elif method == 'tools/list':
-        event('tools-list-received', count=list_count + 1)
+        _meta = req.get('params', {}).get('_meta') or {}
+        event('tools-list-received', count=list_count + 1,
+              modern_meta=_meta.get('io.modelcontextprotocol/protocolVersion'))
         page = tools_page(req.get('params', {}).get('cursor'))
         if MODE == 'close_stdin_after_list':
             # Deterministic EPIPE: the catalog answer goes out first, so the

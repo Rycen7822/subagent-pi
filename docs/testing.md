@@ -21,6 +21,8 @@ bridge 主机测试（tests/test_bridge_host.py + tests/bridge_host.mjs）用 ji
 
 上述核心回归均做过红-绿验证：对未修复实现运行会失败，对修复后代码通过。
 
+0.2.6 回归：modern stdio opt-in（首 RPC=tools/list 携带 modern _meta、server 进程 env 无 marker、unknown marker fail-closed 且不启动进程）、HTTP 400 era 分类（legacy400 回退 / modern400 保持 modern / 无共同版本拒绝 / 401/403/429/503 不降级，副作用 count 0 或 1）、嵌套 x-mcp-header 路径、`=?base64?…?=` 值编码与非 ASCII `Mcp-Name`（strict server 解码后与 body 一致）。
+
 0.2.5 回归：schema 注解 x-mcp-header（strict modern server 校验实收 Mcp-Param-* 与 body 不变）、并发提交下 proxy 串行（server 端 start/end 顺序）、confirm 挂起期间进程死亡（exit/EPIPE，逐进程首 RPC 必为 initialize、副作用恰一次）。
 
 协议一致性夹具（0.2.4）：`fake_mcp_http.py` 提供 strict modern 2026-07-28 模式（缺

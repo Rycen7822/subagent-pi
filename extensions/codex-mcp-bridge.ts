@@ -48,32 +48,84 @@ interface ToolMeta {
 // x-mcp-header (MCP 2026-07-28): a tool may declare that a plain
 // string/integer/boolean argument is mirrored into an HTTP header. The plan is
 // computed once from the inputSchema at discovery and kept in memory only.
-type HeaderPlan = { ok: true; entries: { param: string; header: string }[] } | { ok: false; reason: string };
+type HeaderPlanEntry = { path: string[]; header: string; type: "string" | "integer" | "boolean" };
+type HeaderPlan = { ok: true; entries: HeaderPlanEntry[] } | { ok: false; reason: string };
 const HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const HEADER_DYNAMIC_KEYS = ["items", "oneOf", "anyOf", "allOf", "not", "if", "then", "else", "$ref", "dependentSchemas", "patternProperties"];
+const HEADER_MAX_DEPTH = 8;
+const HEADER_MAX_NODES = 256;
 function parseHeaderPlan(schema: unknown): HeaderPlan {
-  const entries: { param: string; header: string }[] = [];
+  const entries: HeaderPlanEntry[] = [];
   const seen = new Set<string>();  // header names, lower-cased for case-insensitive uniqueness
-  if (typeof schema !== "object" || schema === null) return { ok: true, entries };
-  const properties = (schema as { properties?: unknown }).properties;
-  if (properties === undefined) return { ok: true, entries };
-  if (typeof properties !== "object" || properties === null) return { ok: false, reason: "inputSchema.properties is not an object" };
-  for (const [param, def] of Object.entries(properties as Record<string, unknown>)) {
-    if (typeof def !== "object" || def === null || !("x-mcp-header" in (def as object))) continue;
-    const why = (reason: string): HeaderPlan => ({ ok: false, reason: `property '${param}': ${reason}` });
-    const annotation = (def as Record<string, unknown>)["x-mcp-header"];
-    if (typeof annotation !== "string" || !annotation) return why("x-mcp-header annotation must be a non-empty string");
-    if (!HEADER_TOKEN.test(annotation)) return why("x-mcp-header annotation is not a valid HTTP token");
-    if (seen.has(annotation.toLowerCase())) return why(`x-mcp-header '${annotation}' duplicates an earlier header (case-insensitive)`);
-    for (const key of HEADER_DYNAMIC_KEYS) {
-      if (key in (def as Record<string, unknown>)) return why(`x-mcp-header does not support '${key}' dynamic paths`);
+  let nodes = 0;
+  // Reachable annotations are found by walking ONLY through properties chains.
+  const legalWalk = (node: unknown, path: string[], depth: number): string | null => {
+    if (++nodes > HEADER_MAX_NODES) return `inputSchema exceeds the x-mcp-header walker limit (${HEADER_MAX_NODES} nodes)`;
+    if (depth > HEADER_MAX_DEPTH) return `property '${path.join(".")}' exceeds the maximum nesting depth (${HEADER_MAX_DEPTH})`;
+    if (typeof node !== "object" || node === null) return null;
+    const properties = (node as { properties?: unknown }).properties;
+    if (properties === undefined) return null;
+    if (typeof properties !== "object" || properties === null) return `property '${path.join(".")}': properties is not an object`;
+    for (const [param, def] of Object.entries(properties as Record<string, unknown>)) {
+      if (typeof def !== "object" || def === null) continue;
+      const here = [...path, param];
+      if ("x-mcp-header" in def) {
+        const why = (reason: string): string => `property '${here.join(".")}': ${reason}`;
+        const annotation = (def as Record<string, unknown>)["x-mcp-header"];
+        if (typeof annotation !== "string" || !annotation) return why("x-mcp-header annotation must be a non-empty string");
+        if (!HEADER_TOKEN.test(annotation)) return why("x-mcp-header annotation is not a valid HTTP token");
+        if (seen.has(annotation.toLowerCase())) return why(`x-mcp-header '${annotation}' duplicates an earlier header (case-insensitive)`);
+        const type = (def as Record<string, unknown>).type;
+        if (type !== "string" && type !== "integer" && type !== "boolean") return why("x-mcp-header requires type string, integer or boolean");
+        seen.add(annotation.toLowerCase());
+        entries.push({ path: here, header: annotation, type });
+      }
+      const nested = legalWalk(def, here, depth + 1);
+      if (nested) return nested;
     }
-    const type = (def as Record<string, unknown>).type;
-    if (type !== "string" && type !== "integer" && type !== "boolean") return why("x-mcp-header requires type string, integer or boolean");
-    seen.add(annotation.toLowerCase());
-    entries.push({ param, header: annotation });
+    return null;
+  };
+  // The full scan counts EVERY annotation in the schema. More annotations than
+  // the properties-chain walk collected means one sits under a dynamic position
+  // (items/oneOf/anyOf/allOf/not/if/then/else/$ref/dependentSchemas/patternProperties).
+  const countAnnotations = (root: unknown): number => {
+    let count = 0;
+    const stack = [root];
+    while (stack.length > 0) {
+      if (++nodes > HEADER_MAX_NODES * 2) return Number.POSITIVE_INFINITY;  // budget shared with the legal walk
+      const cur = stack.pop();
+      if (Array.isArray(cur)) { stack.push(...cur); continue; }
+      if (typeof cur !== "object" || cur === null) continue;
+      for (const [k, v] of Object.entries(cur as Record<string, unknown>)) {
+        if (k === "x-mcp-header") count += 1;
+        else stack.push(v);
+      }
+    }
+    return count;
+  };
+  if (typeof schema !== "object" || schema === null) return { ok: true, entries };
+  const legalError = legalWalk(schema, [], 0);
+  if (legalError) return { ok: false, reason: legalError };
+  if (countAnnotations(schema) > entries.length) {
+    return { ok: false, reason: "x-mcp-header annotation under an unsupported dynamic path (only plain properties chains are supported)" };
   }
   return { ok: true, entries };
+}
+// MCP 2026-07-28 header value encoding: plain visible ASCII (plus interior
+// SP/HTAB, no leading/trailing whitespace) is sent as-is; anything else —
+// non-ASCII, control characters, edge whitespace, or a value that already
+// looks like the Base64 sentinel — travels as `=?base64?<Base64 UTF-8>?=`.
+// This is also the CRLF-injection defense: unsafe bytes never hit the wire raw.
+const MCP_BASE64_SENTINEL = /^=\?base64\?[A-Za-z0-9+/]+={0,2}\?=$/;
+function encodeMcpHeaderValue(value: string): string {
+  let plain = value.length > 0;
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i);
+    if ((c < 0x20 && c !== 0x09) || c > 0x7e || c === 0x7f ||
+        ((c === 0x20 || c === 0x09) && (i === 0 || i === value.length - 1))) { plain = false; break; }
+  }
+  if (plain && !MCP_BASE64_SENTINEL.test(value)) return value;
+  return `=?base64?${Buffer.from(value, "utf8").toString("base64")}?=`;
 }
 interface Bootstrap {
   v: number;
@@ -86,6 +138,7 @@ const MAX_PAYLOAD = 8 * 1024 * 1024;
 const MAX_RESULT_TEXT = 256 * 1024;
 const MAX_LINE = 1024 * 1024;
 const MAX_SCHEMA_BYTES = 64 * 1024;
+const MAX_ERROR_BODY = 64 * 1024;  // non-2xx JSON-RPC error bodies, era classification only
 const MAX_PAGES = 20;
 const MAX_TOOLS = 512;
 const BASE_ENV = ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"];
@@ -153,7 +206,7 @@ function readBootstrap(): { payload?: Bootstrap; error?: string } {
 
 interface JsonRpcResponse { id?: number | string | null; result?: unknown; error?: { code: number; message: string } }
 
-function toToolMeta(raw: unknown): ToolMeta | null {
+function toToolMeta(raw: unknown, mirrorHeaders: boolean): ToolMeta | null {
   if (typeof raw !== "object" || raw === null) return null;
   const t = raw as { name?: unknown; description?: unknown; annotations?: { readOnlyHint?: unknown }; inputSchema?: unknown };
   if (typeof t.name !== "string" || !t.name) return null;
@@ -167,17 +220,25 @@ function toToolMeta(raw: unknown): ToolMeta | null {
     description: typeof t.description === "string" ? t.description.slice(0, 200) : undefined,
     readOnly: t.annotations?.readOnlyHint === true,
     inputSchema: schema,
-    headerPlan: parseHeaderPlan(schema),
+    // stdio never parses or enforces x-mcp-header: an HTTP-only annotation must
+    // not take a stdio tool out of the catalog.
+    headerPlan: mirrorHeaders ? parseHeaderPlan(schema) : { ok: true, entries: [] },
   };
 }
 
 abstract class McpConnection {
   toolsCache: ToolMeta[] | null = null;
   catalogTruncated = false;
+  protected mirrorHeaders: boolean = false;  // HTTP-only: stdio tools ignore x-mcp-header entirely
   private catalogEpoch = 0; // bump on list_changed so an in-flight crawl never repopulates an invalidated cache
   protected invalidateCatalog(): void {
     this.toolsCache = null;
     this.catalogEpoch += 1;
+  }
+  /** MCP 2026-07-28: every request self-describes via _meta (no handshake). */
+  protected withMeta(params: unknown): unknown {
+    const base = (typeof params === "object" && params !== null ? params : {}) as Record<string, unknown>;
+    return { ...base, _meta: { ...((base._meta ?? {}) as Record<string, unknown>), ...MODERN_META } };
   }
   abstract get dead(): boolean;
   /** False when the next explicit operation must build a fresh connection (closed, or legacy session expired). */
@@ -185,7 +246,7 @@ abstract class McpConnection {
   abstract request(method: string, params: unknown, timeoutSec: number, opts?: { notification?: boolean; signal?: AbortSignal }): Promise<unknown>;
   abstract initialize(): Promise<void>;
   abstract callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal,
-                     headerPlan?: { param: string; header: string }[]): Promise<unknown>;
+                     headerPlan?: HeaderPlanEntry[]): Promise<unknown>;
   abstract close(): void;
   async ensureTools(cfg: ServerCfg, signal?: AbortSignal): Promise<ToolMeta[]> {
     // Cached in memory; catalogTruncated records a bound-stopped crawl instead of
@@ -206,7 +267,7 @@ abstract class McpConnection {
       }
       for (const tool of result?.tools ?? []) {
         if (collected.length >= MAX_TOOLS) { this.catalogTruncated = true; break; }
-        const meta = toToolMeta(tool);
+        const meta = toToolMeta(tool, this.mirrorHeaders);
         if (meta) collected.push(meta);
       }
       cursor = typeof result?.nextCursor === "string" && result.nextCursor ? result.nextCursor : undefined;
@@ -227,9 +288,14 @@ class StdioConnection extends McpConnection {
   private generation = 0;
   private closed = false;
   private stdinBroken = false;
+  private readonly modern: boolean;
   exitError: string | null = null;
 
-  constructor(private cfg: ServerCfg) { super(); }
+  constructor(private cfg: ServerCfg) {
+    super();
+    this.mirrorHeaders = false;  // header mirroring is an HTTP-transport feature
+    this.modern = this.cfg.protocol_mode === "modern_2026_07_28";
+  }
 
   get dead(): boolean {
     return this.closed || this.proc === null || this.exitError !== null;
@@ -352,8 +418,9 @@ class StdioConnection extends McpConnection {
                 opts: { notification?: boolean; signal?: AbortSignal } = {}): Promise<unknown> {
     if (opts.signal?.aborted) throw new CancelledError(false);
     this.ensureProcess();
+    const wireParams = this.modern ? this.withMeta(params) : params;
     if (opts.notification) {
-      this.sendFrame({ jsonrpc: "2.0", method, params });  // no pending entry; async EPIPE is the stdin listener's job
+      this.sendFrame({ jsonrpc: "2.0", method, params: wireParams });  // no pending entry; async EPIPE is the stdin listener's job
       return null;
     }
     const id = this.nextId++;
@@ -368,7 +435,7 @@ class StdioConnection extends McpConnection {
     });
     try {
       // settle the pending entry synchronously, or the rejection would hang until timeout
-      this.sendFrame({ jsonrpc: "2.0", id, method, params });
+      this.sendFrame({ jsonrpc: "2.0", id, method, params: wireParams });
     } catch (err) {
       const entry = this.pending.get(id);
       if (entry) { this.pending.delete(id); clearTimeout(entry.timer); }
@@ -397,9 +464,13 @@ class StdioConnection extends McpConnection {
   }
 
   async initialize(): Promise<void> {
-    // Managed children never forward the CODEX_MCP_PROTOCOL_VERSION env opt-in, so
-    // stdio stays on the legacy handshake; a modern-only stdio server must fail loudly.
-    if (this.cfg.protocol_mode === "modern_2026_07_28") throw new Error("modern 2026-07-28 requires streamable HTTP; managed stdio servers stay on legacy 2025-06-18");
+    if (this.modern) {
+      // 2026-07-28 stdio: stateless — no initialize handshake; every request is
+      // self-describing via _meta. The CODEX_MCP_PROTOCOL_VERSION opt-in was
+      // consumed by the parent, which strips it from the server's env.
+      await this.request("tools/list", {}, this.cfg.startup_timeout_sec);  // readiness probe warms the catalog
+      return;
+    }
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
@@ -432,13 +503,29 @@ const ABORT_DEADLINE = Symbol("deadline");
 // Modern (2026-07-28): stateless — no handshake, every request self-describes via
 // _meta and the MCP-Protocol-Version / Mcp-Method / Mcp-Name headers.
 const MODERN_VERSION = "2026-07-28";
-const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.5" };
+const MODERN_UNSUPPORTED_CODE = -32022;  // recognized modern JSON-RPC error: UnsupportedProtocolVersionError
+const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.6" };
 const MODERN_META = {
   "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
   "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
   "io.modelcontextprotocol/clientCapabilities": {},
 };
 class StaleSessionError extends Error { constructor(m: string) { super(m); this.name = "StaleSessionError"; } }
+/** In-band JSON-RPC error (HTTP 200 body or SSE frame). */
+class RpcError extends Error {
+  constructor(public code: number, message: string, public data?: unknown) {
+    super(`server error ${code}: ${message.slice(0, 300)}`);
+    this.name = "RpcError";
+  }
+}
+/** HTTP-level failure carrying the parsed JSON-RPC error body, when one existed. */
+class HttpRpcError extends Error {
+  constructor(public status: number, public jsonRpcCode: number | null,
+              public jsonRpcData: unknown, public bodyParsed: boolean, url: string) {
+    super(`HTTP ${status} from ${url}`);
+    this.name = "HttpRpcError";
+  }
+}
 const ABORT_USER = Symbol("user");
 const ABORT_CLOSED = Symbol("closed");
 
@@ -451,15 +538,10 @@ class HttpConnection extends McpConnection {
   private stale = false;  // legacy session expired (HTTP 404); re-initialize on the next explicit operation
   private negotiatedVersion: string | null = null;
 
-  constructor(private cfg: ServerCfg) { super(); }
+  constructor(private cfg: ServerCfg) { super(); this.mirrorHeaders = true; }
 
   get dead(): boolean { return this.closed; }
   get reusable(): boolean { return !this.closed && !this.stale; }
-
-  private withMeta(params: unknown): unknown {
-    const base = (typeof params === "object" && params !== null ? params : {}) as Record<string, unknown>;
-    return { ...base, _meta: { ...((base._meta ?? {}) as Record<string, unknown>), ...MODERN_META } };
-  }
 
   private headers(method?: string, toolName?: string, httpMethod = "POST",
                   paramHeaders?: Record<string, string>): Record<string, string> {
@@ -475,7 +557,7 @@ class HttpConnection extends McpConnection {
       // headers let gateways route and authorize without parsing JSON bodies.
       headers["mcp-protocol-version"] = MODERN_VERSION;
       if (method) headers["mcp-method"] = method;
-      if (method === "tools/call" && toolName) headers["mcp-name"] = toolName;
+      if (method === "tools/call" && toolName) headers["mcp-name"] = encodeMcpHeaderValue(toolName);
     } else {
       if (this.negotiatedVersion) headers["mcp-protocol-version"] = this.negotiatedVersion;  // negotiated at initialize
       if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
@@ -528,7 +610,7 @@ class HttpConnection extends McpConnection {
             msg = JSON.parse(data) as JsonRpcResponse;
           } catch { continue; } // keepalive/comment-ish line
           if (msg.id === id) {
-            if (msg.error) throw new Error(`server error ${msg.error.code}: ${msg.error.message.slice(0, 300)}`);
+            if (msg.error) throw new RpcError(msg.error.code, msg.error.message);
             return msg.result;
           }
         }
@@ -573,7 +655,7 @@ class HttpConnection extends McpConnection {
           this.stale = true;
           throw new StaleSessionError(`MCP session expired (HTTP 404)${sent ? "; the sent request's outcome is unknown" : ""}; the next explicit operation re-initializes`);
         }
-        throw new Error(`HTTP ${response.status} from ${redactUrl(this.cfg.url ?? "")}`);
+        throw await this.classifyHttpError(response);
       }
       if (this.mode === "legacy") {
         const session = response.headers.get("mcp-session-id");
@@ -583,7 +665,7 @@ class HttpConnection extends McpConnection {
       const contentType = response.headers.get("content-type") ?? "";
       if (contentType.includes("text/event-stream")) return await this.parseSse(response, id);
       const msg = await this.readBoundedJson(response, MAX_RESULT_TEXT) as JsonRpcResponse;
-      if (msg.error) throw new Error(`server error ${msg.error.code}: ${msg.error.message.slice(0, 300)}`);
+      if (msg.error) throw new RpcError(msg.error.code, msg.error.message);
       return msg.result;
     } catch (err) {
       // classify by WHO aborted; sent requests keep an outcome-unknown wording
@@ -634,34 +716,73 @@ class HttpConnection extends McpConnection {
   }
 
   private async probeModern(): Promise<boolean> {
+    // Era detection happens ONLY on the side-effect-free server/discover. A
+    // modern server that cannot talk to us answers HTTP 400 carrying a
+    // recognized modern JSON-RPC error (UnsupportedProtocolVersionError);
+    // an unrecognized or legacy-style 400, 404 or 405 proves the endpoint is
+    // legacy-only. Auth/rate-limit/5xx failures are errors, never downgrade
+    // triggers, and a sent tools/call is never replayed either way.
     try {
       await this.request("server/discover", {}, this.cfg.startup_timeout_sec);
       return true;
     } catch (err) {
-      const m = (err as Error).message;
-      if (m.startsWith("HTTP 404 ") || m.startsWith("HTTP 405 ") || m.includes("server error -32601")) return false;
+      if (err instanceof HttpRpcError) {
+        if (err.status !== 400 && err.status !== 404 && err.status !== 405) throw err;
+        if (err.jsonRpcCode === MODERN_UNSUPPORTED_CODE) {
+          const supported = Array.isArray((err.jsonRpcData as { supported?: unknown } | null)?.supported)
+            ? (err.jsonRpcData as { supported: unknown[] }).supported.map(String) : [];
+          if (!supported.includes(MODERN_VERSION)) {
+            throw new Error(`server only supports modern protocol versions [${supported.join(", ") || "none listed"}]; ` +
+              `this bridge speaks ${MODERN_VERSION} — no common modern version, refusing to guess`);
+          }
+          return true;  // recognized modern server: stay modern, never fall back to legacy initialize
+        }
+        return false;  // unrecognized/legacy-style error body: legacy proof
+      }
+      if (err instanceof RpcError && err.code === -32601) return false;  // HTTP 200 + method-not-found
       throw err;
     }
   }
 
+  private async classifyHttpError(response: Response): Promise<Error> {
+    // The error body is read with a strict byte cap and used ONLY to classify
+    // the protocol era and produce a precise diagnostic; it is never logged.
+    const url = redactUrl(this.cfg.url ?? "");
+    let body: unknown;
+    let parsed = false;
+    try {
+      body = await this.readBoundedJson(response, MAX_ERROR_BODY);
+      parsed = true;
+    } catch { /* not JSON, or over the cap */ }
+    const rpc = (body && typeof body === "object" ? (body as { error?: unknown }).error : undefined) as
+      { code?: unknown; message?: unknown; data?: unknown } | undefined;
+    if (rpc && typeof rpc.code === "number") {
+      return new HttpRpcError(response.status, rpc.code, rpc.data, true, url);
+    }
+    return new HttpRpcError(response.status, null, null, parsed, url);
+  }
+
   async callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal,
-                 headerPlan?: { param: string; header: string }[]): Promise<unknown> {
+                 headerPlan?: HeaderPlanEntry[]): Promise<unknown> {
     let paramHeaders: Record<string, string> | undefined;
     if (this.mode === "modern" && headerPlan && headerPlan.length > 0) {
-      // Mirror only declared, plain-typed arguments; the body keeps every argument.
+      // Mirror only declared, plain-typed arguments, read by schema path; the
+      // body keeps every argument unchanged and an absent argument produces no header.
       paramHeaders = {};
-      const a = (typeof args === "object" && args !== null ? args : {}) as Record<string, unknown>;
       for (const entry of headerPlan) {
-        const value = a[entry.param];
-        if (value === undefined) continue;  // an absent argument produces no header
-        if (typeof value === "number" && !Number.isSafeInteger(value)) {
-          throw new Error(`argument ${entry.param} is not a safe integer; refusing to mirror it as a header`);
+        let node: unknown = args;
+        let reachable = true;
+        for (const seg of entry.path) {
+          if (typeof node !== "object" || node === null) { reachable = false; break; }
+          node = (node as Record<string, unknown>)[seg];
         }
-        const s = String(value);
-        if (/[\r\n\x00-\x1F\x7F]/.test(s)) {
-          throw new Error(`argument ${entry.param} contains control characters; refusing to mirror it as a header`);
-        }
-        paramHeaders[`Mcp-Param-${entry.header}`] = s;
+        if (!reachable || node === undefined) continue;
+        const bad = (why: string): Error =>
+          new Error(`argument ${entry.path.join(".")} ${why}; refusing to mirror it as a header`);
+        if (entry.type === "boolean" && typeof node !== "boolean") throw bad("is not a boolean");
+        if (entry.type === "integer" && !(typeof node === "number" && Number.isSafeInteger(node))) throw bad("is not a safe integer");
+        if (entry.type === "string" && typeof node !== "string") throw bad("is not a string");
+        paramHeaders[`Mcp-Param-${entry.header}`] = encodeMcpHeaderValue(String(node));
       }
       if (Object.keys(paramHeaders).length === 0) paramHeaders = undefined;
     }

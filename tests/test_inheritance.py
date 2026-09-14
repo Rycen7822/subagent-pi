@@ -171,6 +171,78 @@ class McpParsing(unittest.TestCase):
         self.home=make_codex_home(self.base)
     def tearDown(self): self.tmp.cleanup()
     def parse(self,config): return parse_mcp_servers(self.home,tomllib.loads(config))
+    def test_stdio_modern_opt_in_selects_modern_and_strips_marker(self):
+        config='''
+[mcp_servers.a]
+command = "srv"
+[mcp_servers.a.env]
+CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"
+API_KEY = "k"
+'''
+        servers,diag=self.parse(config)
+        self.assertEqual(len(servers),1)
+        s=servers[0]
+        self.assertEqual(s['protocol_mode'],'modern_2026_07_28')
+        self.assertNotIn('CODEX_MCP_PROTOCOL_VERSION',s['static_env'])  # marker consumed, never forwarded
+        self.assertEqual(s['static_env'],{'API_KEY':'k'})
+        self.assertTrue(all('legacy' not in d.reason for d in diag))
+
+    def test_stdio_without_marker_stays_legacy_and_env_is_untouched(self):
+        config='''
+[mcp_servers.a]
+command = "srv"
+[mcp_servers.a.env]
+API_KEY = "k"
+'''
+        servers,diag=self.parse(config)
+        self.assertEqual(servers[0]['protocol_mode'],'legacy_2025_06_18')
+        self.assertEqual(servers[0]['static_env'],{'API_KEY':'k'})
+
+    def test_stdio_unknown_marker_fails_closed(self):
+        config='''
+[mcp_servers.a]
+command = "srv"
+required = false
+[mcp_servers.a.env]
+CODEX_MCP_PROTOCOL_VERSION = "1999-01-01"
+'''
+        servers,diag=self.parse(config)
+        self.assertEqual([s['disposition'] for s in servers],['failed'])
+        self.assertTrue(any('CODEX_MCP_PROTOCOL_VERSION' in d.reason for d in diag))
+        # the failed entry never becomes a server env, so the process cannot start
+        self.assertTrue(all('CODEX_MCP_PROTOCOL_VERSION' not in json.dumps(s) or s.get('disposition')=='failed' for s in servers))
+
+    def test_stdio_marker_stripped_even_under_global_legacy_override(self):
+        config='''
+[mcp_servers.a]
+command = "srv"
+[mcp_servers.a.env]
+CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"
+'''
+        servers,diag=parse_mcp_servers(self.home,tomllib.loads(config),'legacy_2025_06_18')
+        self.assertEqual(servers[0]['protocol_mode'],'legacy_2025_06_18')  # global override wins for the era
+        self.assertNotIn('CODEX_MCP_PROTOCOL_VERSION',servers[0]['static_env'])  # but the marker is still stripped
+        self.assertTrue(any('legacy_2025_06_18 keeps this stdio server' in d.reason for d in diag))
+
+    def test_timeout_fields_accept_floating_point_seconds(self):
+        config='''
+[mcp_servers.a]
+command = "srv"
+startup_timeout_sec = 1.5
+tool_timeout_sec = 0.5
+'''
+        servers,diag=self.parse(config)
+        self.assertEqual(servers[0]['startup_timeout_sec'],1.5)
+        self.assertEqual(servers[0]['tool_timeout_sec'],0.5)
+        config2='''
+[mcp_servers.a]
+command = "srv"
+tool_timeout_sec = "soon"
+'''
+        servers2,diag2=self.parse(config2)
+        self.assertEqual(servers2[0]['tool_timeout_sec'],60)
+        self.assertTrue(any('invalid tool_timeout_sec' in d.reason for d in diag2))
+
     def test_stdio_fields_normalized(self):
         servers,diag=self.parse(STDIO_TOML)
         self.assertEqual(len(servers),1)

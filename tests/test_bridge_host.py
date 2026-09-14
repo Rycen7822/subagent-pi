@@ -3,6 +3,7 @@ extensions, driven against local fake stdio/HTTP MCP servers. No Pi process,
 no model call, no disk cache. Skipped (with a documented reason) when the
 installed Pi distribution or node is unavailable."""
 from __future__ import annotations
+import base64
 import json
 import os
 import shutil
@@ -880,7 +881,7 @@ class XMcHeaderTests(BridgeHostCase):
         self.assertEqual(by['c']['kind'], 'result')  # the server itself stays usable
         self.assertEqual([e for e in self.h.events(srv['events']) if e['event'] == 'strict-rejected'], [])
 
-    def test_unsafe_integer_and_control_values_are_rejected_client_side(self):
+    def test_unsafe_integer_is_refused_and_control_value_is_encoded(self):
         srv = self.h.start_http('modern')
         res = self.h.run_host([self.http_cfg(srv)], [
             {'name': 'n', 'action': 'call', 'server': 'web', 'tool': 'hdr',
@@ -889,8 +890,9 @@ class XMcHeaderTests(BridgeHostCase):
              'args': {'trace_id': 'a\nb'}}], access='write')['results']
         by = {r['step']: r for r in res}
         self.assertEqual(by['n']['kind'], 'error'); self.assertIn('safe integer', by['n']['message'])
-        self.assertEqual(by['s']['kind'], 'error'); self.assertIn('control characters', by['s']['message'])
-        self.assertEqual(self.h.calls(srv['log']), [])  # neither call reached the server
+        self.assertEqual(self.h.calls(srv['log']), ['hdr:{"trace_id": "a\\nb"}'])  # only the encoded call was sent
+        check = next(e for e in self.h.events(srv['events']) if e['event'] == 'hdr-check')
+        self.assertTrue(check['match'])  # the newline value arrived as a decoded sentinel, body unchanged
 
     def test_legacy_connection_ignores_the_plan(self):
         srv = self.h.start_http('legacy_only')  # auto falls back to the legacy handshake
@@ -955,8 +957,9 @@ class StdioGenerationTests(BridgeHostCase):
         ev = self.h.events(srv['events'])
         starts = [i for i, e in enumerate(ev) if e['event'] == 'server-start']
         self.assertEqual(len(starts), 2)
-        for idx in starts:  # the first RPC of every new process is initialize
-            self.assertEqual(ev[idx + 1]['event'], 'initialize-received')
+        for idx in starts:  # the first RPC of every new process is initialize (env-marker is not an RPC)
+            self.assertEqual(next(e['event'] for e in ev[idx + 1:] if e['event'] != 'env-marker'),
+                             'initialize-received')
         return ev
 
     def test_confirm_pending_process_exit_no_respawn(self):
@@ -997,3 +1000,163 @@ class StdioGenerationTests(BridgeHostCase):
         self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
         self.assertEqual(len(self.h.calls(srv['log'])), 1)
         self._assert_every_process_rehandshakes(srv)
+
+
+class StdioEraTests(BridgeHostCase):
+    """P1-A: the CODEX_MCP_PROTOCOL_VERSION marker selects the stdio era and is
+    consumed client-side; the server process never sees it."""
+    prefix = 'stdio-era-'
+
+    def test_modern_stdio_first_rpc_is_list_with_meta_and_marker_never_reaches_server(self):
+        srv = self.h.start_stdio()
+        cfg = stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')
+        out = self.h.run_host([cfg], [
+            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
+        ], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        evs = self.h.events(srv['events'])
+        first_method = next(e['event'] for e in evs
+                            if e['event'] in ('initialize-received', 'tools-list-received', 'initialized-received'))
+        self.assertEqual(first_method, 'tools-list-received')  # no legacy initialize handshake
+        self.assertEqual(next(e for e in evs if e['event'] == 'tools-list-received')['modern_meta'], '2026-07-28')
+        self.assertNotIn('initialize-received', [e['event'] for e in evs])
+        marker = next(e for e in evs if e['event'] == 'env-marker')
+        self.assertEqual(marker['present'], 'False')  # the server process env is clean
+
+    def test_legacy_stdio_first_rpc_is_initialize_and_env_is_clean(self):
+        srv = self.h.start_stdio()
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
+            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
+        ], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        evs = self.h.events(srv['events'])
+        first_method = next(e['event'] for e in evs
+                            if e['event'] in ('initialize-received', 'tools-list-received'))
+        self.assertEqual(first_method, 'initialize-received')
+        self.assertEqual(next(e for e in evs if e['event'] == 'env-marker')['present'], 'False')
+
+
+class HttpEraTests(BridgeHostCase):
+    """P1-B: HTTP era classification reads the bounded JSON-RPC error body."""
+    prefix = 'http-era-'
+
+    def test_legacy400_body_falls_back_to_initialize(self):
+        srv = self.h.start_http('normal', extra={'FAKE_MCP_DISCOVER_REJECT': 'legacy400'})
+        out = self.h.run_host([self.http_cfg(srv)], [
+            {'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        evs = self.h.events(srv['events'])
+        rejected = [e for e in evs if e['event'] == 'discover-rejected']
+        self.assertEqual([e['status'] for e in rejected], [400])  # legacy-style 400 body
+        self.assertIn('initialize-received', [e['event'] for e in evs])  # legal legacy fallback
+        self.assertEqual(self.h.calls(srv['log']), ['search:{"query": "x"}'])  # side effect exactly once
+
+    def test_modern400_unsupported_version_stays_modern(self):
+        srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_REJECT': 'modern400'})
+        out = self.h.run_host([self.http_cfg(srv)], [
+            {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
+            access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        evs = self.h.events(srv['events'])
+        self.assertEqual([e['status'] for e in evs if e['event'] == 'discover-rejected'], [400])
+        self.assertNotIn('initialize-received', [e['event'] for e in evs])  # never fell back to legacy
+        self.assertEqual(self.h.calls(srv['log']), ['publish:{"body": "b"}'])  # side effect exactly once
+
+    def test_modern400_no_common_version_is_an_incompatibility(self):
+        srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_REJECT': 'modern400_nocommon'})
+        out = self.h.run_host([self.http_cfg(srv)], [
+            {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
+            access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')
+        self.assertIn('no common modern version', out[0]['message'])
+        self.assertNotIn('initialize-received', [e['event'] for e in self.h.events(srv['events'])])
+        self.assertEqual(self.h.calls(srv['log']), [])  # side-effect count 0: no fallback, no replay
+
+    def test_auth_and_rate_limit_status_never_downgrade_the_era(self):
+        for status in ('401', '403', '429', '503'):
+            with self.subTest(status=status):
+                srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_REJECT': status})
+                out = self.h.run_host([self.http_cfg(srv)], [
+                    {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
+                    access='write')['results']
+                self.assertEqual(out[0]['kind'], 'error', status)
+                self.assertIn(f'HTTP {status}', out[0]['message'], status)
+                evs = self.h.events(srv['events'])
+                self.assertEqual([e['status'] for e in evs if e['event'] == 'discover-rejected'], [int(status)])
+                self.assertNotIn('initialize-received', [e['event'] for e in evs])  # not a downgrade trigger
+                self.assertEqual(self.h.calls(srv['log']), [])
+
+
+class HeaderE2eTests(BridgeHostCase):
+    """P1-C: nested x-mcp-header paths, 2026-07-28 value encoding, Mcp-Name."""
+    prefix = 'hdr-e2e-'
+
+    def test_nested_header_path_reaches_the_server_and_body_is_unchanged(self):
+        srv = self.h.start_http('modern')
+        args = {'context': {'region': 'us-west1'}, 'extra': 'keep'}
+        out = self.h.run_host([self.http_cfg(srv)], [
+            {'action': 'call', 'server': 'web', 'tool': 'hdr_nested', 'args': args}], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        evs = self.h.events(srv['events'])
+        check = next(e for e in evs if e['event'] == 'hdr-check')
+        self.assertEqual(check['header'], 'mcp-param-region')
+        self.assertEqual(check['decoded'], 'us-west1')  # plain ASCII travels raw
+        self.assertTrue(check['match'])
+        call = next(e for e in evs if e['event'] == 'call-received')
+        self.assertEqual(call['args'], args)  # the body keeps every argument unchanged
+
+    def test_header_values_are_encoded_per_the_2026_spec(self):
+        srv = self.h.start_http('modern')
+        cases = [('trace_id', 'Hello, 世界'), ('trace_id', ' padded '), ('trace_id', 'line1\nline2'),
+                 ('trace_id', '=?base64?literal?='), ('flag', True), ('count', -5)]
+        steps = [{'name': f's{i}', 'action': 'call', 'server': 'web', 'tool': 'hdr',
+                  'args': {k: v}} for i, (k, v) in enumerate(cases)]
+        out = self.h.run_host([self.http_cfg(srv)], steps, access='write')['results']
+        for i, r in enumerate(out):
+            self.assertEqual(r['kind'], 'result', f'case {i}: {r.get("message")}')
+        checks = [e for e in self.h.events(srv['events']) if e['event'] == 'hdr-check']
+        self.assertEqual(len(checks), len(cases))
+        for c in checks:
+            self.assertTrue(c['match'], c)  # strict server decoded the sentinel and matched the body value
+        non_plain = {c['decoded'] for c in checks} >= {'Hello, 世界', ' padded ', 'line1\nline2', '=?base64?literal?='}
+        self.assertTrue(non_plain)
+
+    def test_mcp_name_is_encoded_for_non_ascii_tool_names(self):
+        srv = self.h.start_http('modern')
+        out = self.h.run_host([self.http_cfg(srv)], [
+            {'action': 'call', 'server': 'web', 'tool': '搜索', 'args': {}}], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        req = next(e for e in self.h.events(srv['events'])
+                   if e['event'] == 'request' and e['method'] == 'tools/call')
+        self.assertEqual(req['mcp_name_header'],
+                         '=?base64?' + base64.b64encode('搜索'.encode()).decode() + '?=')  # header is the sentinel
+        call = next(e for e in self.h.events(srv['events']) if e['event'] == 'call-received')
+        self.assertEqual(call['tool'], '搜索')  # the body keeps the raw name
+        self.assertNotIn('strict-rejected', [e['event'] for e in self.h.events(srv['events'])])
+
+    def test_runtime_type_mismatch_is_refused_before_sending(self):
+        srv = self.h.start_http('modern')
+        out = self.h.run_host([self.http_cfg(srv)], [
+            {'name': 's', 'action': 'call', 'server': 'web', 'tool': 'hdr', 'args': {'trace_id': 123}},
+            {'name': 'b', 'action': 'call', 'server': 'web', 'tool': 'hdr', 'args': {'trace_id': 'x', 'flag': 'yes'}}],
+            access='write')['results']
+        by = {r['step']: r for r in out}
+        self.assertEqual(by['s']['kind'], 'error'); self.assertIn('is not a string', by['s']['message'])
+        self.assertEqual(by['b']['kind'], 'error'); self.assertIn('is not a boolean', by['b']['message'])
+        self.assertEqual(self.h.calls(srv['log']), [])  # neither mismatched call reached the server
+
+    def test_annotation_under_items_excludes_only_that_tool(self):
+        srv = self.h.start_http('modern', extra={'FAKE_MCP_HEADER_TOOLS': '1'})
+        out = self.h.run_host([self.http_cfg(srv)], [
+            {'name': 'l', 'action': 'list', 'server': 'web'},
+            {'name': 'd', 'action': 'describe', 'server': 'web', 'tool': 'badhdr_items_nested'},
+            {'name': 'c', 'action': 'call', 'server': 'web', 'tool': 'badhdr_items_nested', 'args': {}},
+            {'name': 'ok', 'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}],
+            access='write')['results']
+        by = {r['step']: r for r in out}
+        names = [t['name'] for t in json.loads(by['l']['text'])['tools']]
+        self.assertNotIn('badhdr_items_nested', names)  # excluded from the catalog
+        for step in ('d', 'c'):
+            self.assertEqual(by[step]['kind'], 'error', step)
+            self.assertIn('invalid x-mcp-header', by[step]['message'], step)
+        self.assertEqual(by['ok']['kind'], 'result')  # the server and its other tools stay usable

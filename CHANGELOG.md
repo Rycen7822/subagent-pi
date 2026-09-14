@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.6 — 2026-09-15
+
+Three MCP P1 fixes against review baseline a030a1d (0.2.5).
+
+- P1-A (modern stdio opt-in): `CODEX_MCP_PROTOCOL_VERSION` in a stdio server's
+  env is now consumed as the Codex client-side protocol marker — `2026-07-28`
+  selects the modern stateless stdio lifecycle (first RPC is `tools/list`
+  carrying modern `_meta`; no legacy initialize) — and is stripped from the
+  env forwarded to the server process. Unknown marker values fail the server
+  closed without starting any process; a global `legacy_2025_06_18` override
+  keeps the legacy handshake while still stripping the marker.
+- P1-B (HTTP era detection): non-2xx responses are parsed into a structured
+  error (status + JSON-RPC code/data, body capped at 64 KiB, never logged).
+  `auto` classifies a side-effect-free `server/discover` probe by the error
+  body: HTTP 400 with the recognized modern `UnsupportedProtocolVersionError`
+  (-32022) keeps modern (verifying `data.supported` contains `2026-07-28`,
+  else a clear incompatibility is reported); unrecognized/legacy-style 400,
+  404 and 405 prove legacy; 401/403/429/5xx never downgrade. No message
+  substring matching remains.
+- P1-C (header encoding + nested paths): `encodeMcpHeaderValue` implements the
+  2026-07-28 rule (plain visible ASCII as-is; non-ASCII, control characters,
+  edge whitespace and sentinel-shaped values as `=?base64?<Base64 UTF-8>?=`),
+  shared by `Mcp-Param-*` and `Mcp-Name`. `x-mcp-header` annotations are found
+  through nested properties chains (bounded depth/node walker); annotations
+  under dynamic positions invalidate only that tool. Runtime values are
+  type-checked against the declared schema before sending.
+- Startup/tool timeouts accept floating-point seconds (current Codex accepts
+  0.5/1.5-style values); sec-over-ms precedence unchanged.
+
+All new regressions run against the real TypeScript bridge with localhost fake
+servers (zero model calls); red-verified 13 failures on a030a1d.
+
 ## 0.2.5 — 2026-09-15
 
 Three P1 fixes, each red-verified against 04a46db.

@@ -107,14 +107,20 @@ not bypass this; renaming the binary itself is out of scope).
 
 ## The private channel and the child extension
 
-## MCP protocol compatibility (0.2.4)
+## MCP protocol compatibility (0.2.6)
 
 The HTTP transport supports two protocol eras, selected ONCE per deployment via
 `[inheritance] mcp_protocol_mode = "auto" | "legacy_2025_06_18" |
 "modern_2026_07_28"` (default `auto`) — never per call by the model. stdio
-servers stay on legacy: modern requires the upstream `CODEX_MCP_PROTOCOL_VERSION`
-env opt-in, which managed children never forward, so a modern-only stdio server
-fails loudly instead of silently misbehaving.
+follows the current Codex per-server opt-in: a server whose `env` carries
+`CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"` runs the modern stateless stdio
+lifecycle (no initialize handshake; every request self-describes via `_meta`).
+The marker is a CLIENT-side selection signal: the parent consumes it and never
+forwards it to the server process, exactly as Codex does. An unknown marker
+value fails the server closed (optional servers are excluded, required servers
+block readiness, and the process is never started). A global
+`legacy_2025_06_18` override keeps such servers on the legacy handshake while
+still stripping the marker.
 
 Legacy 2025-06-18: `initialize` NEGOTIATES the protocol version (the server's
 returned version is used on every later request via the `MCP-Protocol-Version`
@@ -128,18 +134,28 @@ Modern 2026-07-28: stateless — no handshake and no session id. Every request
 self-describes through `_meta` (`io.modelcontextprotocol/protocolVersion`,
 `clientInfo`, `clientCapabilities`) plus the `MCP-Protocol-Version` and
 `Mcp-Method` headers (`Mcp-Name` on `tools/call`). `auto` probes once with the
-side-effect-free `server/discover` and falls back to the legacy handshake ONLY
-on proof of legacy-only (HTTP 404/405 or JSON-RPC -32601 on that probe); a
-generic 4xx/5xx is an error, never a downgrade trigger. `x-mcp-header` is honored as a SCHEMA
+side-effect-free `server/discover` and classifies the outcome by the bounded
+JSON-RPC error BODY, never by message strings: HTTP 400 carrying the recognized
+modern `UnsupportedProtocolVersionError` (-32022) proves a modern server — the
+bridge stays modern when `data.supported` contains `2026-07-28` and reports a
+clear incompatibility otherwise, without falling back or replaying. An
+unrecognized or legacy-style 400, a 404 or a 405 prove legacy-only and trigger
+the handshake. 401/403/429/5xx are errors, never downgrade triggers. `x-mcp-header` is honored as a SCHEMA
 annotation: a tool may declare that a plain string/integer/boolean argument is
 mirrored into an `Mcp-Param-*` header on modern calls (body unchanged; absent
-arguments produce no header; unsafe integers and control-character values are
-refused). Annotations are validated at discovery (HTTP token, case-insensitive
-uniqueness, no dynamic paths); a tool with an invalid annotation is excluded
-and rejected by describe/call without failing the server. stdio and legacy
-connections ignore the annotation.
+arguments produce no header; runtime values are type-checked against the
+declared schema before anything is sent). Annotations may sit on nested
+properties chains (`arguments.parent.child`); an annotation under a dynamic
+position (items/oneOf/anyOf/allOf/not/if/then/else/$ref/…) invalidates just
+that tool. Header values follow the 2026-07-28 encoding: plain visible ASCII
+travels as-is; non-ASCII, control characters, edge whitespace and
+sentinel-shaped values are sent as `=?base64?<Base64 UTF-8>?=` — the same
+encoder applies to `Mcp-Name`. Annotations are validated at discovery (HTTP
+token, case-insensitive uniqueness, bounded walker depth/nodes); a tool with an
+invalid annotation is excluded and rejected by describe/call without failing
+the server. stdio and legacy connections ignore the annotation entirely.
 
-## Codex MCP config compatibility (0.2.4)
+## Codex MCP config compatibility (0.2.6)
 
 `subagent_pi/inheritance.py` keeps ONE declarative table
 (`MCP_FIELD_COMPAT`) classifying every current Codex `RawMcpServerConfig`
@@ -149,7 +165,8 @@ frozen upstream version string.
 - mapped: transport fields (`command/args/env/env_vars/cwd`,
   `url/auth/bearer_token_env_var/http_headers/env_http_headers`),
   `startup_timeout_sec`/`startup_timeout_ms` (sec wins when both present,
-  current Codex semantics), `tool_timeout_sec`, `enabled`, `required`,
+  current Codex semantics; floating-point seconds are accepted),
+  `tool_timeout_sec` (float accepted), `enabled`, `required`,
   `enabled_tools`, `disabled_tools`, `default_tools_approval_mode`,
   `tools.<n>.approval_mode`.
 

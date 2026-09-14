@@ -18,8 +18,12 @@ Modes (FAKE_MCP_HTTP_MODE):
 FAKE_MCP_SESSION_EXPIRE_AFTER=N: legacy mode; the N-th request that carries a
 session id gets HTTP 404 (expired session), later re-initialized sessions work.
 FAKE_MCP_HEADER_TOOLS=1: adds the x-mcp-header fixture tools (valid + invalid).
+FAKE_MCP_DISCOVER_REJECT: how server/discover fails, for era-detection tests:
+  legacy400|modern400|modern400_nocommon -> HTTP 400 with the matching JSON-RPC
+  error body; or a bare status code (401/403/429/503) with an empty body.
 """
 from __future__ import annotations
+import base64
 import json
 import os
 import sys
@@ -73,8 +77,47 @@ if os.environ.get('FAKE_MCP_HEADER_TOOLS') == '1':
          "inputSchema": {"type": "object", "properties": {"v": {"$ref": "#/definitions/x", "x-mcp-header": "r"}}}},
         {"name": "badhdr_oneof", "description": "oneOf dynamic path",
          "inputSchema": {"type": "object", "properties": {"v": {"oneOf": [{"type": "string"}], "x-mcp-header": "o"}}}},
+        {"name": "badhdr_items_nested", "description": "annotation under items.properties",
+         "inputSchema": {"type": "object", "properties": {"rows": {"type": "array", "items": {
+             "type": "object", "properties": {"name": {"type": "string", "x-mcp-header": "Row"}}}}}}},
     ]
 
+
+def decode_header_value(v):
+    """Mirror of the MCP 2026-07-28 client encoder: strict servers must decode
+    `=?base64?...?=` values before comparing them with the JSON body."""
+    if v.startswith('=?base64?') and v.endswith('?='):
+        try:
+            return base64.b64decode(v[len('=?base64?'):-2]).decode('utf-8')
+        except Exception:
+            return v
+    return v
+
+
+TOOLS = TOOLS + [
+    {"name": "hdr_nested", "description": "Nested header-mirroring tool",
+     "inputSchema": {"type": "object", "properties": {
+         "context": {"type": "object", "properties": {
+             "region": {"type": "string", "x-mcp-header": "Region"}}}}},
+     "annotations": {"readOnlyHint": True}},
+    {"name": "搜索", "description": "Non-ASCII tool name",
+     "inputSchema": {"type": "object", "properties": {}},
+     "annotations": {"readOnlyHint": True}},
+]
+
+DISCOVER_REJECT = None
+_reject = os.environ.get('FAKE_MCP_DISCOVER_REJECT')
+if _reject:
+    def _err(code, supported=None):
+        err = {"code": code, "message": "unsupported protocol version"}
+        if supported is not None:
+            err["data"] = {"supported": supported}
+        return {"jsonrpc": "2.0", "id": 0, "error": err}
+    DISCOVER_REJECT = {
+        'legacy400': (400, _err(-32601)),
+        'modern400': (400, _err(-32022, ["2026-07-28", "2025-06-18"])),
+        'modern400_nocommon': (400, _err(-32022, ["1999-01-01"])),
+    }.get(_reject) or (int(_reject), None)
 
 STATE = {'session_counter': 0, 'expire_counter': 0}
 
@@ -116,6 +159,17 @@ class Handler(BaseHTTPRequestHandler):
               mcp_name_header=self.headers.get('mcp-name'),
               session=self.headers.get('mcp-session-id'),
               has_modern_meta=(MODERN_META_KEY in (params.get('_meta') or {})))
+        if method == 'server/discover' and DISCOVER_REJECT:
+            status, errbody = DISCOVER_REJECT
+            data = json.dumps({**errbody, 'id': rid}).encode() if errbody else b''
+            self.send_response(status)
+            self.send_header('content-type', 'application/json')
+            self.send_header('content-length', str(len(data)))
+            self.end_headers()
+            if data:
+                self.wfile.write(data)
+            event('discover-rejected', status=status)
+            return
         if MODE == 'bad_status':
             self.send_response(503); self.send_header('content-length', '0'); self.end_headers(); return
 
@@ -128,7 +182,7 @@ class Handler(BaseHTTPRequestHandler):
             what = None
             if proto_header != MODERN_VERSION: what = 'MCP-Protocol-Version'
             elif self.headers.get('mcp-method') != method: what = 'Mcp-Method'
-            elif method == 'tools/call' and self.headers.get('mcp-name') != params.get('name'): what = 'Mcp-Name'
+            elif method == 'tools/call' and decode_header_value(self.headers.get('mcp-name') or '') != params.get('name'): what = 'Mcp-Name'
             elif params.get('_meta', {}).get(MODERN_META_KEY) != MODERN_VERSION: what = 'modern _meta protocolVersion'
             if what:
                 event('strict-rejected', what=what)
@@ -165,8 +219,20 @@ class Handler(BaseHTTPRequestHandler):
             args = params.get('arguments') or {}
             if self._expired(): return
             log_call(f"{name}:{json.dumps(args, sort_keys=True)}")
-            event('call-received', tool=name, args=args,
-                  param_headers={k.lower(): v for k, v in self.headers.items() if k.lower().startswith('mcp-param-')})
+            raw_headers = {k.lower(): v for k, v in self.headers.items() if k.lower().startswith('mcp-param-')}
+            event('call-received', tool=name, args=args, param_headers=raw_headers)
+            if name in ('hdr', 'hdr_nested'):
+                expected = {'hdr': {'trace_id': 'mcp-param-trace-id', 'count': 'mcp-param-count', 'flag': 'mcp-param-x-flag'},
+                            'hdr_nested': {('context', 'region'): 'mcp-param-region'}}[name]
+                for path, header_key in expected.items():
+                    node = args
+                    for seg in (path if isinstance(path, tuple) else (path,)):
+                        node = node.get(seg) if isinstance(node, dict) else None
+                    if node is None:
+                        continue  # absent argument: no header expected
+                    decoded = decode_header_value(raw_headers.get(header_key, ''))
+                    expect = ('true' if node else 'false') if isinstance(node, bool) else str(node)
+                    event('hdr-check', header=header_key, decoded=decoded, body=node, match=decoded == expect)
             result = {"jsonrpc": "2.0", "id": rid,
                       "result": {"content": [{"type": "text", "text": f"handled {name} {args.get('body') or args.get('query') or ''}"}]}}
             if MODE in ('headers_then_hang', 'hang_body_json', 'modern_hang_json'):
