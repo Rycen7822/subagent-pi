@@ -19,8 +19,14 @@ FAKE_MCP_SESSION_EXPIRE_AFTER=N: legacy mode; the N-th request that carries a
 session id gets HTTP 404 (expired session), later re-initialized sessions work.
 FAKE_MCP_HEADER_TOOLS=1: adds the x-mcp-header fixture tools (valid + invalid).
 FAKE_MCP_DISCOVER_REJECT: how server/discover fails, for era-detection tests:
-  legacy400|modern400|modern400_nocommon -> HTTP 400 with the matching JSON-RPC
-  error body; or a bare status code (401/403/429/503) with an empty body.
+  legacy400|modern400|modern400_nocommon|mismatch400 (-32020)|capability400
+  (-32021) -> HTTP 400 with the matching JSON-RPC error body;
+  inband32020|inband32601 -> the same over HTTP 200;
+  or a bare status code (401/403/429/503) with an empty body.
+FAKE_MCP_DISCOVER_MALFORMED=1: server/discover replies a DiscoverResult without
+  resultType/supportedVersions.
+FAKE_MCP_REDIRECT_PLAN: '|'-separated '<status>:<target>' hops, consumed one
+  per POST; a target starting with '/' stays same-origin.
 """
 from __future__ import annotations
 import base64
@@ -105,6 +111,10 @@ TOOLS = TOOLS + [
      "annotations": {"readOnlyHint": True}},
 ]
 
+DISCOVER_MALFORMED = os.environ.get('FAKE_MCP_DISCOVER_MALFORMED') == '1'
+# Redirect plan: '|'-separated hops, consumed one per incoming POST; each entry
+# is '<status>:<target>' where a target starting with '/' stays same-origin.
+REDIRECT_PLAN = [h for h in os.environ.get('FAKE_MCP_REDIRECT_PLAN', '').split('|') if h]
 DISCOVER_REJECT = None
 _reject = os.environ.get('FAKE_MCP_DISCOVER_REJECT')
 if _reject:
@@ -117,13 +127,26 @@ if _reject:
         'legacy400': (400, _err(-32601)),
         'modern400': (400, _err(-32022, ["2026-07-28", "2025-06-18"])),
         'modern400_nocommon': (400, _err(-32022, ["1999-01-01"])),
+        'mismatch400': (400, _err(-32020)),            # HeaderMismatch: modern, no fallback
+        'capability400': (400, _err(-32021)),          # MissingRequiredClientCapability: modern, no fallback
+        'inband32020': (200, _err(-32020)),            # in-band modern error on HTTP 200
+        'inband32601': (200, _err(-32601)),            # in-band legacy-style method-not-found
     }.get(_reject) or (int(_reject), None)
 
-STATE = {'session_counter': 0, 'expire_counter': 0}
+STATE = {'session_counter': 0, 'expire_counter': 0, 'redirect_idx': 0, 'gets': 0}
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     def log_message(self, *a): pass
+
+    def do_GET(self):  # 301/302/303 redirect targets arrive as body-less GETs
+        event('get-received', path=self.path)
+        self.send_response(400)
+        body = b'{"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "fixture: GET not a JSON-RPC exchange"}}'
+        self.send_header('content-type', 'application/json')
+        self.send_header('content-length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _flush_headers(self, ctype, length=None, session=True, status=200, extra=None):
         self.send_response(status)
@@ -159,6 +182,16 @@ class Handler(BaseHTTPRequestHandler):
               mcp_name_header=self.headers.get('mcp-name'),
               session=self.headers.get('mcp-session-id'),
               has_modern_meta=(MODERN_META_KEY in (params.get('_meta') or {})))
+        if STATE['redirect_idx'] < len(REDIRECT_PLAN):
+            entry = REDIRECT_PLAN[STATE['redirect_idx']]
+            STATE['redirect_idx'] += 1
+            code, _, target = entry.partition(':')
+            self.send_response(int(code))
+            self.send_header('location', target)
+            self.send_header('content-length', '0')
+            self.end_headers()
+            event('redirect-sent', status=int(code), target=target)
+            return
         if method == 'server/discover' and DISCOVER_REJECT:
             status, errbody = DISCOVER_REJECT
             data = json.dumps({**errbody, 'id': rid}).encode() if errbody else b''
@@ -208,9 +241,12 @@ class Handler(BaseHTTPRequestHandler):
             reply({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-06-18",
                    "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-http", "version": "1.0"}}})
         elif method == 'server/discover':
-            reply({"jsonrpc": "2.0", "id": rid, "result": {
-                "serverInfo": {"name": "fake-http", "version": "1.0"},
-                "capabilities": {"tools": {"listChanged": False}}}}, session=False)
+            # Real 2026 DiscoverResult shape: resultType + supportedVersions.
+            result = ({"serverInfo": {"name": "fake-http", "version": "1.0"}} if DISCOVER_MALFORMED else
+                      {"resultType": "server", "supportedVersions": ["2026-07-28"],
+                       "serverInfo": {"name": "fake-http", "version": "1.0"},
+                       "capabilities": {"tools": {"listChanged": False}}})
+            reply({"jsonrpc": "2.0", "id": rid, "result": result}, session=False)
         elif method == 'tools/list':
             if self._expired(): return
             reply({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}, sse=True)

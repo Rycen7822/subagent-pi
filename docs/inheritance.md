@@ -1,4 +1,4 @@
-# Codex Inheritance for Managed Children (0.2.5)
+# Codex Inheritance for Managed Children (0.2.7)
 
 Managed subagents started by this plugin can use your Codex-side global skills
 and MCP servers. Normal `pi` sessions are never affected: inheritance is added
@@ -135,12 +135,17 @@ self-describes through `_meta` (`io.modelcontextprotocol/protocolVersion`,
 `clientInfo`, `clientCapabilities`) plus the `MCP-Protocol-Version` and
 `Mcp-Method` headers (`Mcp-Name` on `tools/call`). `auto` probes once with the
 side-effect-free `server/discover` and classifies the outcome by the bounded
-JSON-RPC error BODY, never by message strings: HTTP 400 carrying the recognized
-modern `UnsupportedProtocolVersionError` (-32022) proves a modern server — the
-bridge stays modern when `data.supported` contains `2026-07-28` and reports a
-clear incompatibility otherwise, without falling back or replaying. An
-unrecognized or legacy-style 400, a 404 or a 405 prove legacy-only and trigger
-the handshake. 401/403/429/5xx are errors, never downgrade triggers. `x-mcp-header` is honored as a SCHEMA
+JSON-RPC error BODY through one shared modern-error classifier (-32020
+HeaderMismatch, -32021 MissingRequiredClientCapability, -32022
+UnsupportedProtocolVersion — all modern, no initialize fallback; -32022
+additionally requires a common `data.supported` version, otherwise a clear
+incompatibility is reported without falling back or replaying). HTTP 200
+in-band JSON-RPC errors are classified by structured code too, and a successful
+discover must be a real DiscoverResult (`resultType` + `supportedVersions` with
+a common modern version); a malformed one is a protocol error, never a
+fallback. An unrecognized or legacy-style 400, a 404 or a 405 prove legacy-only
+and trigger the handshake. 401/403/429/5xx are errors, never downgrade triggers.
+`x-mcp-header` is honored as a SCHEMA
 annotation: a tool may declare that a plain string/integer/boolean argument is
 mirrored into an `Mcp-Param-*` header on modern calls (body unchanged; absent
 arguments produce no header; runtime values are type-checked against the

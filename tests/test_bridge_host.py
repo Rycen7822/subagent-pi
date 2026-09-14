@@ -1007,21 +1007,76 @@ class StdioEraTests(BridgeHostCase):
     consumed client-side; the server process never sees it."""
     prefix = 'stdio-era-'
 
-    def test_modern_stdio_first_rpc_is_list_with_meta_and_marker_never_reaches_server(self):
-        srv = self.h.start_stdio()
+    def test_modern_stdio_first_rpc_is_discover_with_meta_and_marker_never_reaches_server(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1'})
         cfg = stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')
         out = self.h.run_host([cfg], [
             {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
         ], access='write')['results']
         self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
         evs = self.h.events(srv['events'])
-        first_method = next(e['event'] for e in evs
-                            if e['event'] in ('initialize-received', 'tools-list-received', 'initialized-received'))
-        self.assertEqual(first_method, 'tools-list-received')  # no legacy initialize handshake
+        # Auto lifecycle: discover -> (modern confirmed) -> catalog list, never initialize
+        self.assertEqual(next(e for e in evs if e['event'] == 'first-method')['method'], 'server/discover')
+        self.assertEqual(next(e for e in evs if e['event'] == 'discover-received')['modern_meta'], '2026-07-28')
         self.assertEqual(next(e for e in evs if e['event'] == 'tools-list-received')['modern_meta'], '2026-07-28')
         self.assertNotIn('initialize-received', [e['event'] for e in evs])
         marker = next(e for e in evs if e['event'] == 'env-marker')
         self.assertEqual(marker['present'], 'False')  # the server process env is clean
+
+    def test_modern_stdio_falls_back_to_initialize_on_legacy_discover_error(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1',
+                                        'FAKE_MCP_DISCOVER_ERROR_CODE': '-32601'})
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')], [
+            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
+        ], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        evs = [e['event'] for e in self.h.events(srv['events'])]
+        # fallback order: discover (side-effect-free) -> full legacy handshake -> catalog
+        self.assertEqual(evs[evs.index('discover-received') + 1:][:3],
+                         ['initialize-received', 'initialized-received', 'tools-list-received'])
+
+    def test_modern_stdio_unsupported_version_without_common_fails_without_fallback(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1',
+                                        'FAKE_MCP_DISCOVER_ERROR_CODE': '-32022',
+                                        'FAKE_MCP_DISCOVER_SUPPORTED': '1999-01-01'})
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')], [
+            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
+        ], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')
+        self.assertIn('no common modern version', out[0]['message'])
+        self.assertNotIn('initialize-received', [e['event'] for e in self.h.events(srv['events'])])
+        self.assertEqual(self.h.calls(srv['log']), [])  # side-effect count 0
+
+    def test_modern_stdio_recognized_header_mismatch_keeps_modern(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1',
+                                        'FAKE_MCP_DISCOVER_ERROR_CODE': '-32020'})
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')], [
+            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
+        ], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))  # -32020 stays modern, no fallback
+        evs = [e['event'] for e in self.h.events(srv['events'])]
+        self.assertNotIn('initialize-received', evs)
+        self.assertIn('tools-list-received', evs)  # catalog list ran with modern _meta
+
+    def test_modern_stdio_malformed_discover_result_is_a_protocol_error(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1',
+                                        'FAKE_MCP_DISCOVER_MALFORMED': '1'})
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')], [
+            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
+        ], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')
+        self.assertIn('malformed DiscoverResult', out[0]['message'])
+        self.assertNotIn('initialize-received', [e['event'] for e in self.h.events(srv['events'])])
+        self.assertEqual(self.h.calls(srv['log']), [])
+
+    def test_strict_fixture_rejects_a_legacy_first_rpc(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1'})
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [  # legacy cfg: first RPC is initialize
+            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
+        ], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')  # the fixture bit: the process exited
+        self.assertEqual(next(e for e in self.h.events(srv['events'])
+                              if e['event'] == 'first-method')['method'], 'initialize')
 
     def test_legacy_stdio_first_rpc_is_initialize_and_env_is_clean(self):
         srv = self.h.start_stdio()
@@ -1061,6 +1116,41 @@ class HttpEraTests(BridgeHostCase):
         self.assertEqual([e['status'] for e in evs if e['event'] == 'discover-rejected'], [400])
         self.assertNotIn('initialize-received', [e['event'] for e in evs])  # never fell back to legacy
         self.assertEqual(self.h.calls(srv['log']), ['publish:{"body": "b"}'])  # side effect exactly once
+
+    def test_recognized_modern_errors_32020_and_32021_keep_modern(self):
+        for reject, label in (('mismatch400', 'http400'), ('capability400', 'http400'), ('inband32020', 'http200')):
+            with self.subTest(reject=reject):
+                srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_REJECT': reject})
+                out = self.h.run_host([self.http_cfg(srv)], [
+                    {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
+                    access='write')['results']
+                self.assertEqual(out[0]['kind'], 'result', f'{reject}: {out[0].get("message")}')
+                evs = [e['event'] for e in self.h.events(srv['events'])]
+                self.assertNotIn('initialize-received', evs)  # recognized modern error: initialize_count 0
+                self.assertEqual(self.h.calls(srv['log']), [f'publish:{{"body": "b"}}'])  # exactly once
+
+    def test_inband_legacy_32601_falls_back_to_initialize(self):
+        # legacy-mode server: it refuses discover in-band AND accepts the
+        # initialize fallback (a modern-only server could not serve the fallback)
+        srv = self.h.start_http('normal', extra={'FAKE_MCP_DISCOVER_REJECT': 'inband32601'})
+        out = self.h.run_host([self.http_cfg(srv)], [
+            {'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        evs = [e['event'] for e in self.h.events(srv['events'])]
+        self.assertEqual([e['method'] for e in self.h.events(srv['events']) if e['event'] == 'request'
+                          and e['method'] == 'initialize'].count('initialize'), 1)  # initialize_count 1
+        self.assertEqual(self.h.calls(srv['log']), ['search:{"query": "x"}'])
+
+    def test_malformed_discover_result_is_a_protocol_error_not_a_fallback(self):
+        srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_MALFORMED': '1'})
+        out = self.h.run_host([self.http_cfg(srv)], [
+            {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
+            access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')
+        self.assertIn('malformed DiscoverResult', out[0]['message'])
+        evs = [e['event'] for e in self.h.events(srv['events'])]
+        self.assertNotIn('initialize-received', evs)  # no fallback
+        self.assertEqual(self.h.calls(srv['log']), [])  # side-effect count 0
 
     def test_modern400_no_common_version_is_an_incompatibility(self):
         srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_REJECT': 'modern400_nocommon'})
@@ -1160,3 +1250,80 @@ class HeaderE2eTests(BridgeHostCase):
             self.assertEqual(by[step]['kind'], 'error', step)
             self.assertIn('invalid x-mcp-header', by[step]['message'], step)
         self.assertEqual(by['ok']['kind'], 'result')  # the server and its other tools stay usable
+
+
+class RedirectTests(BridgeHostCase):
+    """P1-B: redirects are followed manually, same-origin only; no header or
+    body is ever transmitted before the target origin is verified."""
+    prefix = 'redirect-'
+
+    @staticmethod
+    def _events_of(h, srv):
+        try:
+            return h.events(srv['events'])
+        except Exception:
+            return []  # no request ever arrived, so the fake wrote no log
+
+    def test_cross_origin_307_never_sends_secret_headers_or_tool_body(self):
+        b = self.h.start_http('modern')
+        a = self.h.start_http('modern', extra={'FAKE_MCP_REDIRECT_PLAN': f"307:{b['url']}"})
+        out = self.h.run_host([
+            self.http_cfg(a, headers={'X-API-Key': 'canary-secret'}),
+        ], [{'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'canary-body'},
+             'confirm': True}], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')
+        self.assertIn('cross-origin redirect', out[0]['message'])
+        self.assertIn('no headers or body were sent', out[0]['message'])
+        self.assertEqual(self._events_of(self.h, b), [])  # B received ZERO requests
+        self.assertEqual(self.h.calls(b['log']), [])  # tool body canary never reached B
+        self.assertEqual(self.h.calls(a['log']), [])  # A redirected before executing anything
+        self.assertEqual([e for e in self._events_of(self.h, a) if e['event'] == 'redirect-sent'][0]['status'], 307)
+
+    def test_same_origin_307_redirect_completes_and_executes_once(self):
+        a = self.h.start_http('modern', extra={'FAKE_MCP_REDIRECT_PLAN': '307:/mcp2'})
+        out = self.h.run_host([self.http_cfg(a)], [
+            {'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        self.assertEqual(self.h.calls(a['log']), ['search:{"query": "x"}'])  # executed exactly once, not replayed
+        self.assertEqual(len([e for e in self.h.events(a['events']) if e['event'] == 'redirect-sent']), 1)
+
+    def test_second_hop_cross_origin_is_rejected(self):
+        b = self.h.start_http('modern')
+        a = self.h.start_http('modern', extra={'FAKE_MCP_REDIRECT_PLAN': f"307:/mcp2|307:{b['url']}"})
+        out = self.h.run_host([self.http_cfg(a)], [
+            {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
+            access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')
+        self.assertIn('cross-origin redirect', out[0]['message'])
+        self.assertEqual(self._events_of(self.h, b), [])  # the second hop never happened
+        self.assertEqual(self.h.calls(a['log']), [])
+
+    def test_redirect_loop_is_detected(self):
+        a = self.h.start_http('modern', extra={'FAKE_MCP_REDIRECT_PLAN': '307:/loop1|307:/loop2|307:/loop3|307:/loop4'})
+        out = self.h.run_host([self.http_cfg(a)], [
+            {'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')
+        self.assertIn('too many redirects', out[0]['message'])
+        self.assertEqual(self.h.calls(a['log']), [])
+
+    def test_303_becomes_a_bodyless_get(self):
+        a = self.h.start_http('modern', extra={'FAKE_MCP_REDIRECT_PLAN': '303:/mcp2'})
+        out = self.h.run_host([self.http_cfg(a)], [
+            {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
+            access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')  # the fixture answers the GET with an error
+        evs = [e['event'] for e in self.h.events(a['events'])]
+        self.assertIn('redirect-sent', evs)
+        self.assertIn('get-received', evs)  # 303 was followed as GET
+        self.assertEqual(self.h.calls(a['log']), [])  # the tool body was dropped, never executed
+
+    def test_deadline_covers_all_redirect_hops(self):
+        # same-origin hop 1 (/mcp2), then hop 2 hangs: the exchange deadline must
+        # span BOTH hops (one AbortController, never reset per hop)
+        a = self.h.start_http('headers_then_hang', extra={'FAKE_MCP_REDIRECT_PLAN': '307:/mcp2'})
+        out = self.h.run_host([self.http_cfg(a, protocol_mode='modern_2026_07_28', tool_timeout_sec=2)], [
+            {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
+            access='write')['results']
+        self.assertEqual(out[0]['kind'], 'error')
+        self.assertIn('timed out', out[0]['message'])  # the shared deadline expired across the hop
+        self.assertEqual(self.h.calls(a['log']), ['publish:{"body": "b"}'])  # executed once, never replayed

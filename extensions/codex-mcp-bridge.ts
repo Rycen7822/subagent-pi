@@ -80,6 +80,9 @@ function parseHeaderPlan(schema: unknown): HeaderPlan {
         seen.add(annotation.toLowerCase());
         entries.push({ path: here, header: annotation, type });
       }
+      // a properties path must not pass THROUGH a dynamic ancestor ($ref,
+      // items, oneOf, ...); annotations beneath one are caught by the count check
+      if (HEADER_DYNAMIC_KEYS.some((k) => k in (def as Record<string, unknown>))) continue;
       const nested = legalWalk(def, here, depth + 1);
       if (nested) return nested;
     }
@@ -113,10 +116,9 @@ function parseHeaderPlan(schema: unknown): HeaderPlan {
 }
 // MCP 2026-07-28 header value encoding: plain visible ASCII (plus interior
 // SP/HTAB, no leading/trailing whitespace) is sent as-is; anything else —
-// non-ASCII, control characters, edge whitespace, or a value that already
-// looks like the Base64 sentinel — travels as `=?base64?<Base64 UTF-8>?=`.
+// non-ASCII, control characters, edge whitespace, or a value shaped like the
+// Base64 sentinel — travels as `=?base64?<Base64 UTF-8>?=`.
 // This is also the CRLF-injection defense: unsafe bytes never hit the wire raw.
-const MCP_BASE64_SENTINEL = /^=\?base64\?[A-Za-z0-9+/]+={0,2}\?=$/;
 function encodeMcpHeaderValue(value: string): string {
   let plain = value.length > 0;
   for (let i = 0; i < value.length; i++) {
@@ -124,7 +126,9 @@ function encodeMcpHeaderValue(value: string): string {
     if ((c < 0x20 && c !== 0x09) || c > 0x7e || c === 0x7f ||
         ((c === 0x20 || c === 0x09) && (i === 0 || i === value.length - 1))) { plain = false; break; }
   }
-  if (plain && !MCP_BASE64_SENTINEL.test(value)) return value;
+  // ANY string shaped like the sentinel is re-encoded, so a literal value can
+  // never be mistaken for an encoded one on the receiving side.
+  if (plain && !(value.startsWith("=?base64?") && value.endsWith("?="))) return value;
   return `=?base64?${Buffer.from(value, "utf8").toString("base64")}?=`;
 }
 interface Bootstrap {
@@ -204,7 +208,7 @@ function readBootstrap(): { payload?: Bootstrap; error?: string } {
   return result;
 }
 
-interface JsonRpcResponse { id?: number | string | null; result?: unknown; error?: { code: number; message: string } }
+interface JsonRpcResponse { id?: number | string | null; result?: unknown; error?: { code: number; message: string; data?: unknown } }
 
 function toToolMeta(raw: unknown, mirrorHeaders: boolean): ToolMeta | null {
   if (typeof raw !== "object" || raw === null) return null;
@@ -288,13 +292,13 @@ class StdioConnection extends McpConnection {
   private generation = 0;
   private closed = false;
   private stdinBroken = false;
-  private readonly modern: boolean;
+  private era: "legacy" | "modern";
   exitError: string | null = null;
 
   constructor(private cfg: ServerCfg) {
     super();
     this.mirrorHeaders = false;  // header mirroring is an HTTP-transport feature
-    this.modern = this.cfg.protocol_mode === "modern_2026_07_28";
+    this.era = this.cfg.protocol_mode === "modern_2026_07_28" ? "modern" : "legacy";
   }
 
   get dead(): boolean {
@@ -404,7 +408,7 @@ class StdioConnection extends McpConnection {
           const entry = this.pending.get(id) as { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
           this.pending.delete(id);
           clearTimeout(entry.timer);
-          if (msg.error) entry.reject(new Error(`server error ${msg.error.code}: ${msg.error.message.slice(0, 300)}`));
+          if (msg.error) entry.reject(new RpcError(msg.error.code, msg.error.message, msg.error.data));
           else entry.resolve(msg.result);
         } else if (msg.id === undefined) {
           const method = (msg as unknown as { method?: string }).method;
@@ -418,7 +422,7 @@ class StdioConnection extends McpConnection {
                 opts: { notification?: boolean; signal?: AbortSignal } = {}): Promise<unknown> {
     if (opts.signal?.aborted) throw new CancelledError(false);
     this.ensureProcess();
-    const wireParams = this.modern ? this.withMeta(params) : params;
+    const wireParams = this.era === "modern" ? this.withMeta(params) : params;
     if (opts.notification) {
       this.sendFrame({ jsonrpc: "2.0", method, params: wireParams });  // no pending entry; async EPIPE is the stdin listener's job
       return null;
@@ -464,13 +468,29 @@ class StdioConnection extends McpConnection {
   }
 
   async initialize(): Promise<void> {
-    if (this.modern) {
-      // 2026-07-28 stdio: stateless — no initialize handshake; every request is
-      // self-describing via _meta. The CODEX_MCP_PROTOCOL_VERSION opt-in was
-      // consumed by the parent, which strips it from the server's env.
-      await this.request("tools/list", {}, this.cfg.startup_timeout_sec);  // readiness probe warms the catalog
+    if (this.era === "legacy") {
+      await this.legacyHandshake();
       return;
     }
+    // Auto lifecycle (current Codex V20260728): the first RPC of a
+    // modern-enabled process is a side-effect-free server/discover carrying
+    // full modern _meta. A valid DiscoverResult or a recognized modern error
+    // keeps the modern era; any OTHER legacy-style error or a discovery
+    // timeout falls back to the full legacy handshake. Discovery is
+    // side-effect-free, never retried, and a tools/call is never replayed.
+    let result: unknown;
+    try {
+      result = await this.request("server/discover", {}, this.cfg.startup_timeout_sec);
+    } catch (err) {
+      if (classifyProtocolError(err) === "modern") return;  // recognized modern error: no fallback
+      this.era = "legacy";
+      await this.legacyHandshake();
+      return;
+    }
+    assertDiscoverResult(result);  // malformed success: protocol error, no fallback
+  }
+
+  private async legacyHandshake(): Promise<void> {
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
@@ -503,8 +523,42 @@ const ABORT_DEADLINE = Symbol("deadline");
 // Modern (2026-07-28): stateless — no handshake, every request self-describes via
 // _meta and the MCP-Protocol-Version / Mcp-Method / Mcp-Name headers.
 const MODERN_VERSION = "2026-07-28";
-const MODERN_UNSUPPORTED_CODE = -32022;  // recognized modern JSON-RPC error: UnsupportedProtocolVersionError
-const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.6" };
+// MCP 2026 recognized modern protocol errors: HeaderMismatch,
+// MissingRequiredClientCapability, UnsupportedProtocolVersion.
+const MODERN_ERROR_CODES = new Set([-32020, -32021, -32022]);
+const MAX_REDIRECTS = 3;
+
+/** Single modern-error classifier shared by the HTTP probe and the stdio Auto
+ * lifecycle: a recognized modern code keeps the modern era (no initialize);
+ * anything else is a legacy-style error. -32022 additionally requires a common
+ * supported version, reported as a hard incompatibility (never a fallback). */
+function classifyProtocolError(err: unknown): "modern" | "legacy" {
+  const code = err instanceof RpcError ? err.code : err instanceof HttpRpcError ? err.jsonRpcCode : null;
+  if (code === null || !MODERN_ERROR_CODES.has(code)) return "legacy";
+  if (code !== -32022) return "modern";
+  const data = err instanceof RpcError ? err.data : err instanceof HttpRpcError ? err.jsonRpcData : null;
+  const supported = Array.isArray((data as { supported?: unknown } | null)?.supported)
+    ? (data as { supported: unknown[] }).supported.map(String) : [];
+  if (!supported.includes(MODERN_VERSION)) {
+    throw new Error(`server only supports modern protocol versions [${supported.join(", ") || "none listed"}]; ` +
+      `this bridge speaks ${MODERN_VERSION} — no common modern version, refusing to guess`);
+  }
+  return "modern";
+}
+
+/** A successful server/discover must be a real 2026 DiscoverResult naming a
+ * common modern version; anything else is a protocol error, never a fallback. */
+function assertDiscoverResult(result: unknown): void {
+  if (typeof result !== "object" || result === null) throw new Error("malformed DiscoverResult: result is not an object");
+  const r = result as { resultType?: unknown; supportedVersions?: unknown };
+  if (typeof r.resultType !== "string" || !r.resultType) throw new Error("malformed DiscoverResult: missing resultType");
+  if (!Array.isArray(r.supportedVersions)) throw new Error("malformed DiscoverResult: supportedVersions is not an array");
+  if (!r.supportedVersions.map(String).includes(MODERN_VERSION)) {
+    throw new Error(`DiscoverResult supportedVersions [${r.supportedVersions.map(String).join(", ") || "none listed"}] ` +
+      `has no common version with this bridge (${MODERN_VERSION})`);
+  }
+}
+const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.7" };
 const MODERN_META = {
   "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
   "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
@@ -551,7 +605,7 @@ class HttpConnection extends McpConnection {
       ...(this.cfg.headers ?? {}),
     };
     if (this.cfg.bearer_token) headers.authorization = `Bearer ${this.cfg.bearer_token}`;
-    if (httpMethod === "DELETE") return headers;
+    // NOTE: no early return for DELETE — the legacy session id must ride along.
     if (this.mode !== "legacy") {
       // 2026-07-28 (and the auto probe): every request is self-describing; the
       // headers let gateways route and authorize without parsing JSON bodies.
@@ -641,7 +695,7 @@ class HttpConnection extends McpConnection {
     }
     try {
       const body = id === null ? { jsonrpc: "2.0", method, params: wireParams } : { jsonrpc: "2.0", id, method, params: wireParams };
-      const response = await fetch(this.cfg.url as string, {
+      const response = await this.send(this.cfg.url as string, {
         method: "POST",
         headers: this.headers(method, opts.toolName, "POST", opts.paramHeaders),
         body: JSON.stringify(body),
@@ -716,31 +770,58 @@ class HttpConnection extends McpConnection {
   }
 
   private async probeModern(): Promise<boolean> {
-    // Era detection happens ONLY on the side-effect-free server/discover. A
-    // modern server that cannot talk to us answers HTTP 400 carrying a
-    // recognized modern JSON-RPC error (UnsupportedProtocolVersionError);
-    // an unrecognized or legacy-style 400, 404 or 405 proves the endpoint is
-    // legacy-only. Auth/rate-limit/5xx failures are errors, never downgrade
-    // triggers, and a sent tools/call is never replayed either way.
+    // Era detection happens ONLY on the side-effect-free server/discover,
+    // classified by the bounded JSON-RPC error BODY (never message strings):
+    // a recognized modern error (-32020/-32021/-32022) keeps modern — no
+    // initialize is ever sent; an unrecognized or legacy-style 400, 404 or 405
+    // proves legacy-only. Auth/rate-limit/5xx failures are errors, never
+    // downgrade triggers, and a sent tools/call is never replayed either way.
     try {
-      await this.request("server/discover", {}, this.cfg.startup_timeout_sec);
+      assertDiscoverResult(await this.request("server/discover", {}, this.cfg.startup_timeout_sec));
       return true;
     } catch (err) {
       if (err instanceof HttpRpcError) {
         if (err.status !== 400 && err.status !== 404 && err.status !== 405) throw err;
-        if (err.jsonRpcCode === MODERN_UNSUPPORTED_CODE) {
-          const supported = Array.isArray((err.jsonRpcData as { supported?: unknown } | null)?.supported)
-            ? (err.jsonRpcData as { supported: unknown[] }).supported.map(String) : [];
-          if (!supported.includes(MODERN_VERSION)) {
-            throw new Error(`server only supports modern protocol versions [${supported.join(", ") || "none listed"}]; ` +
-              `this bridge speaks ${MODERN_VERSION} — no common modern version, refusing to guess`);
-          }
-          return true;  // recognized modern server: stay modern, never fall back to legacy initialize
-        }
-        return false;  // unrecognized/legacy-style error body: legacy proof
+        return classifyProtocolError(err) === "modern";
       }
-      if (err instanceof RpcError && err.code === -32601) return false;  // HTTP 200 + method-not-found
-      throw err;
+      if (err instanceof RpcError) {
+        if (classifyProtocolError(err) === "modern") return true;  // in-band modern error on HTTP 200
+        if (err.code === -32601) return false;  // legacy-style method-not-found
+        throw err;
+      }
+      throw err;  // timeouts and user aborts are errors, never a downgrade trigger
+    }
+  }
+
+  /** Manual redirect handling (SameOriginRedirect policy): no header or body
+   * is ever transmitted to a redirect target before its origin is verified
+   * against the ORIGINAL MCP origin. 301/302/303 become body-less GETs;
+   * 307/308 preserve method, headers and body. Every hop shares the exchange's
+   * single deadline (one AbortController) and the visited set blocks cycles. */
+  private async send(url: string, init: RequestInit): Promise<Response> {
+    const originalOrigin = new URL(this.cfg.url as string).origin;
+    let current = url;
+    let hopInit = init;
+    const visited = new Set<string>([current]);
+    for (let hop = 0; ; hop++) {
+      const response = await fetch(current, { ...hopInit, redirect: "manual" });
+      if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+      const location = response.headers.get("location");
+      if (!location) throw new Error(`HTTP ${response.status} redirect without Location from ${redactUrl(current)}`);
+      const next = new URL(location, current);
+      if (next.origin !== originalOrigin) {
+        throw new Error(`refusing cross-origin redirect to ${redactUrl(next.toString())}; no headers or body were sent`);
+      }
+      if (visited.has(next.toString())) throw new Error(`redirect loop at ${redactUrl(next.toString())}`);
+      visited.add(next.toString());
+      if (hop >= MAX_REDIRECTS) throw new Error(`too many redirects (>${MAX_REDIRECTS})`);
+      if (response.status !== 307 && response.status !== 308) {
+        const headers = { ...(hopInit.headers as Record<string, string>) };
+        delete headers["content-type"];
+        delete headers["content-length"];
+        hopInit = { ...hopInit, method: "GET", body: undefined, headers };
+      }
+      current = next.toString();
     }
   }
 
@@ -801,6 +882,7 @@ class HttpConnection extends McpConnection {
       try {
         void fetch(this.cfg.url as string, {
           method: "DELETE", headers: this.headers(undefined, undefined, "DELETE"),
+          redirect: "manual",  // session termination must never leak to another origin
           signal: AbortSignal.timeout(2000),
         }).then(r => { void r.body?.cancel(); }).catch(() => { });
       } catch { /* ignore */ }

@@ -4,7 +4,7 @@
 
 让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、运行中 steer、排队 follow-up、检查工作轨迹、中断、关闭、恢复原会话、收取结果。
 
-这是完整源码版 `0.2.6`，针对 **Linux / WSL2，Python 3.11+**。运行时只用 Python 标准库，无 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不是 Codex 内建 collaboration runtime，不进入原生 `/agents`，也不承诺无 hooks 的自动唤醒。
+这是完整源码版 `0.2.7`，针对 **Linux / WSL2，Python 3.11+**。运行时只用 Python 标准库，无 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不是 Codex 内建 collaboration runtime，不进入原生 `/agents`，也不承诺无 hooks 的自动唤醒。
 
 受管子代理可以按需继承你的 Codex 全局 skills（`~/.codex/skills`）与 MCP（`~/.codex/config.toml` 的 `mcp_servers`）：只读原文件、原位引用、内存中传递，不落盘、不迁移；普通 `pi` 不受影响。详见 `docs/inheritance.md`。
 

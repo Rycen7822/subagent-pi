@@ -28,6 +28,19 @@ if CLOSE_ONCE_FILE and not os.path.exists(CLOSE_ONCE_FILE):
     open(CLOSE_ONCE_FILE, 'w').close()
     MODE = 'close_stdin_after_list'
 SLOW_MUTATION_MS = int(os.environ.get('FAKE_MCP_SLOW_MUTATION_MS', '0'))
+# P1-A dual-era fixtures: the strict fixture fails ANY process whose first RPC
+# is not server/discover; DISCOVER_* shape the discover answer.
+STRICT_FIRST = os.environ.get('FAKE_MCP_STRICT_FIRST_DISCOVER') == '1'
+DISCOVER_MALFORMED = os.environ.get('FAKE_MCP_DISCOVER_MALFORMED') == '1'
+DISCOVER_ERROR = None
+_dec = os.environ.get('FAKE_MCP_DISCOVER_ERROR_CODE')
+if _dec:
+    _err = {"code": int(_dec), "message": "fixture discover error"}
+    _sup = os.environ.get('FAKE_MCP_DISCOVER_SUPPORTED')
+    if _sup is not None:
+        _err["data"] = {"supported": [s for s in _sup.split(',') if s]}
+    DISCOVER_ERROR = _err
+FIRST = {'method': None}
 DYN_FILE = os.environ.get('FAKE_MCP_DYN_FILE')
 TOOLS_HIDDEN = set(os.environ.get('FAKE_MCP_HIDE', '').split(','))
 
@@ -153,7 +166,26 @@ for raw in sys.stdin:
     except ValueError:
         continue
     rid, method = req.get('id'), req.get('method')
-    if method == 'initialize':
+    if STRICT_FIRST and FIRST['method'] is None:
+        FIRST['method'] = method
+        event('first-method', method=method)
+        if method != 'server/discover':
+            if rid is not None:
+                print(json.dumps({"jsonrpc": "2.0", "id": rid,
+                                  "error": {"code": -32000, "message": "strict fixture: first RPC must be server/discover"}}), flush=True)
+            os._exit(9)
+    if method == 'server/discover':
+        _meta = req.get('params', {}).get('_meta') or {}
+        event('discover-received', modern_meta=_meta.get('io.modelcontextprotocol/protocolVersion'))
+        if DISCOVER_MALFORMED:
+            reply(req, {"serverInfo": {"name": "fake-stdio", "version": "1.0"}})  # no resultType/supportedVersions
+        elif DISCOVER_ERROR:
+            print(json.dumps({"jsonrpc": "2.0", "id": rid, "error": DISCOVER_ERROR}), flush=True)
+        else:
+            reply(req, {"resultType": "server", "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {"listChanged": True}},
+                        "serverInfo": {"name": "fake-stdio", "version": "1.0"}})
+    elif method == 'initialize':
         event('initialize-received')
         reply(req, {"protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {"listChanged": True}},

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.7 — 2026-09-15
+
+Three MCP P1 fixes against review baseline 2c057b4 (0.2.6).
+
+- P1-A (stdio dual-era Auto lifecycle): a modern-enabled stdio process now
+  starts with `server/discover` carrying full modern `_meta` — never a bare
+  `tools/list`. A valid DiscoverResult (object, `resultType`,
+  `supportedVersions` containing a common modern version) or a recognized
+  modern error keeps modern with no initialize; any other legacy-style error
+  or a discovery timeout falls back to the full legacy handshake
+  (initialize -> notifications/initialized -> tools/list). Fallback happens
+  only on the side-effect-free discovery and never replays a tools/call. The
+  CODEX_MCP_PROTOCOL_VERSION marker is still consumed client-side and never
+  reaches the server process. stdio JSON-RPC errors now preserve
+  code/message/data (shared RpcError).
+- P1-B (same-origin manual redirects): HTTP requests are sent with
+  `redirect: "manual"` and every hop is verified against the ORIGINAL MCP
+  origin before anything is transmitted — a cross-origin redirect is refused
+  with zero requests reaching the target. 301/302/303 become body-less GETs,
+  307/308 preserve method/headers/body; max 3 hops, visited-set cycle
+  protection, and one shared deadline across all hops. The legacy session
+  DELETE also carries Mcp-Session-Id and never redirects.
+- P1-C (full modern error classification): one shared classifier recognizes
+  -32020 (HeaderMismatch), -32021 (MissingRequiredClientCapability) and
+  -32022 (UnsupportedProtocolVersion) — modern, no initialize fallback;
+  -32022 additionally requires a common `data.supported` version. HTTP 200
+  in-band JSON-RPC errors are classified by structured code too. A successful
+  discover must be a real DiscoverResult; a malformed one is a protocol
+  error, not a fallback. The fake modern servers now return the real 2026
+  DiscoverResult shape.
+
+Minor: the Base64 sentinel check now re-encodes ANY string starting with
+`=?base64?` and ending with `?=`; x-mcp-header properties paths may not pass
+through $ref/items/oneOf/... ancestors.
+
+All new regressions run against the real TypeScript bridge with localhost
+fake servers (zero model calls); red-verified 12 failures on 2c057b4.
+
 ## 0.2.6 — 2026-09-15
 
 Three MCP P1 fixes against review baseline a030a1d (0.2.5).
