@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Local streamable-HTTP MCP server for bridge host tests. Binds 127.0.0.1 only."""
+"""Local streamable-HTTP MCP server for bridge tests. Binds 127.0.0.1 only.
+
+Stage evidence goes to FAKE_MCP_HTTP_EVENTS (JSON lines), so tests can prove a
+tools/call was RECEIVED and headers were FLUSHED before asserting deadline,
+cancel or close behavior on the body phase. `hang_body_json` and
+`hang_body_sse` deliberately keep the connection open after the headers, which
+is exactly the phase the bridge's exchange lifecycle must terminate.
+"""
 from __future__ import annotations
 import json
 import os
@@ -7,8 +14,15 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-MODE = os.environ.get('FAKE_MCP_HTTP_MODE', 'normal')  # normal|headers_then_hang|slow_json|bad_status
+MODE = os.environ.get('FAKE_MCP_HTTP_MODE', 'normal')
+# normal|headers_then_hang|slow_json|bad_status|hang_body_json|hang_body_sse
+EVENTS = os.environ.get('FAKE_MCP_HTTP_EVENTS')
 CALL_LOG = os.environ.get('FAKE_MCP_HTTP_CALL_LOG')
+
+def event(kind, **kw):
+    if EVENTS:
+        with open(EVENTS, 'a') as f:
+            f.write(json.dumps({'event': kind, 't': time.time(), **kw}) + '\n')
 
 def log_call(name):
     if CALL_LOG:
@@ -28,6 +42,20 @@ TOOLS = [
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     def log_message(self, *a): pass
+
+    def _flush_headers(self, ctype, length=None, session=True):
+        self.send_response(200)
+        self.send_header('content-type', ctype)
+        if session:
+            self.send_header('mcp-session-id', 'sess-123')
+        if length is not None:
+            self.send_header('content-length', str(length))
+        self.end_headers()
+        try:
+            self.wfile.flush()
+        except OSError:
+            pass
+
     def do_POST(self):
         length = int(self.headers.get('content-length', 0))
         body = self.rfile.read(length)
@@ -38,17 +66,19 @@ class Handler(BaseHTTPRequestHandler):
         rid, method = req.get('id'), req.get('method')
         if MODE == 'bad_status':
             self.send_response(503); self.send_header('content-length', '0'); self.end_headers(); return
+
         def reply(payload, sse=False):
-            body = json.dumps(payload).encode()
-            data = (b'data: ' + body + b'\n\n') if sse else body
-            self.send_response(200)
-            self.send_header('content-type', 'text/event-stream' if sse else 'application/json')
-            self.send_header('mcp-session-id', 'sess-123')
-            self.send_header('content-length', str(len(data)))
-            self.end_headers()
+            encoded = json.dumps(payload).encode()
+            data = (b'data: ' + encoded + b'\n\n') if sse else encoded
+            self._flush_headers('text/event-stream' if sse else 'application/json', len(data))
             self.wfile.write(data)
-            self.wfile.flush()
+            try:
+                self.wfile.flush()
+            except OSError:
+                pass
+
         if method == 'initialize':
+            event('initialize-received')
             reply({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-06-18",
                    "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-http", "version": "1.0"}}})
         elif method == 'tools/list':
@@ -57,14 +87,43 @@ class Handler(BaseHTTPRequestHandler):
             name = (req.get('params') or {}).get('name')
             args = (req.get('params') or {}).get('arguments') or {}
             log_call(f"{name}:{json.dumps(args, sort_keys=True)}")
+            event('call-received', tool=name)
             if MODE == 'headers_then_hang':
-                # Headers already sent for the initialize case is impossible here;
-                # for calls we simply never reply (deadline test).
+                # Legacy mode kept for older tests: headers go out, no body ever.
+                self._flush_headers('application/json', 999999)
+                event('headers-sent')
+                time.sleep(30)
                 return
             if MODE == 'slow_json':
                 time.sleep(5)
-            result = {"content": [{"type": "text", "text": f"published {args.get('body', '')}"}]}
-            reply({"jsonrpc": "2.0", "id": rid, "result": result})
+                reply({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "late"}]}})
+                return
+            result = {"jsonrpc": "2.0", "id": rid,
+                      "result": {"content": [{"type": "text", "text": f"handled {name} {args.get('body') or args.get('query') or ''}"}]}}
+            if MODE == 'hang_body_json':
+                encoded = json.dumps(result).encode()
+                self._flush_headers('application/json', len(encoded))
+                event('headers-sent')
+                self.wfile.write(encoded[:len(encoded) // 2])  # one fragment, then hold the rest forever
+                try:
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                event('body-fragment-sent')
+                time.sleep(30)
+                return
+            if MODE == 'hang_body_sse':
+                self._flush_headers('text/event-stream')  # no content-length: stream stays open
+                event('headers-sent')
+                self.wfile.write(b': keepalive\n\n')  # non-terminal event
+                try:
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                event('body-fragment-sent')
+                time.sleep(30)
+                return
+            reply(result)
         elif rid is not None:
             reply({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "not implemented"}})
         else:

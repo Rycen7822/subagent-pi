@@ -148,32 +148,51 @@ function toToolMeta(raw: unknown): ToolMeta | null {
 
 abstract class McpConnection {
   toolsCache: ToolMeta[] | null = null;
+  catalogTruncated = false;
+  /** Bumped by tools/list_changed so an in-flight crawl never repopulates a
+   * cache that was invalidated while it was running. */
+  private catalogEpoch = 0;
+  protected invalidateCatalog(): void {
+    this.toolsCache = null;
+    this.catalogEpoch += 1;
+  }
+  abstract get dead(): boolean;
   abstract request(method: string, params: unknown, timeoutSec: number, opts?: { notification?: boolean; signal?: AbortSignal }): Promise<unknown>;
   abstract initialize(): Promise<void>;
   abstract callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal): Promise<unknown>;
   abstract close(): void;
+  /**
+   * Fetches and caches the tool catalog in memory. `catalogTruncated` records
+   * when a bound stopped the crawl, so callers can surface truncated: true
+   * instead of presenting a partial catalog as complete. The cache invalidates
+   * on notifications/tools/list_changed.
+   */
   async ensureTools(cfg: ServerCfg, signal?: AbortSignal): Promise<ToolMeta[]> {
     if (this.toolsCache) return this.toolsCache;
+    const epochAtStart = this.catalogEpoch;
     const collected: ToolMeta[] = [];
     let cursor: string | undefined;
     let pages = 0;
+    this.catalogTruncated = false;
     const seenCursors = new Set<string>();
     do {
       const result = await this.request("tools/list", cursor ? { cursor } : {}, cfg.startup_timeout_sec, { signal }) as
         { tools?: unknown[]; nextCursor?: unknown };
       if (typeof result?.nextCursor === "string" && result.nextCursor) {
-        if (seenCursors.has(result.nextCursor)) break; // server cursor loop guard
+        if (seenCursors.has(result.nextCursor)) { this.catalogTruncated = true; break; } // server cursor loop guard
         seenCursors.add(result.nextCursor);
       }
       for (const tool of result?.tools ?? []) {
-        if (collected.length >= MAX_TOOLS) break;
+        if (collected.length >= MAX_TOOLS) { this.catalogTruncated = true; break; }
         const meta = toToolMeta(tool);
         if (meta) collected.push(meta);
       }
       cursor = typeof result?.nextCursor === "string" && result.nextCursor ? result.nextCursor : undefined;
       pages += 1;
-    } while (cursor && pages < MAX_TOOLS && pages < MAX_PAGES && collected.length < MAX_TOOLS);
-    this.toolsCache = collected;
+    } while (cursor && pages < MAX_PAGES && collected.length < MAX_TOOLS);
+    if (cursor && pages >= MAX_PAGES) this.catalogTruncated = true; // page budget exhausted, not a complete catalog
+    // A list_changed that arrived mid-crawl must win over this result.
+    if (this.catalogEpoch === epochAtStart) this.toolsCache = collected;
     return collected;
   }
 }
@@ -185,9 +204,15 @@ class StdioConnection extends McpConnection {
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
   private stderrTail = "";
   private generation = 0;
+  private closed = false;
+  private stdinBroken = false;
   exitError: string | null = null;
 
   constructor(private cfg: ServerCfg) { super(); }
+
+  get dead(): boolean {
+    return this.closed || this.proc === null || this.exitError !== null;
+  }
 
   private failPending(message: string): void {
     const err = new Error(message);
@@ -199,6 +224,7 @@ class StdioConnection extends McpConnection {
   }
 
   private ensureProcess(): ChildProcess {
+    if (this.closed) throw new Error("stdio connection is closed");
     if (this.proc && this.exitError === null) return this.proc;
     if (this.proc) this.close();
     if (!this.cfg.command) throw new Error("stdio server missing command");
@@ -218,6 +244,7 @@ class StdioConnection extends McpConnection {
     for (const key of BASE_ENV) if (process.env[key]) env[key] = process.env[key] as string;
     Object.assign(env, this.cfg.env ?? {});
     this.exitError = null;
+    this.stdinBroken = false;
     this.generation += 1;
     const myGeneration = this.generation;
     const child = spawn(this.cfg.command, args, {
@@ -227,27 +254,57 @@ class StdioConnection extends McpConnection {
     });
     this.proc = child;
     child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => this.onData(chunk));
+    child.stdout?.on("data", (chunk: string) => this.onData(chunk, myGeneration));
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
       this.stderrTail = (this.stderrTail + chunk).slice(-4096);
     });
+    // The stdin Socket can fail ASYNCHRONOUSLY (classic case: the server closed
+    // its read end and the next write raises EPIPE). A ChildProcess 'error'
+    // listener does not cover this, and try/catch around write() only sees
+    // synchronous failures. This handler is the lifecycle hook: it settles this
+    // connection's pending requests with a deterministic transport error and
+    // marks the connection dead so the next explicit operation reconnects with
+    // a fresh handshake. It is not a silencer.
+    child.stdin?.on("error", (err: Error) => {
+      if (myGeneration !== this.generation || this.closed) return;
+      this.stdinBroken = true;
+      const code = (err as NodeJS.ErrnoException).code ?? "error";
+      this.exitError = this.exitError ?? `stdio transport broken: ${code}`;
+      this.failPending(`stdio transport broken (${code}); the call may or may not have reached the server`);
+    });
     // Spawn failures and early exits must reject waiters, never crash Pi with
     // an unhandled 'error' event.
     child.on("error", (err: Error) => {
-      if (myGeneration !== this.generation) return;
+      if (myGeneration !== this.generation || this.closed) return;
       this.exitError = `server failed to start: ${err.message.slice(0, 200)}`;
       this.failPending(this.exitError);
     });
     child.on("exit", () => {
-      if (myGeneration !== this.generation) return; // stale process of an older generation
-      this.exitError = "server process exited";
+      if (myGeneration !== this.generation || this.closed) return; // stale process of an older generation
+      this.exitError = this.exitError ?? "server process exited";
       this.failPending("stdio server exited before responding");
     });
     return child;
   }
 
-  private onData(chunk: string): void {
+  /**
+   * Single controlled send path for requests and notifications. Synchronous
+   * failures throw; asynchronous failures (async EPIPE) are handled by the
+   * stdin 'error' listener installed at spawn time. write() returning false is
+   * backpressure, not failure or completion — Node keeps buffering and the
+   * reader-side MAX_LINE bound keeps the queue finite.
+   */
+  private sendFrame(frame: unknown): void {
+    const child = this.ensureProcess();
+    if (this.stdinBroken || !child.stdin?.writable) {
+      throw new Error("stdio transport is broken; reconnect required");
+    }
+    child.stdin.write(JSON.stringify(frame) + "\n");
+  }
+
+  private onData(chunk: string, generation: number): void {
+    if (generation !== this.generation) return; // stale bytes from a replaced process
     this.buffer += chunk;
     if (this.buffer.length > MAX_LINE) {
       this.buffer = "";
@@ -271,7 +328,7 @@ class StdioConnection extends McpConnection {
           else entry.resolve(msg.result);
         } else if (msg.id === undefined) {
           const method = (msg as unknown as { method?: string }).method;
-          if (method === "notifications/tools/list_changed") this.toolsCache = null; // no model wakeup
+          if (method === "notifications/tools/list_changed") this.invalidateCatalog(); // no model wakeup
         }
       } catch { /* non-JSON stdout line: ignore, never forward */ }
     }
@@ -279,10 +336,13 @@ class StdioConnection extends McpConnection {
 
   async request(method: string, params: unknown, timeoutSec: number,
                 opts: { notification?: boolean; signal?: AbortSignal } = {}): Promise<unknown> {
-    const child = this.ensureProcess();
     if (opts.signal?.aborted) throw new CancelledError(false);
+    this.ensureProcess();
     if (opts.notification) {
-      child.stdin?.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
+      // Notifications have no pending entry: a synchronous send failure is a
+      // deterministic transport error; an ASYNC failure (EPIPE) is handled by
+      // the stdin 'error' listener and must not crash the worker.
+      this.sendFrame({ jsonrpc: "2.0", method, params });
       return null;
     }
     const id = this.nextId++;
@@ -298,7 +358,9 @@ class StdioConnection extends McpConnection {
       this.pending.set(id, { resolve, reject, timer });
     });
     try {
-      child.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      // A synchronous send failure must settle the pending entry before the
+      // rejection propagates, otherwise it would hang until the timeout.
+      this.sendFrame({ jsonrpc: "2.0", id, method, params });
     } catch (err) {
       const entry = this.pending.get(id);
       if (entry) { this.pending.delete(id); clearTimeout(entry.timer); }
@@ -310,8 +372,9 @@ class StdioConnection extends McpConnection {
         this.pending.delete(id);
         clearTimeout(entry.timer);
         entry.reject(new CancelledError(true));
-        // Cancellation notice is best-effort; side effects are NOT rolled back.
-        try { child.stdin?.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }) + "\n"); } catch { /* ignore */ }
+        // Cancellation notice is best-effort: a send failure here must neither
+        // crash the worker nor turn this cancellation into a success.
+        try { this.sendFrame({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }); } catch { /* ignore */ }
       }
     };
     if (opts.signal) {
@@ -331,7 +394,7 @@ class StdioConnection extends McpConnection {
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
-      clientInfo: { name: "subagent-pi-bridge", version: "0.2.1" },
+      clientInfo: { name: "subagent-pi-bridge", version: "0.2.2" },
     }, this.cfg.startup_timeout_sec);
     await this.request("notifications/initialized", {}, this.cfg.startup_timeout_sec, { notification: true });
   }
@@ -342,6 +405,7 @@ class StdioConnection extends McpConnection {
 
   close(): void {
     const child = this.proc;
+    this.closed = true;
     this.proc = null;
     this.failPending("connection closed");
     if (child) {
@@ -351,11 +415,21 @@ class StdioConnection extends McpConnection {
   }
 }
 
+/** Distinguishes why an in-flight HTTP exchange was aborted. */
+const ABORT_DEADLINE = Symbol("deadline");
+const ABORT_USER = Symbol("user");
+const ABORT_CLOSED = Symbol("closed");
+
 class HttpConnection extends McpConnection {
   private sessionId: string | null = null;
   private nextId = 1;
+  private closed = false;
+  /** AbortControllers of every in-flight exchange, so close() can end them all. */
+  private active = new Set<AbortController>();
 
   constructor(private cfg: ServerCfg) { super(); }
+
+  get dead(): boolean { return this.closed; }
 
   private headers(): Record<string, string> {
     const headers: Record<string, string> = {
@@ -368,48 +442,22 @@ class HttpConnection extends McpConnection {
     return headers;
   }
 
-  /** Deadline covers the WHOLE exchange — headers, body and result parsing. */
-  private async post(body: unknown, timeoutSec: number, signal?: AbortSignal): Promise<Response> {
-    if (signal?.aborted) throw new CancelledError(false);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new CancelledError(true)), timeoutSec * 1000);
-    const onOuterAbort = () => controller.abort(new CancelledError(true));
-    if (signal) {
-      if (signal.aborted) { clearTimeout(timer); throw new CancelledError(false); }
-      signal.addEventListener("abort", onOuterAbort, { once: true });
-    }
-    try {
-      return await fetch(this.cfg.url as string, {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      if ((err as Error).name === "AbortError" && signal?.aborted) throw new CancelledError(true);
-      if ((err as Error).name === "AbortError") throw new Error(`${redactUrl(this.cfg.url ?? "")} timed out after ${timeoutSec}s`);
-      throw new Error(`HTTP request failed: ${(err as Error).message.slice(0, 200)}`);
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onOuterAbort);
-    }
-  }
-
-  /** Reads a bounded JSON body with the deadline still armed. */
+  /** Reads a bounded JSON body. Aborts propagate from the exchange signal. */
   private async readBoundedJson(response: Response, limit: number): Promise<unknown> {
     const reader = response.body?.getReader();
     if (!reader) throw new Error("empty response body");
     const chunks: Buffer[] = [];
     let total = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > limit) {
-        try { await reader.cancel(); } catch { /* ignore */ }
-        throw new Error("response body exceeds limit");
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > limit) throw new Error("response body exceeds limit");
+        chunks.push(Buffer.from(value));
       }
-      chunks.push(Buffer.from(value));
+    } finally {
+      try { await reader.cancel(); } catch { /* ignore */ }
     }
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   }
@@ -450,30 +498,62 @@ class HttpConnection extends McpConnection {
     throw new Error("event-stream closed before the JSON-RPC response arrived");
   }
 
+  /**
+   * One HTTP exchange owns its whole lifecycle: the deadline, the caller's
+   * cancellation, the fetch, header handling, body consumption and cleanup all
+   * share a single AbortController that is armed until the exchange SETTLES —
+   * not merely until the response headers arrive. A hung body therefore hits
+   * the deadline, and close()/user-cancel abort the body reader too. JSON
+   * parsing runs on a payload already bounded in bytes, so the synchronous
+   * parse phase is bounded without pretending AbortSignal can preempt it.
+   * No exchange is ever retried here: a tools/call may have reached the server.
+   */
   async request(method: string, params: unknown, timeoutSec: number,
                 opts: { notification?: boolean; signal?: AbortSignal } = {}): Promise<unknown> {
+    if (this.closed) throw new Error(`connection ${this.cfg.name} is closed`);
+    if (opts.signal?.aborted) throw new CancelledError(false);
     const id = opts.notification ? null : this.nextId++;
-    const body = id === null ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", id, method, params };
-    const response = await this.post(body, timeoutSec, opts.signal);
-    const session = response.headers.get("mcp-session-id");
-    if (session) this.sessionId = session;
-    if (!response.ok) {
-      try { await response.body?.cancel(); } catch { /* ignore */ }
-      throw new Error(`HTTP ${response.status} from ${redactUrl(this.cfg.url ?? "")}`);
+    const controller = new AbortController();
+    this.active.add(controller);
+    const timer = setTimeout(() => controller.abort(ABORT_DEADLINE), timeoutSec * 1000);
+    const onOuterAbort = () => controller.abort(ABORT_USER);
+    if (opts.signal) {
+      if (opts.signal.aborted) { clearTimeout(timer); this.active.delete(controller); throw new CancelledError(false); }
+      opts.signal.addEventListener("abort", onOuterAbort, { once: true });
     }
-    if (id === null) {
-      try { await response.body?.cancel(); } catch { /* ignore */ }
-      return null;
-    }
-    const contentType = response.headers.get("content-type") ?? "";
     try {
+      const body = id === null ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", id, method, params };
+      const response = await fetch(this.cfg.url as string, {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const session = response.headers.get("mcp-session-id");
+      if (session) this.sessionId = session;
+      if (!response.ok) throw new Error(`HTTP ${response.status} from ${redactUrl(this.cfg.url ?? "")}`);
+      if (id === null) return null; // notification accepted; nothing to wait for
+      const contentType = response.headers.get("content-type") ?? "";
       if (contentType.includes("text/event-stream")) return await this.parseSse(response, id);
       const msg = await this.readBoundedJson(response, MAX_RESULT_TEXT) as JsonRpcResponse;
       if (msg.error) throw new Error(`server error ${msg.error.code}: ${msg.error.message.slice(0, 300)}`);
       return msg.result;
     } catch (err) {
-      if ((err as Error).name === "AbortError" && opts.signal?.aborted) throw new CancelledError(true);
+      // Classify by WHO aborted the exchange; a request that was already sent
+      // keeps an outcome-unknown wording instead of claiming server-side state.
+      const sent = id !== null;
+      if (opts.signal?.aborted) {
+        if (err instanceof CancelledError) throw err;
+        throw new CancelledError(sent);
+      }
+      if (err === ABORT_DEADLINE) throw new Error(`${method} exchange timed out after ${timeoutSec}s${sent ? "; server outcome is unknown" : ""}`);
+      if (err === ABORT_CLOSED) throw new Error(`${method} exchange ended because the connection was closed${sent ? "; server outcome is unknown" : ""}`);
+      if (err === ABORT_USER) throw new CancelledError(sent);
       throw err;
+    } finally {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onOuterAbort);
+      this.active.delete(controller);
     }
   }
 
@@ -481,7 +561,7 @@ class HttpConnection extends McpConnection {
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
-      clientInfo: { name: "subagent-pi-bridge", version: "0.2.1" },
+      clientInfo: { name: "subagent-pi-bridge", version: "0.2.2" },
     }, this.cfg.startup_timeout_sec);
     await this.request("notifications/initialized", {}, this.cfg.startup_timeout_sec, { notification: true });
   }
@@ -490,51 +570,68 @@ class HttpConnection extends McpConnection {
     return await this.request("tools/call", { name, arguments: args ?? {} }, timeoutSec, { signal });
   }
 
-  close(): void { /* stateless; active readers are cancelled by their deadlines */ }
+  /** Ends every in-flight exchange on this connection and rejects new ones. */
+  close(): void {
+    if (this.closed) return; // idempotent
+    this.closed = true;
+    for (const controller of this.active) controller.abort(ABORT_CLOSED);
+    this.active.clear();
+    this.sessionId = null;
+  }
 }
 
 export default async function (pi: ExtensionAPI) {
   const boot = readBootstrap();
   const connections = new Map<string, McpConnection>();
+  const connecting = new Map<string, Promise<McpConnection>>();
   const servers: ServerCfg[] = boot.payload?.mcp.servers ?? [];
   const access = boot.payload?.agent.access ?? "write";
-  // Defense in depth: a read child without an explicit allowlist ALWAYS
-  // confirms and only sees readOnly tools — the bridge derives this itself
-  // instead of trusting the payload to have precomputed confirm_all.
-  for (const cfg of servers) {
-    if (access === "read" && cfg.allowed_tools === null) cfg.confirm_all = true;
-  }
 
-  function toolAllowed(cfg: ServerCfg, name: string): boolean {
-    if (cfg.disabled_tools.includes(name)) return false;
-    if (cfg.allowed_tools !== null && !cfg.allowed_tools.includes(name)) return false;
-    return true;
+  /** Deny (disabled_tools) wins first, for every access level. */
+  function isDenied(cfg: ServerCfg, name: string): boolean {
+    return cfg.disabled_tools.includes(name);
   }
 
   function toolVisible(cfg: ServerCfg, meta: ToolMeta): boolean {
-    if (!toolAllowed(cfg, meta.name)) return false;
-    // Read child without an explicit allowlist: only readOnly-advertised tools
-    // are visible. readOnlyHint is a server self-report that only affects
-    // visibility — it never removes the mandatory confirmation.
-    if (cfg.confirm_all && !meta.readOnly) return false;
+    if (isDenied(cfg, meta.name)) return false;
+    if (access === "read") {
+      // P1-B: the parent's enabled_tools is NOT child authorization. A read
+      // child never sees or calls a tool that is not explicitly declared
+      // readOnly — not through per-tool auto, and a confirmation dialog never
+      // upgrades the worker either. An explicit parent allowlist can only
+      // SHRINK the child surface (an empty allowlist allows nothing); it can
+      // never add write tools back. readOnlyHint is a server self-report
+      // affecting the managed tool surface only; it is not a sandbox claim.
+      if (meta.readOnly !== true) return false;
+      if (cfg.allowed_tools !== null && !cfg.allowed_tools.includes(meta.name)) return false;
+      return true;
+    }
+    if (cfg.allowed_tools !== null && !cfg.allowed_tools.includes(meta.name)) return false;
     return true;
   }
 
-  /** Child confirm_all wins over any parent-side auto (F06). */
-  function needsConfirmation(cfg: ServerCfg, tool: ToolMeta): boolean {
-    if (cfg.confirm_all) return true;
-    return (cfg.tool_approval[tool.name] ?? cfg.approval_default) !== "auto";
+  /**
+   * Effective confirmation AFTER a tool is allowed. The child rule wins:
+   * read children always confirm, regardless of parent-side auto; write
+   * children follow per-tool override > server default > confirm.
+   */
+  function needsConfirmation(cfg: ServerCfg, meta: ToolMeta): boolean {
+    if (access === "read") return true;
+    return (cfg.tool_approval[meta.name] ?? cfg.approval_default) !== "auto";
   }
 
   async function ensureConnection(cfg: ServerCfg, signal?: AbortSignal): Promise<McpConnection> {
-    let conn = connections.get(cfg.name);
-    if (conn instanceof StdioConnection && conn.exitError) {
-      conn.close();
+    const existing = connections.get(cfg.name);
+    if (existing && !existing.dead) return existing;
+    if (existing) {
+      existing.close();
       connections.delete(cfg.name);
-      conn = undefined;
     }
-    if (!conn) {
-      conn = cfg.transport === "http" ? new HttpConnection(cfg) : new StdioConnection(cfg);
+    // Concurrent first uses share one creation+handshake per server name.
+    const inflight = connecting.get(cfg.name);
+    if (inflight) return inflight;
+    const create = (async () => {
+      const conn = cfg.transport === "http" ? new HttpConnection(cfg) : new StdioConnection(cfg);
       connections.set(cfg.name, conn);
       try {
         await conn.initialize();
@@ -543,8 +640,14 @@ export default async function (pi: ExtensionAPI) {
         conn.close();
         throw new Error(`server ${cfg.name} failed to initialize: ${(err as Error).message.slice(0, 300)}`);
       }
+      return conn;
+    })();
+    connecting.set(cfg.name, create);
+    try {
+      return await create;
+    } finally {
+      connecting.delete(cfg.name);
     }
-    return conn;
   }
 
   /** Release every connection, reader and pending request on shutdown. */
@@ -573,7 +676,7 @@ export default async function (pi: ExtensionAPI) {
 
   const parameters = Type.Object({
     action: Type.Union([Type.Literal("list"), Type.Literal("describe"), Type.Literal("call")]),
-    server: Type.Optional(Type.String({ description: "Server name (describe/call)" })),
+    server: Type.Optional(Type.String({ description: "Server name. list: optional (catalog one server); describe/call: required" })),
     tool: Type.Optional(Type.String({ description: "Tool name (describe/call)" })),
     args: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Tool arguments object (call)" })),
   });
@@ -583,9 +686,9 @@ export default async function (pi: ExtensionAPI) {
     if (boot.error) {
       throw new Error(`Inherited MCP is unavailable in this child: ${boot.error}`);
     }
-    if (params.action === "list") {
-      // Names and configured policy only — cold start does not connect every
-      // server. Use describe for a specific server's tools.
+    if (params.action === "list" && !params.server) {
+      // Discovery level 1: configured servers and policy only — cold start
+      // does not connect anything.
       const report = servers.map((cfg) => ({
         server: cfg.name,
         transport: cfg.transport,
@@ -594,33 +697,43 @@ export default async function (pi: ExtensionAPI) {
           allowed_tools: cfg.allowed_tools,
           disabled_tools: cfg.disabled_tools,
           approval_default: cfg.approval_default,
-          confirm_all: cfg.confirm_all === true,
         },
       }));
-      return { content: [{ type: "text", text: JSON.stringify({ servers: report }, null, 1).slice(0, MAX_RESULT_TEXT) }], details: {} };
+      return { content: [{ type: "text", text: JSON.stringify({ servers: report }) }], details: { servers: report } };
     }
     const serverName = params.server;
-    const toolName = params.tool;
-    if (!serverName || !toolName) {
-      throw new Error("action=describe|call requires server and tool");
-    }
+    if (!serverName) throw new Error("action=describe|call requires server and tool");
     const cfg = servers.find((s) => s.name === serverName);
     if (!cfg) throw new Error(`Unknown server ${serverName}; use action=list`);
-    if (!toolAllowed(cfg, toolName)) {
+    if (params.action === "list") {
+      // Discovery level 2: connect THIS server on demand (no other optional
+      // server is started) and list its VISIBLE tools — parent deny/allow and
+      // the child access rule are applied here, not just at call time.
+      const conn = await ensureConnection(cfg, signal);
+      const tools = await conn.ensureTools(cfg, signal);
+      const visible = tools.filter((t) => toolVisible(cfg, t));
+      const entries = visible.map((t) => ({ name: t.name, description: t.description ?? "", read_only: t.readOnly }));
+      // Byte bound WITHOUT breaking the JSON: drop whole entries until it fits.
+      let truncated = conn.catalogTruncated || visible.length !== tools.length;
+      while (JSON.stringify({ server: serverName, tools: entries, truncated }).length > MAX_RESULT_TEXT && entries.length > 0) {
+        entries.pop();
+        truncated = true;
+      }
+      const report = { server: serverName, transport: cfg.transport, tools: entries, truncated };
+      return { content: [{ type: "text", text: JSON.stringify(report) }], details: report };
+    }
+    const toolName = params.tool;
+    if (!toolName) throw new Error("action=describe|call requires server and tool");
+    if (isDenied(cfg, toolName)) {
       throw new Error(`Tool ${serverName}.${toolName} is excluded by the inherited server policy`);
     }
-    let conn: McpConnection;
-    try {
-      conn = await ensureConnection(cfg, signal);
-    } catch (err) {
-      throw new Error((err as Error).message);
-    }
+    const conn = await ensureConnection(cfg, signal);
     let tools = await conn.ensureTools(cfg, signal);
     let toolMeta = tools.find((t) => t.name === toolName);
     if (!toolMeta) {
       tools = await conn.ensureTools(cfg, signal); // cache may be stale after list_changed
       toolMeta = tools.find((t) => t.name === toolName);
-      if (!toolMeta) throw new Error(`Tool ${toolName} is not offered by ${serverName}`);
+      if (!toolMeta) throw new Error(`Tool ${toolName} is not offered by ${serverName}; use action=list with server=${serverName} to discover tools`);
     }
     if (params.action === "describe") {
       if (!toolVisible(cfg, toolMeta)) {
@@ -629,14 +742,15 @@ export default async function (pi: ExtensionAPI) {
       if (!toolMeta.inputSchema) {
         throw new Error(`Tool ${serverName}.${toolName} has no usable inputSchema (missing or larger than ${MAX_SCHEMA_BYTES} bytes)`);
       }
-      return {
-        content: [{ type: "text", text: JSON.stringify({ server: serverName, tool: toolMeta.name, description: toolMeta.description, inputSchema: toolMeta.inputSchema }).slice(0, MAX_RESULT_TEXT) }],
-        details: { server: serverName, tool: toolMeta.name, inputSchema: toolMeta.inputSchema },
-      };
+      const report = { server: serverName, tool: toolMeta.name, description: toolMeta.description, inputSchema: toolMeta.inputSchema };
+      // inputSchema is validated <= MAX_SCHEMA_BYTES at discovery time, so this
+      // JSON always fits the result bound; no string slicing that could break it.
+      return { content: [{ type: "text", text: JSON.stringify(report) }], details: report };
     }
-    // action === "call"
+    // action === "call" — the same effective policy as list/describe, checked
+    // against the CURRENT metadata right before execution.
     if (!toolVisible(cfg, toolMeta)) {
-      throw new Error(`Tool ${serverName}.${toolName} is not exposed in this read-only managed child (no explicit allowlist)`);
+      throw new Error(`Tool ${serverName}.${toolName} is not available to this managed child (access=${access}; only explicitly read-only tools are exposed)`);
     }
     if (needsConfirmation(cfg, toolMeta)) {
       const argsPreview = JSON.stringify(params.args ?? {}).slice(0, 500);
@@ -646,7 +760,7 @@ export default async function (pi: ExtensionAPI) {
       );
       if (!ok) {
         // Denial is not an error: nothing was called.
-        return { content: [{ type: "text", text: "Approval denied; the MCP tool was not called" }], details: {} };
+        return { content: [{ type: "text", text: "Approval denied; the MCP tool was not called" }], details: { confirmed: false } };
       }
     }
     if (signal?.aborted) throw new CancelledError(false);
@@ -667,11 +781,12 @@ export default async function (pi: ExtensionAPI) {
     name: "codex_mcp",
     label: "Codex MCP bridge",
     description:
-      "Call tools on Codex MCP servers inherited into this managed child. " +
-      "action=list shows configured servers and policy (no connections). " +
-      "action=describe returns a tool's full inputSchema. action=call invokes " +
-      "server+tool with an args object. Connections live in memory for this " +
-      "worker's lifetime; nothing is cached on disk.",
+      "Discover and call tools on Codex MCP servers inherited into this managed child. " +
+      "Discovery: action=list (no server) shows configured servers and policy without " +
+      "connecting; action=list with server=<name> connects that one server and lists its " +
+      "visible tool names and short descriptions. action=describe with server+tool returns " +
+      "a tool's full inputSchema; action=call invokes server+tool with an args object. " +
+      "Connections live in memory for this worker's lifetime; nothing is cached on disk.",
     parameters,
     execute,
   });

@@ -15,7 +15,11 @@ transport 测试通过真正的 MCP stdio 和 Unix socket，覆盖并发初始�
 
 继承测试覆盖来源解析与错误回退、skill/MCP 转换与 disposition、审批优先级表、递归身份识别（含安装器包装）、诊断可序列化、环境隔离（双 scope 各自取值、daemon-only canary 不可达、控制面无值）、required 失败阻止 spawn 且零 prompt，以及最终 argv 经 Pi 真实 parseArgs 探针验证（单一 `--tools` 合并 codex_mcp）。
 
-bridge 主机测试（tests/test_bridge_host.py + tests/bridge_host.mjs）用 jiti 加载**真实** TypeScript bridge（与 Pi 相同的加载器），对本地假 stdio/HTTP MCP server 驱动 list/describe/call、超时、中途退出、取消、审批拒绝/接受、白名单与递归拒绝；回执（receipt）为结构化 JSON。该层不启动 Pi 进程、不调模型。
+bridge 主机测试（tests/test_bridge_host.py + tests/bridge_host.mjs）用 jiti 加载**真实** TypeScript bridge（与 Pi 相同的加载器），对本地假 stdio/HTTP MCP server 驱动完整发现链（list → list(server) → describe → call，工具名由假 server 动态生成）、审批策略矩阵、HTTP headers 后 body 挂起的 deadline/取消/close（阶段证据：请求送达+headers 已 flush 才允许断言）、stdio 异步 EPIPE（host 以 `--unhandled-rejections=strict` 运行且必须退出码 0）、目录失效与分页上限。回执（receipt）为结构化 JSON。该层不启动 Pi 进程、不调模型。
+
+环境绑定链测试（test_inheritance.EnvironmentBindingChain）经真实 CLI 子进程 → daemon → guard → fake-Pi 执行：自定义 PATH 中的无害解释器实际运行（rc=0 证明环境绑定）、授权 child_env 名单送达、daemon-only canary 不可达、总开关关闭时 config.toml 为 FIFO（任何读取都会阻塞）仍正常启动、秘密值不落控制面。
+
+上述五项核心回归均做过红-绿验证：对 d7ff1e9（未修复实现）运行会失败，对修复后代码通过。
 
 TypeScript 类型检查（一次性 `npm install && npm run setup`，仅开发期，固定 typescript 版本，运行时零 npm 依赖）：
 

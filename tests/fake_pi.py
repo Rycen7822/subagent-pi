@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -106,7 +107,29 @@ async def main():
     reader=asyncio.StreamReader(); transport,_=await asyncio.get_running_loop().connect_read_pipe(lambda:asyncio.StreamReaderProtocol(reader),sys.stdin.buffer)
     while line:=await reader.readline():
         r=json.loads(line); kind=r['type']
-        if kind=='get_state': response(r,data={'sessionFile':str(path),'sessionId':'fake-session','isStreaming':bool(current and not current.done()),'pendingMessageCount':len(queue),'model':{'id':'fake','provider':'test'},'env_probe':{k:v for k,v in sorted(os.environ.items()) if k.startswith('PI_TEST_') and len(v)<=256}})
+        if kind=='get_state':
+            # PI_TEST_PROBE_FILE: evidence channel for the env-binding chain test.
+            # The probe runs a harmless interpreter found via PATH so the test can
+            # prove the child's environment actually works (rc 127 proves it does
+            # not). Only non-secret facts are recorded: rc, PATH value (test
+            # fixture path), booleans for canary PRESENCE, never secret values.
+            probe_file=os.environ.get('PI_TEST_PROBE_FILE')
+            if probe_file and not Path(probe_file).exists():
+                pc=os.environ.get('PI_TEST_PROBE_CMD')
+                rc=127; out=''
+                if pc:
+                    exe=shutil.which(pc)
+                    if exe:
+                        proc=subprocess.run([exe],capture_output=True,text=True,timeout=10)
+                        rc=proc.returncode; out=proc.stdout.strip()[:80]
+                with open(probe_file,'w') as f:
+                    json.dump({'rc':rc,'out':out,
+                               'path':os.environ.get('PATH','')[:500],
+                               'has_auth':'PI_TEST_AUTH' in os.environ,
+                               'has_daemon_only':'PI_TEST_DAEMON_ONLY' in os.environ,
+                               'home_tag':os.environ.get('PI_TEST_HOME_TAG',''),
+                               'cwd':os.getcwd()},f)
+            response(r,data={'sessionFile':str(path),'sessionId':'fake-session','isStreaming':bool(current and not current.done()),'pendingMessageCount':len(queue),'model':{'id':'fake','provider':'test'},'env_probe':{k:v for k,v in sorted(os.environ.items()) if k.startswith('PI_TEST_') and len(v)<=256},'path_probe':None if 'PI_TEST_PROBE_CMD' not in os.environ else {'rc':0}})
         elif kind=='prompt':
             if current and not current.done(): response(r,False,error='Already streaming')
             else: response(r); current=asyncio.create_task(run(r['message']))

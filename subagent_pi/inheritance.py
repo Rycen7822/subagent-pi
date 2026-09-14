@@ -543,9 +543,15 @@ def scope_source_snapshot(home: Path, environ: dict) -> dict:
     """Trusted client-side snapshot for scope binding: codex home resolution plus
     the minimal env capture (base keys, referenced vars, authorized child-env
     names). Called by the CLI launcher and the Codex-spawned MCP adapter; the
-    values live in daemon memory only and are never model-visible."""
+    values live in daemon memory only and are never model-visible.
+    When the inheritance master switch is off this binds ONLY the base worker
+    environment: no Codex directory is read or resolved, so an invalid or
+    missing CODEX_HOME cannot break a normal worker start."""
     from .config import load_config  # local import: config owns the state home layout
     cfg = load_config(home)
-    codex_home, _ = resolve_codex_home(cfg['inheritance'], {'CODEX_HOME': environ.get('CODEX_HOME')})
-    return {'env': capture_scope_env(codex_home, environ,
-                                     extra_names=cfg['inheritance'].get('child_env', []))}
+    inh = cfg['inheritance']
+    child_env = inh.get('child_env', [])
+    if not inh.get('enabled', True):
+        return {'env': capture_scope_env(None, environ, extra_names=child_env)}
+    codex_home, _ = resolve_codex_home(inh, {'CODEX_HOME': environ.get('CODEX_HOME')})
+    return {'env': capture_scope_env(codex_home, environ, extra_names=child_env)}

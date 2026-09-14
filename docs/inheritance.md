@@ -1,4 +1,4 @@
-# Codex Inheritance for Managed Children (0.2.1)
+# Codex Inheritance for Managed Children (0.2.2)
 
 Managed subagents started by this plugin can use your Codex-side global skills
 and MCP servers. Normal `pi` sessions are never affected: inheritance is added
@@ -107,6 +107,24 @@ not bypass this; renaming the binary itself is out of scope).
 
 ## The private channel and the child extension
 
+## Tool discovery (unknown tool names)
+
+The single `codex_mcp` tool supports the whole chain without prior knowledge
+of tool names:
+
+1. `action=list` (no server): configured servers and their policy; nothing is
+   connected.
+2. `action=list` + `server`: connects THAT server only and lists its visible
+   tools (names, short descriptions, read-only flag) with bounded pagination
+   and an honest `truncated` flag when a bound stopped the crawl.
+3. `action=describe` + `server` + `tool`: the full, effective `inputSchema`.
+4. `action=call` + `server` + `tool` + `args`: runs the same effective policy
+   check against current metadata before executing.
+
+The catalog lives in memory only, is filtered by deny/allow and the child
+access rule at every level, and is invalidated when the server sends
+`notifications/tools/list_changed`.
+
 Booted children receive the converted configuration through an anonymous pipe
 (fd number in `PI_AGENTS_BOOTSTRAP_FD`), passed daemon → worker guard → Pi
 with `pass_fds` on every hop; the daemon writes the payload asynchronously in
@@ -135,6 +153,14 @@ REQUIRED servers are initialized eagerly before the receipt; the daemon does
 not send a task until the receipt says ready for this exact agent generation.
 Optional servers connect lazily on first use.
 
+Stdio transport failures are lifecycle events, not host crashes: the stdin
+socket carries a real error handler installed before the first write, so an
+asynchronous EPIPE (server closed its read end) settles that connection's
+pending requests with a deterministic transport error and marks the connection
+for reconnection on the next explicit operation. A cancellation notice whose
+send fails is swallowed; it never crashes the worker nor turns the
+cancellation into a success.
+
 ## Approval policy and read-only children
 
 The effective approval for a tool is resolved top-down: deny (disabled_tools
@@ -142,14 +168,18 @@ or unimplementable tool config) highest, then the per-tool `approval_mode`
 override, then the server `default_tools_approval_mode`, then "confirm".
 `writes` and unknown values degrade to confirm with a named diagnostic.
 
-A read child WITHOUT an explicit allowlist sees only readOnly-advertised
-tools and every call confirms (`confirm_all`); the bridge derives this rule
-itself from the child access, so parent-side `auto` can never relax it. A
-read child WITH an allowlist may call exactly those tools under the inherited
-approval policy. `readOnlyHint` is a server self-report: it affects visibility
-only and never removes a mandatory confirmation. Confirmations flow through
-the normal `pi_answer_agent` channel; a denied or cancelled confirmation sends
-no `tools/call` at all.
+A read child's exposure is computed from the CHILD access, independent of the
+parent-side policy: only tools explicitly declared `readOnly` are visible
+(parent deny rules still win, and a parent `enabled_tools` allowlist can only
+SHRINK the surface — an empty allowlist allows nothing), and EVERY call
+confirms first. The parent's `enabled_tools` is a parent-side declaration, not
+child authorization; parent-side `auto` can never waive the child
+confirmation, and a confirmation dialog never upgrades the worker. Write
+children keep the per-tool/server policy from the parent config.
+`readOnlyHint` is a server self-report: it affects the managed tool surface
+only and is not a sandbox claim. Confirmations flow through the normal
+`pi_answer_agent` channel; a denied or cancelled confirmation sends no
+`tools/call` at all.
 
 The tool policy is not an OS sandbox and does not recreate Codex sandboxing.
 MCP `isError` results and transport failures surface as real tool errors via
@@ -166,7 +196,10 @@ than pretending it did not run.
   model-auth env vars). It is never persisted, logged, or included in events.
 - The guard and Pi worker do NOT inherit the daemon's environ: their base
   environment is built from the scope snapshot above, so session B never sees
-  session A's credentials. The bridge gives each MCP stdio server only the
+  session A's credentials. This base binding happens on EVERY scope bind,
+  independent of the inheritance master switch — with inheritance disabled a
+  worker still gets its own PATH/HOME (and never triggers any Codex source
+  access). The bridge gives each MCP stdio server only the
   same base keys plus that server's declared `env` values.
 - Persistence stores non-secret source fields only (codex_home, mode, enabled
   flag, variable NAMES in diagnostics, env NAMES in launch.json); profile env
@@ -198,7 +231,7 @@ than pretending it did not run.
 - Model pinning, run/request identities, single-session writer, receipts and
   result-hash acknowledgement are unchanged.
 
-## Known boundaries (unsupported in 0.2.1)
+## Known boundaries (unsupported in 0.2.2)
 
 - OAuth / ChatGPT-session authenticated MCP servers, dynamic
   `http_headers_helper`, remote executor stdio, sampling/elicitation, and

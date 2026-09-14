@@ -1,6 +1,6 @@
 [project]
 name = "subagent-pi-codex"
-version = "0.2.1"
+version = "0.2.2"
 description = "Local persistent subagent-pi via MCP and CLI"
 requires-python = ">=3.11"
 dependencies = []

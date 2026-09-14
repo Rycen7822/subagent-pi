@@ -154,6 +154,14 @@ class Runtime:
         # stable source pointer; re-resolving only fills gaps for legacy scopes.
         if scope['codex_home']:
             codex_home, mode = Path(scope['codex_home']), scope['codex_source'] or 'scope_env'
+        elif source_env and isinstance(source_env.get('CODEX_HOME'), str) and source_env['CODEX_HOME'].strip():
+            codex_home, mode = self._resolve_source(source_env)
+        elif scope['codex_source']:
+            # The scope HAD a source binding but the daemon restart wiped the
+            # in-memory/scope snapshot: never silently fall back to some other
+            # Codex home (e.g. the daemon user's ~/.codex). Demand a rebind.
+            raise AgentError('inheritance_source_unbound',
+                             'Scope lost its codex source binding after a daemon restart; the owning client must re-open the scope')
         else:
             codex_home, mode = self._resolve_source(source_env)
         if codex_home is None:
@@ -516,32 +524,45 @@ class Runtime:
                 with contextlib.suppress(OSError): os.close(receipt_w)
 
     def _bind_scope_source(self, sid, p, source):
-        """Persist non-secret source fields; keep secret env values in memory only."""
+        """Bind a scope in two independent layers.
+
+        Layer 1 (ALWAYS): the worker base environment — PATH/HOME/etc. from the
+        opening client, plus explicitly authorized child_env names. Without it a
+        child cannot even find its interpreter; it must not depend on whether
+        Codex capability inheritance is enabled.
+        Layer 2 (only when the master switch is on): resolve and bind the Codex
+        source, so skills/MCP can be inherited. Secrets stay in memory only in
+        both layers.
+        """
         inh=self.config['inheritance']
         scope=self.store.scope(sid)
-        if not inh.get('enabled',True):
-            # Master switch off: do not touch the binding or demand a source.
-            return
         env = source.get('env') if isinstance(source,dict) else None
+        master_enabled = bool(inh.get('enabled',True))
         explicit_home = p.get('codex_home')
         if explicit_home is not None:
             explicit_home = str(Path(text(explicit_home,'codex_home',4096)).expanduser().resolve())
             if not Path(explicit_home).is_dir(): raise AgentError('invalid_cwd','codex_home must be an existing directory')
-        home,mode = resolve_codex_home({**inh,'codex_home':explicit_home or inh.get('codex_home')},env)
-        stored=scope['codex_home']
-        if stored and home and Path(stored)!=Path(home) and explicit_home is None and p.get('inheritance') is None:
-            raise AgentError('inheritance_source_conflict',
-                f'Scope is bound to codex source {stored}; rebind explicitly with codex_home or inheritance parameters')
+        home=None; mode=None
+        if master_enabled:
+            home,mode = resolve_codex_home({**inh,'codex_home':explicit_home or inh.get('codex_home')},env)
+            stored=scope['codex_home']
+            if stored and home and Path(stored)!=Path(home) and explicit_home is None and p.get('inheritance') is None:
+                raise AgentError('inheritance_source_conflict',
+                    f'Scope is bound to codex source {stored}; rebind explicitly with codex_home or inheritance parameters')
         # A credential refresh must not silently flip the per-scope switch: keep
         # the current state unless the client passes inheritance explicitly.
         enabled=bool(scope['inheritance'])
         if p.get('inheritance') is False: enabled=False
         elif p.get('inheritance') is True: enabled=True
+        # Layer-2 fields stay untouched while the master switch is off: re-enabling
+        # later must not find them clobbered by a disabled-era rebind.
         self.store.execute('UPDATE scopes SET codex_home=?,codex_source=?,inheritance=? WHERE id=?',
-            (str(home) if home else None, mode if home else None, 1 if enabled else 0, sid))
+            ((str(home) if home else scope['codex_home']) if master_enabled else scope['codex_home'],
+             (mode if home else scope['codex_source']) if master_enabled else scope['codex_source'],
+             1 if enabled else 0, sid))
         if env is not None:
             names=set(BASE_KEYS) | {k for k in inh.get('child_env',[]) if isinstance(k,str)}
-            if home is not None:
+            if master_enabled and home is not None:
                 try:
                     servers,_=parse_mcp_servers(home,read_codex_config(home))
                     names |= referenced_env_names(servers)

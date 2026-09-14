@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.2.2 — 2026-09-14
+
+Five P1 fixes found by the d7ff1e9 review; each has a regression that was
+verified to FAIL against the unfixed code (red/green) and PASS after the fix.
+
+- P1-A (HTTP exchange lifecycle): the deadline, the caller's cancellation and
+  connection close now cover the WHOLE exchange — send, headers, body and
+  parsing — through one AbortController armed until settlement. `close()`
+  aborts every in-flight exchange and rejects new ones until an explicit
+  reconnect re-handshakes. Timeout and user cancellation stay distinguishable
+  and keep an explicit "server outcome is unknown" for calls that were sent.
+- P1-B (read-child policy): the parent's `enabled_tools` is no longer treated
+  as child authorization. A read child sees only tools explicitly declared
+  `readOnly` (deny rules still win; an explicit allowlist can only shrink the
+  surface), always confirms before calling, and a confirmation can never
+  upgrade the worker. Write children keep the per-tool/server policy.
+- P1-C (stdio async EPIPE): all writes go through one controlled `sendFrame`;
+  the stdin socket gets a real error listener installed before the first
+  write, which settles this connection's pending requests with a
+  deterministic transport error and marks the connection for reconnection.
+  Best-effort cancellation notices cannot crash the worker or turn a
+  cancellation into a success; stale bytes from a replaced process are
+  dropped by generation.
+- P1-D (tool discovery): `action=list` with a server connects that one server
+  and returns its VISIBLE tool names + short descriptions (parent deny/allow
+  and child access rules applied), with bounded pagination and an honest
+  `truncated` flag (size caps drop whole entries instead of cutting JSON).
+  The catalog invalidates on `tools/list_changed`; an in-flight crawl no
+  longer repopulates a cache that was invalidated mid-fetch.
+- P1-E (base environment vs inheritance): binding the worker base environment
+  (PATH/HOME/authorized child_env names) now happens on EVERY scope bind,
+  independent of the inheritance master switch; when the switch is off, no
+  Codex source is read at all (verified with a FIFO config that would block).
+  A scope whose source binding was lost in a daemon restart fails with
+  `inheritance_source_unbound` instead of silently falling back to the daemon
+  user's ~/.codex.
+
+New test layers (no model calls): bridge-host red/green matrix against real
+fake stdio/HTTP MCP servers (25 regressions), and a full CLI -> daemon ->
+guard -> fake-Pi subprocess chain for the environment binding.
+
 ## 0.2.1 — 2026-09-14
 
 Repair release based on the 0.2.0 review. Every finding is a behavior fix with

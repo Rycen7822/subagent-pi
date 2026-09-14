@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import tempfile
 import unittest
 
@@ -424,7 +425,6 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         after_codex=self.snapshot(self.codex)
         self.assertEqual(before_codex,after_codex)  # codex source tree untouched
         await self.mutation_close(s['agent_id'])
-        return s
     async def mutation_close(self,aid):
         return await self.rt.dispatch('close',{'scope':self.scope,'agent_id':aid,'request_id':self.key()})
     async def test_canary_never_reaches_disk(self):
@@ -742,6 +742,155 @@ class ScopeEnvIsolation(unittest.IsolatedAsyncioTestCase):
         wal=self.home/'registry.sqlite-wal'
         if wal.exists():
             self.assertNotIn(b'scope-secret-value',wal.read_bytes())
+
+class EnvironmentBindingChain(unittest.TestCase):
+    """P1-E end-to-end: a REAL CLI client -> autostarted daemon -> worker guard
+    -> fake-Pi subprocess chain. The client process carries a custom PATH, an
+    authorized auth canary name (value never asserted nor persisted), a
+    daemon-only canary, and the fake Pi records non-secret probe facts through
+    its own business-output file. Master switch OFF must keep the base
+    environment binding; Codex sources must not even be read."""
+    def _client_env(self, state, fakebin, home_tag):
+        env={k:v for k,v in os.environ.items() if k not in ('PI_AGENTS_HOME','PI_AGENTS_SCOPE','CODEX_HOME','PI_TEST_AUTH','PI_TEST_DAEMON_ONLY','PI_TEST_HOME_TAG','PI_TEST_PROBE_FILE','PI_TEST_PROBE_CMD')}
+        env['PI_AGENTS_HOME']=str(state)
+        env['PATH']=f'{fakebin}{os.pathsep}{env.get("PATH","")}'
+        env['PI_TEST_AUTH']='real-secret-123'          # value must never surface
+        env['PI_TEST_DAEMON_ONLY']='daemon-canary-x'   # must never reach the child
+        env['PI_TEST_HOME_TAG']=home_tag
+        env['PI_TEST_PROBE_CMD']='tag-interp'
+        return env
+
+    def _cli(self, cli, env, *args, check=True):
+        proc=subprocess.run([sys.executable,cli,*args],env=env,capture_output=True,text=True,timeout=120)
+        if check: self.assertEqual(proc.returncode,0,proc.stdout+proc.stderr)
+        return proc
+
+    def _scenario(self, state_config, codex_home_value, home_tag):
+        cli=str(ROOT/'bin'/'subagent-pi')
+        tmp=tempfile.TemporaryDirectory(prefix='env-chain-')
+        env=None
+        try:
+            root=Path(tmp.name); state=root/'state'; state.mkdir()
+            ws=root/'ws'; ws.mkdir()
+            fakebin=root/'bin'; fakebin.mkdir()
+            interp=fakebin/'tag-interp'
+            interp.write_text('#!/bin/sh\necho interp-ok\n'); interp.chmod(0o755)
+            # A FIFO as config.toml would BLOCK any reader: hard evidence the
+            # disabled path never opens the Codex source.
+            codex=root/'codex'; codex.mkdir()
+            if codex_home_value=='fifo':
+                os.mkfifo(codex/'config.toml')
+            (state/'config.toml').write_text(state_config)
+            probe=root/'probe.json'
+            env=self._client_env(state,fakebin,home_tag)
+            env['PI_TEST_PROBE_FILE']=str(probe)
+            if codex_home_value=='fifo':
+                env['CODEX_HOME']=str(codex)
+            elif codex_home_value:
+                env['CODEX_HOME']=str(codex_home_value)
+            opened=self._cli(cli,env,'scope','open','--cwd',str(ws),'--label','chain')
+            scope_id=json.loads(opened.stdout)['scope']
+            # The client binds the scope it opened; spawning into a DIFFERENT,
+            # never-bound scope would legitimately have no base environment.
+            spawn=self._cli(cli,env,'spawn','--scope',scope_id,'--cwd',str(ws),'--task','simple','--access','read',check=False)
+            self.assertEqual(spawn.returncode,0,spawn.stdout+spawn.stderr)
+            agent_id=json.loads(spawn.stdout)['agent_id']
+            launch_file=state/'agents'/agent_id/'launch.json'
+            for _ in range(40):  # boot completes asynchronously from the CLI's view
+                if probe.exists() and launch_file.exists(): break
+                time.sleep(0.25)
+            self.assertTrue(probe.exists(),f'probe missing; spawn said: {spawn.stdout} {spawn.stderr}')
+            data=json.loads(probe.read_text())
+            # Base environment is bound from THIS client, not the daemon environ:
+            self.assertEqual(data['rc'],0)                     # custom-PATH interpreter ran
+            self.assertIn('interp-ok',data['out'])
+            self.assertTrue(data['path'].startswith(str(fakebin)))
+            self.assertEqual(data['home_tag'],home_tag)
+            # Return the live handle: the TemporaryDirectory object MUST stay
+            # referenced by the caller or its finalizer deletes the state tree.
+            return data,state,env,cli,tmp
+        except Exception:
+            if env is not None:
+                subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True,timeout=30)
+            tmp.cleanup()
+            raise
+
+    def test_master_off_keeps_base_env_and_never_reads_source(self):
+        cfg='pi_command = '+fake_pi_command()+'\nstartup_timeout_seconds = 30\n\n[inheritance]\nenabled = false\nchild_env = ["PI_TEST_AUTH", "PI_TEST_PROBE_FILE", "PI_TEST_PROBE_CMD", "PI_TEST_HOME_TAG"]\n'
+        data,state,env,cli,tmp_s=self._scenario(cfg,'fifo','A')
+        try:
+            self.assertTrue(data['has_auth'])          # authorized auth name still delivered
+            self.assertFalse(data['has_daemon_only'])  # daemon-only canary did NOT reach the child
+            # No inheritance import happened: the FIFO was never opened (no block,
+            # no error) and launch argv carries no bridge/skill flags.
+            launches=list((state/'agents').glob('*/launch.json'))
+            self.assertTrue(launches)
+            argv=json.loads(launches[0].read_text())['argv']
+            self.assertNotIn('--extension',argv)
+            self.assertNotIn('--skill',argv)
+            # The authorized secret value never reached any control-plane file.
+            for p in state.rglob('*'):
+                if p.is_file():
+                    self.assertNotIn(b'real-secret-123',p.read_bytes(),p)
+        finally:
+            subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True,timeout=30)
+            tmp_s.cleanup()
+
+    def test_two_scopes_get_their_own_chain_env(self):
+        cfg='pi_command = '+fake_pi_command()+'\nstartup_timeout_seconds = 30\n\n[inheritance]\nenabled = false\nchild_env = ["PI_TEST_AUTH", "PI_TEST_PROBE_FILE", "PI_TEST_PROBE_CMD", "PI_TEST_HOME_TAG"]\n'
+        data_a,state_a,env_a,cli_a,tmp_a=self._scenario(cfg,None,'A')
+        try:
+            self.assertEqual(data_a['home_tag'],'A')
+        finally:
+            subprocess.run([sys.executable,cli_a,'daemon','stop','--force'],env=env_a,capture_output=True,timeout=30)
+            tmp_a.cleanup()
+        data_b,state_b,env_b,cli_b,tmp_b=self._scenario(cfg,None,'B')
+        try:
+            self.assertEqual(data_b['home_tag'],'B')   # not scope A's value
+        finally:
+            subprocess.run([sys.executable,cli_b,'daemon','stop','--force'],env=env_b,capture_output=True,timeout=30)
+            tmp_b.cleanup()
+
+    def test_reenabling_inheritance_restores_import(self):
+        tmp=tempfile.TemporaryDirectory(prefix='env-chain-on-')
+        try:
+            root=Path(tmp.name); state=root/'state'; state.mkdir()
+            ws=root/'ws'; ws.mkdir()
+            fakebin=root/'bin'; fakebin.mkdir()
+            interp=fakebin/'tag-interp'; interp.write_text('#!/bin/sh\necho ok\n'); interp.chmod(0o755)
+            codex=make_codex_home(root/'src',config=STDIO_TOML)
+            make_skill(codex/'skills','alpha')
+            (state/'config.toml').write_text('pi_command = '+fake_pi_command()+'\nstartup_timeout_seconds = 30\n\n[inheritance]\nenabled = false\nchild_env = ["PI_TEST_AUTH", "PI_TEST_PROBE_FILE", "PI_TEST_PROBE_CMD", "PI_TEST_HOME_TAG"]\n')
+            probe=root/'probe.json'
+            env=self._client_env(state,fakebin,'A')
+            env['PI_TEST_PROBE_FILE']=str(probe)
+            env['CODEX_HOME']=str(codex)
+            env['TOKEN_VAR']='tv'  # referenced by the fake codex config; proves env resolution after rebind
+            cli=str(ROOT/'bin'/'subagent-pi')
+            opened=self._cli(cli,env,'scope','open','--cwd',str(ws))
+            scope_id=json.loads(opened.stdout)['scope']
+            self._cli(cli,env,'spawn','--scope',scope_id,'--cwd',str(ws),'--task','simple','--access','read')
+            launches=list((state/'agents').glob('*/launch.json'))
+            argv=json.loads(launches[0].read_text())['argv']
+            self.assertNotIn('--extension',argv)  # master off: no import
+            # Flip the master switch on and rebind: import comes back.
+            (state/'config.toml').write_text('pi_command = '+fake_pi_command()+'\nstartup_timeout_seconds = 30\n\n[inheritance]\nenabled = true\nchild_env = ["PI_TEST_AUTH", "PI_TEST_PROBE_FILE", "PI_TEST_PROBE_CMD", "PI_TEST_HOME_TAG"]\n')
+            subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True,timeout=30)
+            # The restart wiped the daemon's source memory: the owning client
+            # must re-open the scope to rebind (no silent ~/.codex fallback).
+            self._cli(cli,env,'scope','open','--cwd',str(ws),'--label','chain','--scope',scope_id)
+            doc=self._cli(cli,env,'doctor','--inheritance')
+            sc=json.loads(doc.stdout)['inheritance']['scopes'][0]
+            self.assertEqual(sc['codex_home'],str(codex))  # rebind bound the client's source
+            spawn=self._cli(cli,env,'spawn','--scope',scope_id,'--cwd',str(ws),'--task','simple','--access','read')
+            agent_id=json.loads(spawn.stdout)['agent_id']
+            argv2=json.loads((state/'agents'/agent_id/'launch.json').read_text())['argv']
+            self.assertIn('--extension',argv2)    # inheritance restored end to end
+            self.assertIn('--skill',argv2)
+            self.assertIn('alpha',' '.join(argv2))  # the codex skill path is referenced in place
+        finally:
+            subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True)
+            tmp.cleanup()
 
 if __name__=='__main__':
     unittest.main()
