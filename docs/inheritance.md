@@ -1,4 +1,4 @@
-# Codex Inheritance for Managed Children (0.2.4)
+# Codex Inheritance for Managed Children (0.2.5)
 
 Managed subagents started by this plugin can use your Codex-side global skills
 and MCP servers. Normal `pi` sessions are never affected: inheritance is added
@@ -130,9 +130,14 @@ self-describes through `_meta` (`io.modelcontextprotocol/protocolVersion`,
 `Mcp-Method` headers (`Mcp-Name` on `tools/call`). `auto` probes once with the
 side-effect-free `server/discover` and falls back to the legacy handshake ONLY
 on proof of legacy-only (HTTP 404/405 or JSON-RPC -32601 on that probe); a
-generic 4xx/5xx is an error, never a downgrade trigger. `x-mcp-header`
-argument mirroring is unsupported: such calls are refused before sending, so
-model-controlled values can never become HTTP headers.
+generic 4xx/5xx is an error, never a downgrade trigger. `x-mcp-header` is honored as a SCHEMA
+annotation: a tool may declare that a plain string/integer/boolean argument is
+mirrored into an `Mcp-Param-*` header on modern calls (body unchanged; absent
+arguments produce no header; unsafe integers and control-character values are
+refused). Annotations are validated at discovery (HTTP token, case-insensitive
+uniqueness, no dynamic paths); a tool with an invalid annotation is excluded
+and rejected by describe/call without failing the server. stdio and legacy
+connections ignore the annotation.
 
 ## Codex MCP config compatibility (0.2.4)
 
@@ -143,9 +148,15 @@ frozen upstream version string.
 
 - mapped: transport fields (`command/args/env/env_vars/cwd`,
   `url/auth/bearer_token_env_var/http_headers/env_http_headers`),
-  `startup_timeout_sec`/`startup_timeout_ms` (ms wins, full precision kept),
-  `tool_timeout_sec`, `enabled`, `required`, `enabled_tools`,
-  `disabled_tools`, `default_tools_approval_mode`, `tools.<n>.approval_mode`.
+  `startup_timeout_sec`/`startup_timeout_ms` (sec wins when both present,
+  current Codex semantics), `tool_timeout_sec`, `enabled`, `required`,
+  `enabled_tools`, `disabled_tools`, `default_tools_approval_mode`,
+  `tools.<n>.approval_mode`.
+
+The `codex_mcp` proxy tool is registered with sequential execution and an
+in-memory promise chain, so inherited MCP calls serialize conservatively no
+matter what a server declares in `supports_parallel_tool_calls` (recorded as a
+no-effect hint).
 - accepted_no_effect: `supports_parallel_tool_calls` (the proxy tool executes
   calls sequentially — do not advertise parallel safety) and the legacy
   per-server `name` label; recorded as diagnostics, never fatal.

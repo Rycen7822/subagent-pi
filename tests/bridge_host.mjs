@@ -87,7 +87,7 @@ async function runStep(step) {
     setTimeout(() => { for (const cb of handlers['session_shutdown'] ?? []) cb(); }, step.closeAfterMs);
   }
   try {
-    const ctx = { ui: { confirm: async () => { confirmCount += 1; return step.confirm === true; } } };
+    const ctx = { ui: { confirm: async () => { confirmCount += 1; if (step.confirmDelayMs) await new Promise((r) => setTimeout(r, step.confirmDelayMs)); return step.confirm === true; } } };
     const out = await registered.execute('call-1', {
       action: step.action, server: step.server, tool: step.tool, args: step.args ?? {},
     }, signal.signal, null, ctx);
@@ -110,7 +110,7 @@ for (const step of actions) {
 await Promise.allSettled(launched.splice(0)); // never leave a step unsettled
 
 writeSync(openSync(resultPath, 'w'), JSON.stringify({
-  registered: registered ? { name: registered.name, parameters: registered.parameters } : null,
+  registered: registered ? { name: registered.name, parameters: registered.parameters, executionMode: registered.executionMode } : null,
   receipt,
   confirm_count: confirmCount,
   results,

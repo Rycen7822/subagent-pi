@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import tomllib
 import sqlite3
 import subprocess
 import sys
@@ -109,7 +110,7 @@ class SkillCollection(unittest.TestCase):
     def test_disabled_by_skills_config(self):
         s=make_skill(self.home/'skills','gone')
         config=f'[[skills.config]]\npath = "{s}/SKILL.md"\nenabled = false\n'
-        raw=read_codex_config(self.home) if False else __import__('tomllib').loads(config)
+        raw=tomllib.loads(config)
         selected,diag=collect_skills(self.home,raw,None,[])
         self.assertEqual(selected,[])
         self.assertTrue(any('disabled by codex' in d.reason for d in diag))
@@ -169,7 +170,7 @@ class McpParsing(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(prefix='inh-mcp-'); self.base=Path(self.tmp.name)
         self.home=make_codex_home(self.base)
     def tearDown(self): self.tmp.cleanup()
-    def parse(self,config): return parse_mcp_servers(self.home,__import__('tomllib').loads(config))
+    def parse(self,config): return parse_mcp_servers(self.home,tomllib.loads(config))
     def test_stdio_fields_normalized(self):
         servers,diag=self.parse(STDIO_TOML)
         self.assertEqual(len(servers),1)
@@ -916,9 +917,9 @@ output_token_limit = 50
 '''
         servers,diag=self.parse(cfg)
         self.assertEqual(servers[0]['disposition'],'ok')
-        self.assertEqual(servers[0]['startup_timeout_sec'],2.5)  # ms wins; precision preserved
+        self.assertEqual(servers[0]['startup_timeout_sec'],7)  # sec wins over ms (Codex semantics)
         reasons=[d.reason for d in diag]
-        self.assertTrue(any('startup_timeout_ms takes precedence' in r for r in reasons))
+        self.assertTrue(any('startup_timeout_ms ignored' in r for r in reasons))
         self.assertTrue(any('supports_parallel_tool_calls' in r for r in reasons))
         self.assertTrue(any('legacy name label' in r for r in reasons))
         self.assertEqual(servers[0]['tool_output_limits'].get('t'),200)  # 50 tokens * 4 bytes, tighten-only
@@ -952,11 +953,11 @@ required = {required}
 
     def test_http_protocol_mode_passthrough_and_fallback_default(self):
         http='[mcp_servers.s]\nurl = "http://x/mcp"\n'
-        servers,_=parse_mcp_servers(self.home,__import__('tomllib').loads(http),'modern_2026_07_28')
+        servers,_=parse_mcp_servers(self.home,tomllib.loads(http),'modern_2026_07_28')
         self.assertEqual(servers[0]['protocol_mode'],'modern_2026_07_28')
-        servers,_=parse_mcp_servers(self.home,__import__('tomllib').loads(http),'banana')
+        servers,_=parse_mcp_servers(self.home,tomllib.loads(http),'banana')
         self.assertEqual(servers[0]['protocol_mode'],'auto')
-        servers,_=parse_mcp_servers(self.home,__import__('tomllib').loads(http))
+        servers,_=parse_mcp_servers(self.home,tomllib.loads(http))
         self.assertEqual(servers[0]['protocol_mode'],'auto')
 
     def test_compatibility_baseline_constant(self):

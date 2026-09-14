@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.5 — 2026-09-15
+
+Three P1 fixes, each red-verified against 04a46db.
+
+- P1-A (x-mcp-header): the annotation is a SCHEMA declaration on plain-typed
+  properties, not an argument. Discovery parses inputSchema.properties into an
+  in-memory extraction plan, validating per the 2026-07-28 rules: non-empty
+  HTTP token, case-insensitively unique, no control characters, plain
+  string/integer/boolean types only, no array/items/oneOf/anyOf/allOf/not/
+  conditional/$ref dynamic paths. Modern HTTP tools/call mirrors declared
+  arguments as Mcp-Param-* headers with the body unchanged; an absent
+  argument produces no header; unsafe integers and control-character values
+  are refused before sending. Tools with invalid annotations are excluded
+  from the catalog and rejected by describe/call without failing the server;
+  stdio and legacy connections ignore the annotation. The previous
+  arguments-based check was removed.
+- P1-B (proxy serialization): codex_mcp is registered with
+  executionMode "sequential" AND serializes in memory via a promise chain —
+  concurrent sibling calls never overlap server-side; a cancelled first call
+  never poisons the chain. supports_parallel_tool_calls diagnostics now state
+  the enforced behavior.
+- P1-C (stdio generations): a StdioConnection maps to exactly one handshake
+  generation. When its process dies (exit or EPIPE), the connection is dead:
+  the in-flight/pending operation fails, tools/call is never replayed, and the
+  next explicit operation builds a NEW process whose first RPC is initialize.
+  No respawn ever happens inside a dead connection.
+- startup_timeout: sec wins over ms when both are present (current Codex
+  semantics), correcting 0.2.4's "ms wins".
+
+New regressions (all localhost fakes, zero model calls): schema-annotation
+header mirroring against a strict modern server, concurrent proxy calls with
+server-side start/end ordering, confirm-pending process death (exit and EPIPE)
+with per-process first-RPC checks. Existing lifecycle tests updated for the
+serialized proxy.
+
 ## 0.2.4 — 2026-09-15
 
 Two MCP/Codex compatibility P1 fixes, each verified red against 6741777.

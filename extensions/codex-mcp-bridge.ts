@@ -43,6 +43,37 @@ interface ToolMeta {
   description?: string;
   readOnly: boolean;
   inputSchema?: unknown;
+  headerPlan: HeaderPlan;
+}
+// x-mcp-header (MCP 2026-07-28): a tool may declare that a plain
+// string/integer/boolean argument is mirrored into an HTTP header. The plan is
+// computed once from the inputSchema at discovery and kept in memory only.
+type HeaderPlan = { ok: true; entries: { param: string; header: string }[] } | { ok: false; reason: string };
+const HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const HEADER_DYNAMIC_KEYS = ["items", "oneOf", "anyOf", "allOf", "not", "if", "then", "else", "$ref", "dependentSchemas", "patternProperties"];
+function parseHeaderPlan(schema: unknown): HeaderPlan {
+  const entries: { param: string; header: string }[] = [];
+  const seen = new Set<string>();  // header names, lower-cased for case-insensitive uniqueness
+  if (typeof schema !== "object" || schema === null) return { ok: true, entries };
+  const properties = (schema as { properties?: unknown }).properties;
+  if (properties === undefined) return { ok: true, entries };
+  if (typeof properties !== "object" || properties === null) return { ok: false, reason: "inputSchema.properties is not an object" };
+  for (const [param, def] of Object.entries(properties as Record<string, unknown>)) {
+    if (typeof def !== "object" || def === null || !("x-mcp-header" in (def as object))) continue;
+    const why = (reason: string): HeaderPlan => ({ ok: false, reason: `property '${param}': ${reason}` });
+    const annotation = (def as Record<string, unknown>)["x-mcp-header"];
+    if (typeof annotation !== "string" || !annotation) return why("x-mcp-header annotation must be a non-empty string");
+    if (!HEADER_TOKEN.test(annotation)) return why("x-mcp-header annotation is not a valid HTTP token");
+    if (seen.has(annotation.toLowerCase())) return why(`x-mcp-header '${annotation}' duplicates an earlier header (case-insensitive)`);
+    for (const key of HEADER_DYNAMIC_KEYS) {
+      if (key in (def as Record<string, unknown>)) return why(`x-mcp-header does not support '${key}' dynamic paths`);
+    }
+    const type = (def as Record<string, unknown>).type;
+    if (type !== "string" && type !== "integer" && type !== "boolean") return why("x-mcp-header requires type string, integer or boolean");
+    seen.add(annotation.toLowerCase());
+    entries.push({ param, header: annotation });
+  }
+  return { ok: true, entries };
 }
 interface Bootstrap {
   v: number;
@@ -136,6 +167,7 @@ function toToolMeta(raw: unknown): ToolMeta | null {
     description: typeof t.description === "string" ? t.description.slice(0, 200) : undefined,
     readOnly: t.annotations?.readOnlyHint === true,
     inputSchema: schema,
+    headerPlan: parseHeaderPlan(schema),
   };
 }
 
@@ -152,7 +184,8 @@ abstract class McpConnection {
   get reusable(): boolean { return !this.dead; }
   abstract request(method: string, params: unknown, timeoutSec: number, opts?: { notification?: boolean; signal?: AbortSignal }): Promise<unknown>;
   abstract initialize(): Promise<void>;
-  abstract callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal): Promise<unknown>;
+  abstract callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal,
+                     headerPlan?: { param: string; header: string }[]): Promise<unknown>;
   abstract close(): void;
   async ensureTools(cfg: ServerCfg, signal?: AbortSignal): Promise<ToolMeta[]> {
     // Cached in memory; catalogTruncated records a bound-stopped crawl instead of
@@ -213,8 +246,14 @@ class StdioConnection extends McpConnection {
 
   private ensureProcess(): ChildProcess {
     if (this.closed) throw new Error("stdio connection is closed");
-    if (this.proc && this.exitError === null) return this.proc;
-    if (this.proc) this.close();
+    if (this.proc) {
+      if (this.exitError === null) return this.proc;
+      // The process died after the handshake: this connection is FINISHED. A
+      // replacement must be built by ensureConnection (which re-runs the full
+      // initialize handshake); respawning in place would hand a fresh process
+      // tools/call as its very first frame.
+      throw new Error(`${this.exitError}; this connection is finished, the next explicit operation re-initializes a new process`);
+    }
     if (!this.cfg.command) throw new Error("stdio server missing command");
     // Recursion guard by execution definition: renaming the server in the
     // config does not bypass this. Covers the direct entrypoint, entry-script
@@ -231,9 +270,7 @@ class StdioConnection extends McpConnection {
     const env: Record<string, string> = {};
     for (const key of BASE_ENV) if (process.env[key]) env[key] = process.env[key] as string;
     Object.assign(env, this.cfg.env ?? {});
-    this.exitError = null;
-    this.stdinBroken = false;
-    this.generation += 1;
+    this.generation += 1;  // one connection = one handshake generation, ever
     const myGeneration = this.generation;
     const child = spawn(this.cfg.command, args, {
       cwd: this.cfg.cwd || undefined,
@@ -371,6 +408,7 @@ class StdioConnection extends McpConnection {
     await this.request("notifications/initialized", {}, this.cfg.startup_timeout_sec, { notification: true });
   }
 
+  // stdio ignores x-mcp-header: header mirroring is an HTTP-transport feature
   async callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal): Promise<unknown> {
     return await this.request("tools/call", { name, arguments: args ?? {} }, timeoutSec, { signal });
   }
@@ -394,7 +432,7 @@ const ABORT_DEADLINE = Symbol("deadline");
 // Modern (2026-07-28): stateless — no handshake, every request self-describes via
 // _meta and the MCP-Protocol-Version / Mcp-Method / Mcp-Name headers.
 const MODERN_VERSION = "2026-07-28";
-const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.4" };
+const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.5" };
 const MODERN_META = {
   "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
   "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
@@ -423,7 +461,8 @@ class HttpConnection extends McpConnection {
     return { ...base, _meta: { ...((base._meta ?? {}) as Record<string, unknown>), ...MODERN_META } };
   }
 
-  private headers(method?: string, toolName?: string, httpMethod = "POST"): Record<string, string> {
+  private headers(method?: string, toolName?: string, httpMethod = "POST",
+                  paramHeaders?: Record<string, string>): Record<string, string> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
@@ -441,6 +480,7 @@ class HttpConnection extends McpConnection {
       if (this.negotiatedVersion) headers["mcp-protocol-version"] = this.negotiatedVersion;  // negotiated at initialize
       if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
     }
+    if (paramHeaders) Object.assign(headers, paramHeaders);  // Mcp-Param-* from the tool's x-mcp-header plan
     return headers;
   }
 
@@ -500,7 +540,7 @@ class HttpConnection extends McpConnection {
   }
 
   async request(method: string, params: unknown, timeoutSec: number,
-                opts: { notification?: boolean; signal?: AbortSignal; toolName?: string } = {}): Promise<unknown> {
+                opts: { notification?: boolean; signal?: AbortSignal; toolName?: string; paramHeaders?: Record<string, string> } = {}): Promise<unknown> {
     // One exchange, one AbortController: the deadline, caller cancellation and
     // connection close all cover send/headers/body/parse until settlement, so a
     // hung body still hits the deadline. No exchange is ever retried here.
@@ -521,7 +561,7 @@ class HttpConnection extends McpConnection {
       const body = id === null ? { jsonrpc: "2.0", method, params: wireParams } : { jsonrpc: "2.0", id, method, params: wireParams };
       const response = await fetch(this.cfg.url as string, {
         method: "POST",
-        headers: this.headers(method, opts.toolName),
+        headers: this.headers(method, opts.toolName, "POST", opts.paramHeaders),
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -604,8 +644,28 @@ class HttpConnection extends McpConnection {
     }
   }
 
-  async callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal): Promise<unknown> {
-    return await this.request("tools/call", { name, arguments: args ?? {} }, timeoutSec, { signal, toolName: name });
+  async callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal,
+                 headerPlan?: { param: string; header: string }[]): Promise<unknown> {
+    let paramHeaders: Record<string, string> | undefined;
+    if (this.mode === "modern" && headerPlan && headerPlan.length > 0) {
+      // Mirror only declared, plain-typed arguments; the body keeps every argument.
+      paramHeaders = {};
+      const a = (typeof args === "object" && args !== null ? args : {}) as Record<string, unknown>;
+      for (const entry of headerPlan) {
+        const value = a[entry.param];
+        if (value === undefined) continue;  // an absent argument produces no header
+        if (typeof value === "number" && !Number.isSafeInteger(value)) {
+          throw new Error(`argument ${entry.param} is not a safe integer; refusing to mirror it as a header`);
+        }
+        const s = String(value);
+        if (/[\r\n\x00-\x1F\x7F]/.test(s)) {
+          throw new Error(`argument ${entry.param} contains control characters; refusing to mirror it as a header`);
+        }
+        paramHeaders[`Mcp-Param-${entry.header}`] = s;
+      }
+      if (Object.keys(paramHeaders).length === 0) paramHeaders = undefined;
+    }
+    return await this.request("tools/call", { name, arguments: args ?? {} }, timeoutSec, { signal, toolName: name, paramHeaders });
   }
 
   close(): void {
@@ -745,7 +805,9 @@ export default async function (pi: ExtensionAPI) {
       // level 2: connect THIS server on demand; visibility rules apply here, not just at call time
       const conn = await ensureConnection(cfg, signal);
       const tools = await conn.ensureTools(cfg, signal);
-      const visible = tools.filter((t) => toolVisible(cfg, t));
+      // An invalid x-mcp-header annotation excludes just that tool; the server and
+      // its other tools stay usable.
+      const visible = tools.filter((t) => toolVisible(cfg, t) && t.headerPlan.ok);
       const entries = visible.map((t) => ({ name: t.name, description: t.description ?? "", read_only: t.readOnly }));
       let truncated = conn.catalogTruncated || visible.length !== tools.length;
       while (JSON.stringify({ server: serverName, tools: entries, truncated }).length > MAX_RESULT_TEXT && entries.length > 0) {
@@ -775,12 +837,18 @@ export default async function (pi: ExtensionAPI) {
       if (!toolMeta.inputSchema) {
         throw new Error(`Tool ${serverName}.${toolName} has no usable inputSchema (missing or larger than ${MAX_SCHEMA_BYTES} bytes)`);
       }
+      if (!toolMeta.headerPlan.ok) {
+        throw new Error(`Tool ${serverName}.${toolName} declares an invalid x-mcp-header annotation (${toolMeta.headerPlan.reason}) and is not callable`);
+      }
       const report = { server: serverName, tool: toolMeta.name, description: toolMeta.description, inputSchema: toolMeta.inputSchema };
       return { content: [{ type: "text", text: JSON.stringify(report) }], details: report };
     }
     // action === "call": same effective policy, checked against current metadata right before execution
     if (!toolVisible(cfg, toolMeta)) {
       throw new Error(`Tool ${serverName}.${toolName} is not available to this managed child (access=${access}; only explicitly read-only tools are exposed)`);
+    }
+    if (!toolMeta.headerPlan.ok) {
+      throw new Error(`Tool ${serverName}.${toolName} declares an invalid x-mcp-header annotation (${toolMeta.headerPlan.reason}) and is not callable`);
     }
     if (needsConfirmation(cfg, toolMeta)) {
       const argsPreview = JSON.stringify(params.args ?? {}).slice(0, 500);
@@ -793,13 +861,8 @@ export default async function (pi: ExtensionAPI) {
       }
     }
     if (signal?.aborted) throw new CancelledError(false);
-    if (params.args && typeof params.args === "object" && "x-mcp-header" in (params.args as Record<string, unknown>)) {
-      // Header mirroring from tool arguments would turn model-controlled values into
-      // HTTP headers; unsupported here, so such calls are refused, never sent.
-      throw new Error("x-mcp-header mirroring is not supported by this bridge; the tool cannot be called");
-    }
     try {
-      const result = await conn.callTool(toolName, params.args ?? {}, cfg.tool_timeout_sec, signal) as { isError?: boolean } | undefined;
+      const result = await conn.callTool(toolName, params.args ?? {}, cfg.tool_timeout_sec, signal, toolMeta.headerPlan.ok ? toolMeta.headerPlan.entries : undefined) as { isError?: boolean } | undefined;
       let text = describeResult(result);
       // output_token_limit: enforced here at the serialization boundary with a
       // conservative 4 bytes/token budget; it can only TIGHTEN the default cap.
@@ -817,8 +880,20 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
+  // P1-B: one proxy tool fronts every inherited server, so all calls through it
+  // serialize conservatively. Enforced twice: here with an in-memory promise
+  // chain (no persistent scheduler), and via Pi's executionMode below.
+  let executeChain: Promise<unknown> = Promise.resolve();
+  const serializedExecute = async (id: string, params: { action: "list" | "describe" | "call"; server?: string; tool?: string; args?: Record<string, unknown> },
+                                   signal: AbortSignal, onUpdate: unknown, ctx: { ui: { confirm: (title: string, message: string) => Promise<boolean> } }) => {
+    const run = executeChain.then(() => execute(id, params, signal, onUpdate, ctx));
+    executeChain = run.then(() => undefined, () => undefined);  // a cancelled first call never poisons the chain
+    return run;
+  };
+
   pi.registerTool({
     name: "codex_mcp",
+    executionMode: "sequential",
     label: "Codex MCP bridge",
     description:
       "Discover and call tools on Codex MCP servers inherited into this managed child. " +
@@ -828,7 +903,7 @@ export default async function (pi: ExtensionAPI) {
       "a tool's full inputSchema; action=call invokes server+tool with an args object. " +
       "Connections live in memory for this worker's lifetime; nothing is cached on disk.",
     parameters,
-    execute,
+    execute: serializedExecute,
   });
 
   // Readiness receipt: required servers initialize eagerly so the daemon knows

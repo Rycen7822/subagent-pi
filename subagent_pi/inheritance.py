@@ -37,7 +37,7 @@ MCP_FIELD_COMPAT = {
     'enabled_tools': ('mapped', '', 'stdio http'), 'disabled_tools': ('mapped', '', 'stdio http'),
     'default_tools_approval_mode': ('mapped', '', 'stdio http'), 'tools': ('mapped', '', 'stdio http'),
     'experimental_environment': ('explicitly_unsupported', 'remote executor is not supported in managed children', 'stdio'),
-    'supports_parallel_tool_calls': ('accepted_no_effect', 'concurrency hint; the proxy tool executes calls sequentially', 'stdio http'),
+    'supports_parallel_tool_calls': ('accepted_no_effect', 'concurrency hint; the proxy tool is registered sequential and serializes every call regardless', 'stdio http'),
     'name': ('accepted_no_effect', 'legacy name label; the config key identifies the server', 'stdio http'),
     'environment_id': ('conditional_local', 'no remote executor in managed children', 'stdio http'),
     'omit_tools_from': ('explicitly_unsupported', 'ToolExposureSurface cannot be mapped onto the proxy tool surface without guessing', 'stdio http'),
@@ -377,17 +377,18 @@ def parse_mcp_servers(codex_home: Path, raw: dict, protocol_mode: str = 'auto') 
                          approval_default=policy['default'],
                          tool_approval=policy['tools'])
             diagnostics.extend(pdiag)
-            if server.get('startup_timeout_ms') is not None:
-                ms, mdiag = _int_field(server, 'startup_timeout_ms', 10000, maximum=3600000)
-                entry['startup_timeout_sec'] = ms / 1000  # ms wins, matching Codex; precision is preserved
-                if server.get('startup_timeout_sec') is not None:
-                    diagnostics.append(Diagnostic('mcp', name,
-                                                  'startup_timeout_sec ignored: startup_timeout_ms takes precedence (Codex semantics)'))
-                diagnostics.extend(mdiag)
-            else:
+            if server.get('startup_timeout_sec') is not None:
+                # sec wins over ms when both are present (current Codex semantics)
                 timeout, tdiag = _int_field(server, 'startup_timeout_sec', 10)
                 entry['startup_timeout_sec'] = timeout
+                if server.get('startup_timeout_ms') is not None:
+                    diagnostics.append(Diagnostic('mcp', name,
+                                                  'startup_timeout_ms ignored: startup_timeout_sec takes precedence (Codex semantics)'))
                 diagnostics.extend(tdiag)
+            else:
+                ms, mdiag = _int_field(server, 'startup_timeout_ms', 10000, maximum=3600000)
+                entry['startup_timeout_sec'] = ms / 1000
+                diagnostics.extend(mdiag)
             tool_timeout, ttdiag = _int_field(server, 'tool_timeout_sec', 60)
             entry['tool_timeout_sec'] = tool_timeout
             entry['tool_output_limits'] = policy['budgets']

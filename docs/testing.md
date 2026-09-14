@@ -21,6 +21,8 @@ bridge 主机测试（tests/test_bridge_host.py + tests/bridge_host.mjs）用 ji
 
 上述核心回归均做过红-绿验证：对未修复实现运行会失败，对修复后代码通过。
 
+0.2.5 回归：schema 注解 x-mcp-header（strict modern server 校验实收 Mcp-Param-* 与 body 不变）、并发提交下 proxy 串行（server 端 start/end 顺序）、confirm 挂起期间进程死亡（exit/EPIPE，逐进程首 RPC 必为 initialize、副作用恰一次）。
+
 协议一致性夹具（0.2.4）：`fake_mcp_http.py` 提供 strict modern 2026-07-28 模式（缺
 `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name`/modern `_meta` 即 400 拒绝）、legacy-only
 discovery 模式（`server/discover` → 404 证明可回退）与 legacy session 过期模式

@@ -17,8 +17,7 @@ Modes (FAKE_MCP_HTTP_MODE):
 
 FAKE_MCP_SESSION_EXPIRE_AFTER=N: legacy mode; the N-th request that carries a
 session id gets HTTP 404 (expired session), later re-initialized sessions work.
-FAKE_MCP_REQUIRE_LEGACY_HEADER=1: legacy mode; requests after initialize must
-carry mcp-protocol-version: 2025-06-18 or get HTTP 400.
+FAKE_MCP_HEADER_TOOLS=1: adds the x-mcp-header fixture tools (valid + invalid).
 """
 from __future__ import annotations
 import json
@@ -31,7 +30,6 @@ MODE = os.environ.get('FAKE_MCP_HTTP_MODE', 'normal')
 EVENTS = os.environ.get('FAKE_MCP_HTTP_EVENTS')
 CALL_LOG = os.environ.get('FAKE_MCP_HTTP_CALL_LOG')
 EXPIRE_AFTER = int(os.environ.get('FAKE_MCP_SESSION_EXPIRE_AFTER', '0'))
-REQUIRE_LEGACY_HEADER = os.environ.get('FAKE_MCP_REQUIRE_LEGACY_HEADER') == '1'
 MODERN_VERSION = '2026-07-28'
 MODERN_META_KEY = 'io.modelcontextprotocol/protocolVersion'
 
@@ -51,9 +49,32 @@ TOOLS = [
                      "additionalProperties": False},
      "annotations": {"readOnlyHint": True}},
     {"name": "publish", "description": "Publish content",
-     "inputSchema": {"type": "object", "properties": {"body": {"type": "string"}}, "required": ["body"]},
-     "annotations": {"readOnlyHint": False}},
+     "inputSchema": {"type": "object", "properties": {"body": {"type": "string"}}}, "required": ["body"]},
+    {"name": "hdr", "description": "Header-mirroring tool",
+     "inputSchema": {"type": "object", "properties": {
+         "trace_id": {"type": "string", "x-mcp-header": "trace-id"},
+         "count": {"type": "integer", "x-mcp-header": "count"},
+         "flag": {"type": "boolean", "x-mcp-header": "x-flag"}},
+         "required": ["trace_id"], "additionalProperties": False},
+     "annotations": {"readOnlyHint": True}},
 ]
+if os.environ.get('FAKE_MCP_HEADER_TOOLS') == '1':
+    TOOLS = TOOLS + [
+        {"name": "badhdr_array", "description": "array-typed header param",
+         "inputSchema": {"type": "object", "properties": {"v": {"type": "array", "items": {"type": "string"}, "x-mcp-header": "arr"}}}},
+        {"name": "badhdr_dup", "description": "duplicate header names",
+         "inputSchema": {"type": "object", "properties": {"a": {"type": "string", "x-mcp-header": "dup"},
+                                                         "b": {"type": "string", "x-mcp-header": "DUP"}}}},
+        {"name": "badhdr_ctrl", "description": "control chars in annotation",
+         "inputSchema": {"type": "object", "properties": {"v": {"type": "string", "x-mcp-header": "bad\nheader"}}}},
+        {"name": "badhdr_empty", "description": "empty annotation",
+         "inputSchema": {"type": "object", "properties": {"v": {"type": "string", "x-mcp-header": ""}}}},
+        {"name": "badhdr_ref", "description": "$ref dynamic path",
+         "inputSchema": {"type": "object", "properties": {"v": {"$ref": "#/definitions/x", "x-mcp-header": "r"}}}},
+        {"name": "badhdr_oneof", "description": "oneOf dynamic path",
+         "inputSchema": {"type": "object", "properties": {"v": {"oneOf": [{"type": "string"}], "x-mcp-header": "o"}}}},
+    ]
+
 
 STATE = {'session_counter': 0, 'expire_counter': 0}
 
@@ -127,8 +148,6 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
         if method == 'initialize':
-            if REQUIRE_LEGACY_HEADER and proto_header and proto_header != '2025-06-18':
-                self.send_response(400); self.send_header('content-length', '0'); self.end_headers(); return
             STATE['session_counter'] += 1
             STATE['expire_counter'] = 0
             event('initialize-received', session=f"sess-{STATE['session_counter']}")
@@ -146,7 +165,8 @@ class Handler(BaseHTTPRequestHandler):
             args = params.get('arguments') or {}
             if self._expired(): return
             log_call(f"{name}:{json.dumps(args, sort_keys=True)}")
-            event('call-received', tool=name)
+            event('call-received', tool=name, args=args,
+                  param_headers={k.lower(): v for k, v in self.headers.items() if k.lower().startswith('mcp-param-')})
             result = {"jsonrpc": "2.0", "id": rid,
                       "result": {"content": [{"type": "text", "text": f"handled {name} {args.get('body') or args.get('query') or ''}"}]}}
             if MODE in ('headers_then_hang', 'hang_body_json', 'modern_hang_json'):
@@ -180,8 +200,6 @@ class Handler(BaseHTTPRequestHandler):
                 reply({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "late"}]}})
                 return
             reply(result)
-        elif method == 'tools/unsupported_legacy':
-            reply({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "not implemented"}})
         elif rid is not None:
             reply({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "not implemented"}})
         else:

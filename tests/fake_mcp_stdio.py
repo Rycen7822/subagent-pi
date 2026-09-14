@@ -20,6 +20,14 @@ PAGED = os.environ.get('FAKE_MCP_PAGED') == '1'
 MANY = os.environ.get('FAKE_MCP_MANY') == '1'
 DYNAMIC = os.environ.get('FAKE_MCP_DYNAMIC') == '1'
 MUTATE = os.environ.get('FAKE_MCP_MUTATE') == '1'
+DIE_AFTER_LIST_MS = int(os.environ.get('FAKE_MCP_DIE_AFTER_LIST_MS', '0'))
+# Arm close_stdin_after_list for the FIRST process only: a reconnect must get a
+# healthy server, proving the new generation re-handshakes and can serve calls.
+CLOSE_ONCE_FILE = os.environ.get('FAKE_MCP_CLOSE_STDIN_ONCE_FILE')
+if CLOSE_ONCE_FILE and not os.path.exists(CLOSE_ONCE_FILE):
+    open(CLOSE_ONCE_FILE, 'w').close()
+    MODE = 'close_stdin_after_list'
+SLOW_MUTATION_MS = int(os.environ.get('FAKE_MCP_SLOW_MUTATION_MS', '0'))
 DYN_FILE = os.environ.get('FAKE_MCP_DYN_FILE')
 TOOLS_HIDDEN = set(os.environ.get('FAKE_MCP_HIDE', '').split(','))
 
@@ -60,6 +68,7 @@ if DYNAMIC and DYN_FILE:
     else:
         with open(DYN_FILE, 'w') as f:
             f.write(DYN_NAME)
+event('server-start', pid=os.getpid())
 TOOLS = [t for t in base_tools() if t['name'] not in TOOLS_HIDDEN]
 if DYNAMIC:
     TOOLS = TOOLS + [{
@@ -99,6 +108,12 @@ def tools_page(cursor):
 def handle_call(req, name, args):
     log_call(f"{name}:{json.dumps(args, sort_keys=True)}")
     event('call-received', tool=name)
+    if SLOW_MUTATION_MS:
+        # server-side execution window: tests prove serialized ordering from
+        # these start/end records, never from client-side await ordering
+        event('call-start', tool=name)
+        time.sleep(SLOW_MUTATION_MS / 1000)
+        event('call-end', tool=name)
     if CLOSE_AFTER_CALL:
         # Deterministic EPIPE for the client's CANCEL notification: hold the
         # call, close our read end, then the client's abort-write hits it.
@@ -174,6 +189,10 @@ for raw in sys.stdin:
             else:
                 page = {'tools': TOOLS_MUTATED}  # after list_changed
         reply(req, page)
+        if DIE_AFTER_LIST_MS:
+            # die AFTER the catalog answer is flushed: the client caches a live
+            # catalog, then the process disappears (e.g. during a confirm wait)
+            threading.Timer(DIE_AFTER_LIST_MS / 1000, lambda: os._exit(9)).start()
         if MUTATE and list_count == 1:
             print(json.dumps({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}), flush=True)
             event('list-changed-sent')

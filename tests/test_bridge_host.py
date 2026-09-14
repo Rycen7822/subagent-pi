@@ -42,7 +42,7 @@ class HostHarness:
     def __init__(self, tmp: Path):
         self.tmp = tmp
         self.procs = []
-    def start_stdio(self, mode='normal', hide='', paged=False, many=False, dynamic=False, mutate=False, close_after_call=False):
+    def start_stdio(self, mode='normal', hide='', paged=False, many=False, dynamic=False, mutate=False, close_after_call=False, extra=None):
         """Returns server config env vars; the bridge spawns the server itself
         with ONLY its declared env + base keys, so mode/call-log must travel in
         cfg.env — which also proves the per-server env delivery path."""
@@ -54,6 +54,8 @@ class HostHarness:
                'FAKE_MCP_CALL_LOG': str(self.tmp / f'stdio-calls-{n}.log'),
                'FAKE_MCP_EVENTS': str(self.tmp / f'stdio-events-{n}.log'),
                'FAKE_MCP_DYN_FILE': str(self.tmp / f'dyn-{n}.name')}
+        for k, v in (extra or {}).items():
+            env[k] = v
         self.procs.append(None)
         return {'log': Path(env['FAKE_MCP_CALL_LOG']), 'events': Path(env['FAKE_MCP_EVENTS']),
                 'dyn_file': Path(env['FAKE_MCP_DYN_FILE']), 'env': env}
@@ -115,8 +117,8 @@ def stdio_cfg(name='local', server_env=None, **over):
     return cfg
 
 
-class HttpHostCase(unittest.TestCase):
-    """Shared fixture for tests that drive the real bridge against fake HTTP servers."""
+class BridgeHostCase(unittest.TestCase):
+    """Shared fixture for tests that drive the real bridge against fake servers."""
     prefix = 'bridge-http-'
     def setUp(self):
         if find_pi_dir() is None: self.skipTest('installed pi distribution not found')
@@ -491,7 +493,7 @@ class DiscoveryFlowTests(unittest.TestCase):
         self.assertIn('failed to initialize', by['broken_list']['message'])
         self.assertEqual(by['good_list']['kind'], 'result')
 
-class HttpExchangeLifecycleTests(HttpHostCase):
+class HttpExchangeLifecycleTests(BridgeHostCase):
     """P1-A: after the response HEADERS arrive, a hung body must still be ended
     by the deadline, the caller's cancellation and connection close. Every test
     proves the tools/call reached the server and headers were flushed first."""
@@ -568,21 +570,23 @@ class HttpExchangeLifecycleTests(HttpHostCase):
             {'name': 'fresh', 'action': 'list', 'server': 'web'}], access='write')
         self.assertEqual(out2['results'][0]['kind'], 'result')
 
-    def test_close_ends_all_inflight_on_the_connection(self):
+    def test_close_ends_inflight_exchanges_on_the_connection(self):
+        # Since the proxy serializes calls, one in-flight exchange covers the
+        # lifecycle: close during the hanging body phase must terminate the wait.
         srv = self.h.start_http(mode='hang_body_json')
         cfg = self.http_cfg(srv, tool_timeout_sec=15)
         out = self.h.run_host([cfg], [
-            {'name': 'a', 'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'a'}, 'confirm': True, 'launch': True},
-            {'name': 'b', 'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True, 'launch': True},
-            {'name': 'close', 'action': 'call', 'server': 'web', 'tool': 'status_never_called', 'args': {}, 'closeAfterMs': 700, 'launch': True},
+            {'name': 'a', 'action': 'call', 'server': 'web', 'tool': 'publish',
+             'args': {'body': 'a'}, 'confirm': True, 'launch': True, 'closeAfterMs': 700},
             {'name': 'await', 'awaitPending': True},
         ], access='write', timeout=30)
-        by = {r['step']: r for r in out['results'] if r['step'] in ('a', 'b')}
-        for step in ('a', 'b'):
-            self.assertEqual(by[step]['kind'], 'error', step)
-            self.assertIn('connection was closed', by[step]['message'], step)
-        # only the two real calls reached the server; the close-trigger failed fast
-        self.assertEqual(len(self.h.calls(srv['log'])), 2)
+        by = {r['step']: r for r in out['results']}
+        self.assertEqual(by['a']['kind'], 'error')
+        self.assertIn('connection was closed', by['a']['message'])
+        self.assertEqual(len(self.h.calls(srv['log'])), 1)  # the call reached the server once, never replayed
+        kinds = [e['event'] for e in self.h.events(srv['events'])]
+        self.assertIn('call-received', kinds)
+        self.assertIn('headers-sent', kinds)  # the body phase was already hanging when close fired
 
     def test_concurrent_cancel_does_not_hurt_the_other_request(self):
         hanging = self.h.start_http(mode='hang_body_json')
@@ -707,7 +711,7 @@ class StdioTransportFailureTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-class LegacySessionTests(HttpHostCase):
+class LegacySessionTests(BridgeHostCase):
     """2025-06-18 legacy HTTP lifecycle: negotiation, protocol header, session
     prefix = 'legacy-sess-'
     expiry (404) recovery — and proof that an expired-session call is never replayed."""
@@ -750,7 +754,7 @@ class LegacySessionTests(HttpHostCase):
         self.assertEqual(len([e for e in ev if e['event'] == 'initialize-received']), 2)
 
 
-class ModernProtocolTests(HttpHostCase):
+class ModernProtocolTests(BridgeHostCase):
     """2026-07-28 modern lifecycle against a strict fixture that rejects requests
     prefix = 'modern-mcp-'
     missing MCP-Protocol-Version / Mcp-Method / Mcp-Name / modern _meta."""
@@ -816,12 +820,180 @@ class ModernProtocolTests(HttpHostCase):
         self.assertIn('headers-sent', kinds)    # and headers were flushed
         self.assertEqual(len(self.h.calls(srv['log'])), 1)  # exactly one server-side execution
 
-    def test_x_mcp_header_arguments_are_refused_never_sent(self):
+    def test_bare_x_mcp_header_argument_is_an_ordinary_body_param(self):
         srv = self.h.start_http('modern')
         res = self.h.run_host([self.http_cfg(srv)],
                               [{'action': 'call', 'server': 'web', 'tool': 'search',
                                 'args': {'query': 'x', 'x-mcp-header': {'X-Injected': 'value'}}}],
                               access='write')['results']
-        self.assertEqual(res[0]['kind'], 'error')
-        self.assertIn('x-mcp-header', res[0]['message'])
-        self.assertEqual(self.h.calls(srv['log']), [])  # the non-conforming call never reached the server
+        # arguments never become headers by themselves: only SCHEMA annotations mirror
+        self.assertEqual(res[0]['kind'], 'result', res[0].get('message'))
+        calls = [e for e in self.h.events(srv['events']) if e['event'] == 'call-received']
+        self.assertEqual(calls[0]['param_headers'], {})
+
+class XMcHeaderTests(BridgeHostCase):
+    """x-mcp-header (MCP 2026-07-28) is a SCHEMA annotation on plain-typed
+    properties; the bridge mirrors declared arguments as Mcp-Param-* headers on
+    modern HTTP calls, keeps the body unchanged, and excludes tools with
+    invalid annotations instead of failing the server."""
+    prefix = 'x-mcp-hdr-'
+
+    def test_modern_call_mirrors_declared_headers(self):
+        srv = self.h.start_http('modern')
+        res = self.h.run_host([self.http_cfg(srv)], [
+            {'name': 'call', 'action': 'call', 'server': 'web', 'tool': 'hdr',
+             'args': {'trace_id': 'tr-1', 'count': 7, 'flag': True}}], access='write')['results']
+        self.assertEqual(res[0]['kind'], 'result', res[0].get('message'))
+        calls = [e for e in self.h.events(srv['events']) if e['event'] == 'call-received' and e['tool'] == 'hdr']
+        self.assertEqual(len(calls), 1)
+        ph = calls[0]['param_headers']
+        self.assertEqual(ph.get('mcp-param-trace-id'), 'tr-1')
+        self.assertEqual(ph.get('mcp-param-count'), '7')
+        self.assertEqual(ph.get('mcp-param-x-flag'), 'true')
+        # the body keeps every argument unchanged
+        self.assertEqual(calls[0]['args'], {'trace_id': 'tr-1', 'count': 7, 'flag': True})
+
+    def test_absent_argument_produces_no_header(self):
+        srv = self.h.start_http('modern')
+        res = self.h.run_host([self.http_cfg(srv)], [
+            {'name': 'call', 'action': 'call', 'server': 'web', 'tool': 'hdr',
+             'args': {'trace_id': 'only-trace'}}], access='write')['results']
+        self.assertEqual(res[0]['kind'], 'result')
+        calls = [e for e in self.h.events(srv['events']) if e['event'] == 'call-received' and e['tool'] == 'hdr']
+        # only the present argument is mirrored; count/flag produce no headers
+        self.assertEqual(calls[0]['param_headers'], {'mcp-param-trace-id': 'only-trace'})
+
+    def test_invalid_annotations_exclude_the_tool_not_the_server(self):
+        srv = self.h.start_http('modern', extra={'FAKE_MCP_HEADER_TOOLS': '1'})
+        res = self.h.run_host([self.http_cfg(srv)], [
+            {'name': 'l', 'action': 'list', 'server': 'web'},
+            {'name': 'd', 'action': 'describe', 'server': 'web', 'tool': 'badhdr_array'},
+            {'name': 'c', 'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'ok'}}],
+            access='write')['results']
+        by = {r['step']: r for r in res}
+        names = [t['name'] for t in json.loads(by['l']['text'])['tools']]
+        for bad in ('badhdr_array', 'badhdr_dup', 'badhdr_ctrl', 'badhdr_empty', 'badhdr_ref', 'badhdr_oneof'):
+            self.assertNotIn(bad, names)
+        self.assertIn('hdr', names); self.assertIn('search', names)
+        self.assertEqual(by['d']['kind'], 'error')
+        self.assertIn('x-mcp-header', by['d']['message'])
+        self.assertEqual(by['c']['kind'], 'result')  # the server itself stays usable
+        self.assertEqual([e for e in self.h.events(srv['events']) if e['event'] == 'strict-rejected'], [])
+
+    def test_unsafe_integer_and_control_values_are_rejected_client_side(self):
+        srv = self.h.start_http('modern')
+        res = self.h.run_host([self.http_cfg(srv)], [
+            {'name': 'n', 'action': 'call', 'server': 'web', 'tool': 'hdr',
+             'args': {'trace_id': 'x', 'count': 2 ** 53}},
+            {'name': 's', 'action': 'call', 'server': 'web', 'tool': 'hdr',
+             'args': {'trace_id': 'a\nb'}}], access='write')['results']
+        by = {r['step']: r for r in res}
+        self.assertEqual(by['n']['kind'], 'error'); self.assertIn('safe integer', by['n']['message'])
+        self.assertEqual(by['s']['kind'], 'error'); self.assertIn('control characters', by['s']['message'])
+        self.assertEqual(self.h.calls(srv['log']), [])  # neither call reached the server
+
+    def test_legacy_connection_ignores_the_plan(self):
+        srv = self.h.start_http('legacy_only')  # auto falls back to the legacy handshake
+        res = self.h.run_host([self.http_cfg(srv)], [
+            {'name': 'call', 'action': 'call', 'server': 'web', 'tool': 'hdr',
+             'args': {'trace_id': 't'}}], access='write')['results']
+        self.assertEqual(res[0]['kind'], 'result', res[0].get('message'))
+        calls = [e for e in self.h.events(srv['events']) if e['event'] == 'call-received' and e['tool'] == 'hdr']
+        self.assertEqual(calls[0]['param_headers'], {})  # mirroring is modern-only
+
+
+class SequentialExecutionTests(BridgeHostCase):
+    """P1-B: the proxy tool is registered sequential and serializes in memory;
+    two calls submitted CONCURRENTLY must not overlap server-side."""
+    prefix = 'seq-exec-'
+
+    def test_concurrent_proxy_calls_serialize_server_side(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_SLOW_MUTATION_MS': '400'})
+        cfg = stdio_cfg(server_env=srv['env'], approval_default='auto')
+        out = self.h.run_host([cfg], [
+            {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'echo',
+             'args': {'text': 'first'}, 'launch': True},
+            {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'echo',
+             'args': {'text': 'second'}, 'launch': True},
+            {'action': 'awaitPending'}], access='write', timeout=90)
+        by = {r['step']: r for r in out['results']}
+        self.assertEqual(out['registered']['executionMode'], 'sequential')
+        self.assertEqual(by['c1']['kind'], 'result', by['c1'].get('message'))
+        self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
+        seq = [e['event'] for e in self.h.events(srv['events']) if e['event'] in ('call-start', 'call-end')]
+        # submitted concurrently, executed serially: the second start is after the first end
+        self.assertEqual(seq, ['call-start', 'call-end', 'call-start', 'call-end'])
+        self.assertIn('first', by['c1']['text'])
+        self.assertIn('second', by['c2']['text'])  # no state reuse between queued calls
+
+    def test_cancelled_first_call_does_not_poison_the_second(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_SLOW_MUTATION_MS': '400'})
+        cfg = stdio_cfg(server_env=srv['env'], approval_default='auto')
+        out = self.h.run_host([cfg], [
+            {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'echo',
+             'args': {'text': 'first'}, 'launch': True, 'abortAfterMs': 150},
+            {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'echo',
+             'args': {'text': 'second'}, 'launch': True},
+            {'action': 'awaitPending'}], access='write', timeout=90)
+        by = {r['step']: r for r in out['results']}
+        self.assertEqual(by['c1']['kind'], 'error')  # cancelled mid-flight
+        self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
+        self.assertIn('second', by['c2']['text'])
+        seq = [e['event'] for e in self.h.events(srv['events']) if e['event'] in ('call-start', 'call-end')]
+        self.assertEqual(seq.count('call-start'), 2)
+        self.assertEqual(seq.count('call-end'), 2)  # the server finished both handler windows
+
+
+class StdioGenerationTests(BridgeHostCase):
+    """P1-C: a StdioConnection maps to exactly ONE handshake generation. A
+    process that dies during a pending confirmation kills the connection; the
+    failed call is never replayed, and the next explicit operation builds a NEW
+    process whose first RPC is initialize."""
+    prefix = 'stdio-gen-'
+
+    def _assert_every_process_rehandshakes(self, srv):
+        ev = self.h.events(srv['events'])
+        starts = [i for i, e in enumerate(ev) if e['event'] == 'server-start']
+        self.assertEqual(len(starts), 2)
+        for idx in starts:  # the first RPC of every new process is initialize
+            self.assertEqual(ev[idx + 1]['event'], 'initialize-received')
+        return ev
+
+    def test_confirm_pending_process_exit_no_respawn(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_DIE_AFTER_LIST_MS': '300'})
+        cfg = stdio_cfg(server_env=srv['env'])  # approval prompt: calls wait for confirm
+        out = self.h.run_host([cfg], [
+            {'name': 'l1', 'action': 'list', 'server': 'local'},
+            {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
+             'args': {'path': 'x'}, 'confirm': True, 'confirmDelayMs': 700, 'launch': True},
+            {'action': 'awaitPending'},
+            {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
+             'args': {'path': 'y'}, 'confirm': True}], access='write', timeout=90)
+        by = {r['step']: r for r in out['results']}
+        self.assertEqual(by['l1']['kind'], 'result')
+        # the confirm-pending call failed; the server NEVER received it
+        self.assertEqual(by['c1']['kind'], 'error')
+        self.assertIn('exited', by['c1']['message'])
+        # the next explicit call built a NEW process and the side effect ran exactly once
+        self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
+        self.assertEqual(len(self.h.calls(srv['log'])), 1)
+        ev = self._assert_every_process_rehandshakes(srv)
+        self.assertEqual([e['tool'] for e in ev if e['event'] == 'call-received'], ['delete_file'])
+
+    def test_confirm_pending_stdin_closed_no_respawn(self):
+        srv = self.h.start_stdio(extra={'FAKE_MCP_CLOSE_STDIN_ONCE_FILE': str(Path(self.tmp.name) / 'close-once.marker')})
+        cfg = stdio_cfg(server_env=srv['env'])
+        out = self.h.run_host([cfg], [
+            {'name': 'l1', 'action': 'list', 'server': 'local'},
+            {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
+             'args': {'path': 'x'}, 'confirm': True, 'confirmDelayMs': 700, 'launch': True},
+            {'action': 'awaitPending'},
+            {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
+             'args': {'path': 'y'}, 'confirm': True}], access='write', timeout=90)
+        by = {r['step']: r for r in out['results']}
+        # the write hit the closed read end: transport error, no respawn, no replay
+        self.assertEqual(by['c1']['kind'], 'error')
+        self.assertIn('transport broken', by['c1']['message'])
+        self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
+        self.assertEqual(len(self.h.calls(srv['log'])), 1)
+        self._assert_every_process_rehandshakes(srv)
