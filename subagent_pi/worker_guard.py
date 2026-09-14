@@ -27,15 +27,19 @@ def main():
     env = os.environ.copy()
     env.update(spec.get('env',{}))
     env['PI_AGENTS_MANAGED_CHILD']='1'
-    # The bootstrap channel fd number travels in the environment; the pipe itself
-    # never touches disk. close_fds stays on, but the passed fd survives both hops
-    # because pass_fds preserves its number.
-    bootstrap_fd = os.environ.get('PI_AGENTS_BOOTSTRAP_FD')
-    pass_fds = (int(bootstrap_fd),) if bootstrap_fd and bootstrap_fd.isdigit() else ()
+    # The bootstrap/receipt fd numbers travel in the environment; the pipes
+    # themselves never touch disk. close_fds stays on, but the passed fds
+    # survive both hops because pass_fds preserves their numbers.
+    fds=[]
+    for name in ('PI_AGENTS_BOOTSTRAP_FD','PI_AGENTS_BRIDGE_RECEIPT_FD'):
+        value=os.environ.get(name)
+        if value and value.isdigit():
+            fds.append(int(value))
+    pass_fds=tuple(fds)
     # The Pi subprocess shares our new process group. Neither stdin nor stdout is a shell.
     proc = subprocess.Popen(spec['argv'],cwd=spec['cwd'],env=env,stdin=0,stdout=1,stderr=2,close_fds=True,pass_fds=pass_fds)
-    if pass_fds:
-        with contextlib.suppress(OSError): os.close(pass_fds[0])  # only the child keeps the reader now
+    for fd in pass_fds:
+        with contextlib.suppress(OSError): os.close(fd)  # only the child keeps the readers now
     owner.update(pi_pid=proc.pid,pi_identity=process_identity(proc.pid),spawning=False)
     atomic_json(owner_path,owner)
     rc = proc.wait()

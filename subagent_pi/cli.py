@@ -59,19 +59,24 @@ def read_input(path):
     return sys.stdin.read(65537) if path=='-' else Path(path).expanduser().read_text(encoding='utf-8')
 
 def split_codex_cwd(tail):
-    """Recognize Codex's -C/--cd (and --cd=DIR) before the -- separator.
+    """Read-only scan for Codex's -C/--cd (and --cd=DIR / -CDIR attached forms)
+    before the first `--` separator.
 
-    Returns (cwd_or_None, remaining_args); unparseable forms stay in the tail
-    and are passed to codex untouched.
+    Returns (cwd_or_None, original_args): the arguments are returned VERBATIM —
+    the launcher must not strip the flag, because Codex applies it itself and
+    stripping it would leave Codex in the wrong project. The last occurrence
+    wins, matching flag-assignment semantics. Anything after `--` is left
+    alone, so a prompt that merely mentions --cd is never mistaken for one.
     """
-    cwd=None; rest=[]; after_dd=False; i=0
+    cwd=None; after_dd=False; i=0
     while i<len(tail):
         a=tail[i]
-        if not after_dd and a=='--': after_dd=True; rest.append(a); i+=1; continue
+        if not after_dd and a=='--': after_dd=True; i+=1; continue
         if not after_dd and a in ('-C','--cd') and i+1<len(tail): cwd=tail[i+1]; i+=2; continue
         if not after_dd and a.startswith('--cd='): cwd=a[5:]; i+=1; continue
-        rest.append(a); i+=1
-    return cwd,rest
+        if not after_dd and a.startswith('-C') and len(a)>2: cwd=a[2:]; i+=1; continue
+        i+=1
+    return cwd,list(tail)
 
 def source_snapshot(home):
     """Trusted client-side env snapshot for scope binding; never model-visible."""
@@ -127,12 +132,15 @@ async def execute(args):
         exe=shutil.which('codex')
         if not exe: raise AgentError('codex_not_found','codex was not found on PATH')
         tail=args.codex_args[1:] if args.codex_args[:1]==['--'] else args.codex_args
-        # Scope binding must follow Codex's actual working directory, not the
-        # launcher cwd, when the user passed -C/--cd.
+        # Read-only scan: bind the scope to Codex's actual working directory
+        # (-C/--cd), then exec Codex with the ORIGINAL arguments so Codex applies
+        # the chdir itself. Stripping the flag here left Codex in the launcher's
+        # directory while the scope pointed elsewhere.
         found,rest=split_codex_cwd(tail)
         cwd=os.getcwd()
         if found is not None:
-            cwd=str(Path(found).expanduser().resolve())
+            candidate=Path(found).expanduser()
+            cwd=str(candidate.resolve() if candidate.is_absolute() else (Path(cwd)/candidate).resolve())
             if not Path(cwd).is_dir(): raise AgentError('invalid_cwd',f'codex -C/--cd directory does not exist: {cwd}')
         opened=await request(home,'scope_open',{'cwd':cwd,'label':'Codex CLI',**({'scope':os.environ['PI_AGENTS_SCOPE']} if os.environ.get('PI_AGENTS_SCOPE') else {})},source=source_snapshot(home))
         env=os.environ.copy(); env.update(PI_AGENTS_SCOPE=opened['scope'],PI_AGENTS_CWD=cwd,PI_AGENTS_HOME=str(home))
@@ -160,7 +168,13 @@ async def execute(args):
     return result
 
 def main():
-    args=parser().parse_args()
+    argv=sys.argv[1:]
+    if argv[:1]==['codex'] and argv[1:2] and argv[1].startswith('-') and argv[1] not in ('--','-h','--help'):
+        # argparse REMAINDER does not capture a leading flag after the subcommand
+        # (bpo-17050). The launcher must accept ANY Codex argument verbatim, so a
+        # leading -C/--cd/--cd= form is routed through the -- separator instead.
+        argv=['codex','--',*argv[1:]]
+    args=parser().parse_args(argv)
     try:
         result=asyncio.run(execute(args))
         if result is not None: print(dumps(result))

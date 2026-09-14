@@ -35,7 +35,12 @@ def install(args):
     (destination/'plugins').mkdir(exist_ok=True)
     stage=Path(tempfile.mkdtemp(prefix='.subagent-pi-stage-',dir=destination))
     try:
-        shutil.copytree(SOURCE,stage/'payload',ignore=shutil.ignore_patterns('__pycache__','*.pyc','.git','*.zip','.pytest_cache'),dirs_exist_ok=False)
+        # Same selection rules as scripts/package.py: never ship scratch dirs,
+        # dev tooling, user config, runtime databases, logs or old artifacts.
+        shutil.copytree(SOURCE,stage/'payload',ignore=shutil.ignore_patterns(
+            '__pycache__','*.pyc','.git','*.zip','.pytest_cache','.venv','.work','.pi',
+            '.codex','.claude','node_modules','*.sqlite','*.sqlite-wal','*.sqlite-shm',
+            'daemon.log','daemon.previous.log','.mypy_cache','.ruff_cache','*.egg-info'),dirs_exist_ok=False)
         entry=str(plugin/'bin/subagent-pi')
         # Resolve paths at install time. Do not depend on undocumented plugin-root substitutions or host cwd.
         server={'command':str(Path(sys.executable).resolve()),'args':[entry,'mcp'],'env':{'PI_AGENTS_HOME':str(home)}}

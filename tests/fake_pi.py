@@ -15,7 +15,8 @@ a,_=p.parse_known_args()
 path=Path(a.session) if a.session else Path(a.session_dir)/'test-session.jsonl'; current=None; queue=[]; ui={}; count=0
 
 def read_bootstrap():
-    """Emulate the real bridge: consume the anonymous pipe, emit the ready marker."""
+    """Emulate the real bridge: consume the pipe, emit the ready marker and the
+    structured receipt (same channel contract as codex-mcp-bridge.ts)."""
     raw=os.environ.get('PI_AGENTS_BOOTSTRAP_FD')
     if not raw or not raw.isdigit(): return None
     fd=int(raw); chunks=[]
@@ -25,6 +26,7 @@ def read_bootstrap():
         if not data: break
         chunks.append(data)
     os.close(fd)
+    payload=None
     try:
         payload=json.loads(b''.join(chunks))
         servers=payload.get('mcp',{}).get('servers',[])
@@ -33,10 +35,20 @@ def read_bootstrap():
         for s in servers:
             if 'FAKE_TEST_ECHO' in s.get('env',{}):
                 print(f'bridge-env {s["name"]}={s["env"]["FAKE_TEST_ECHO"]}',file=sys.stderr,flush=True)
-        return payload
+        receipt={'kind':'subagent-pi-bridge-receipt','v':1,
+                 'agent':payload.get('agent',{}).get('id'),'generation':payload.get('agent',{}).get('generation'),
+                 'state':'ready','servers':[{'name':s['name'],'status':'lazy','required':bool(s.get('required'))} for s in servers]}
     except Exception:
         print('subagent-pi-bridge ready servers=0 error=malformed',file=sys.stderr,flush=True)
-        return None
+        receipt={'kind':'subagent-pi-bridge-receipt','v':1,'agent':None,'generation':None,'state':'failed','servers':[]}
+    rraw=os.environ.get('PI_AGENTS_BRIDGE_RECEIPT_FD')
+    if rraw and rraw.isdigit():
+        rfd=int(rraw)
+        try: os.write(rfd,(json.dumps(receipt)+'\n').encode())
+        finally:
+            try: os.close(rfd)
+            except OSError: pass
+    return payload
 
 BRIDGE=read_bootstrap()
 
@@ -94,7 +106,7 @@ async def main():
     reader=asyncio.StreamReader(); transport,_=await asyncio.get_running_loop().connect_read_pipe(lambda:asyncio.StreamReaderProtocol(reader),sys.stdin.buffer)
     while line:=await reader.readline():
         r=json.loads(line); kind=r['type']
-        if kind=='get_state': response(r,data={'sessionFile':str(path),'sessionId':'fake-session','isStreaming':bool(current and not current.done()),'pendingMessageCount':len(queue),'model':{'id':'fake','provider':'test'}})
+        if kind=='get_state': response(r,data={'sessionFile':str(path),'sessionId':'fake-session','isStreaming':bool(current and not current.done()),'pendingMessageCount':len(queue),'model':{'id':'fake','provider':'test'},'env_probe':{k:v for k,v in sorted(os.environ.items()) if k.startswith('PI_TEST_') and len(v)<=256}})
         elif kind=='prompt':
             if current and not current.done(): response(r,False,error='Already streaming')
             else: response(r); current=asyncio.create_task(run(r['message']))

@@ -1,0 +1,12 @@
+{
+  "name": "subagent-pi-dev",
+  "private": true,
+  "description": "Development-time type checking for extensions/codex-mcp-bridge.ts. No runtime dependencies: the bridge uses only Node built-ins plus typebox, which the Pi host provides to extensions. Run `npm ci` once, then `npm run typecheck`.",
+  "scripts": {
+    "setup": "node scripts/dev-setup.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

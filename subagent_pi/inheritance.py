@@ -42,8 +42,11 @@ def redact_url(url: str) -> str:
 
 
 class Diagnostic:
-    def __init__(self, scope: str, name: str, reason: str):
-        self.scope, self.name, self.reason = scope, name, reason
+    def __init__(self, scope: str, name, reason: str):
+        # Diagnostics cross JSON boundaries (events, doctor, responses). Path
+        # objects and other non-string names are coerced here, at the edge, so
+        # serialization never fails on a missing directory or odd config value.
+        self.scope, self.name, self.reason = scope, (name if isinstance(name, str) else str(name)), reason
     def as_dict(self):
         return {'scope': self.scope, 'name': self.name, 'reason': self.reason}
 
@@ -52,20 +55,28 @@ def resolve_codex_home(config, source_env: dict | None) -> tuple[Path | None, st
     """Explicit trusted setting -> scope-bound CODEX_HOME -> ~/.codex.
 
     Accepts either the full plugin config or its [inheritance] table directly.
-    Returns (home, mode); home is None when no candidate directory exists.
+    A configured source that does not exist is an error, never a silent
+    fallback to another candidate: only an UNSET source falls back, and only
+    the user default may be absent (reported as empty capability).
     """
     inh = config.get('inheritance', config) if isinstance(config, dict) else {}
     explicit = inh.get('codex_home') if isinstance(inh, dict) else None
-    candidates: list[tuple[Path, str]] = []
     if explicit:
-        candidates.append((Path(explicit).expanduser(), 'explicit'))
+        home = Path(explicit).expanduser()
+        if not home.is_dir():
+            raise AgentError('inheritance_source_unreadable',
+                             f'inheritance.codex_home does not exist: {home}')
+        return home, 'explicit'
     if isinstance(source_env, dict) and isinstance(source_env.get('CODEX_HOME'), str) and source_env['CODEX_HOME'].strip():
-        candidates.append((Path(source_env['CODEX_HOME']).expanduser(), 'scope_env'))
-    candidates.append((Path.home() / '.codex', 'user_default'))
-    for home, mode in candidates:
-        if home.is_dir():
-            return home, mode
-    return None, candidates[0][1] if candidates else 'user_default'
+        home = Path(source_env['CODEX_HOME']).expanduser()
+        if not home.is_dir():
+            raise AgentError('inheritance_source_unreadable',
+                             f'CODEX_HOME from the scope source does not exist: {home}')
+        return home, 'scope_env'
+    home = Path.home() / '.codex'
+    if home.is_dir():
+        return home, 'user_default'
+    return None, 'user_default'
 
 
 def read_codex_config(codex_home: Path) -> dict:
@@ -135,7 +146,7 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
     codex_skills = codex_home / 'skills'
     if codex_skills.is_dir():
         sources.append(('codex_global', codex_skills))
-    elif not any(s[0] == 'codex_global' for s in sources):
+    else:
         diagnostics.append(Diagnostic('skills', codex_home / 'skills', 'codex global skills directory not present; treated as empty'))
 
     count = 0
@@ -153,6 +164,9 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
             if real in by_real:
                 continue  # same real path already provided by project/profile source
             label = entry.name
+            if (entry / 'agents' / 'openai.yaml').is_file() or (entry / 'agents').is_dir():
+                diagnostics.append(Diagnostic('skills', label,
+                                              'codex-specific policy metadata present (agents/); it is not interpreted or enforced by Pi'))
             if real in disabled or skill_md.resolve() in disabled:
                 diagnostics.append(Diagnostic('skills', label, 'disabled by codex skills.config'))
                 continue
@@ -178,41 +192,55 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
     return selected, diagnostics
 
 
-def _tool_policy(server: dict, table: dict) -> tuple[set[str] | None, set[str], str, list[Diagnostic]]:
+def _tool_policy(server: dict) -> tuple[dict, list[Diagnostic]]:
+    """Effective policy model for one server.
+
+    Returns (policy, diagnostics); policy = {'default': 'auto'|'confirm',
+    'tools': {name: 'auto'|'confirm'}, 'denied': sorteddeny list}. For each tool
+    the effective mode is the per-tool approval_mode override, else the server
+    default, else 'prompt'. Values this bridge cannot enforce ('writes',
+    unknown strings) degrade to 'confirm' with a named diagnostic; a per-tool
+    'auto' can never lift a child-side mandatory confirmation (the child rule
+    is applied separately and wins). Tool config keys this plugin cannot honor
+    (for example output_token_limit) deny that tool outright instead of being
+    silently ignored.
+    """
     diagnostics: list[Diagnostic] = []
-    enabled = server.get('enabled_tools')
-    if enabled is not None:
-        if not isinstance(enabled, list) or any(not isinstance(t, str) for t in enabled):
-            raise AgentError('invalid_argument', 'enabled_tools must be a list of tool names')
-        allowed = set(enabled)
-    else:
-        allowed = None
-    disabled = server.get('disabled_tools') or []
-    if not isinstance(disabled, list) or any(not isinstance(t, str) for t in disabled):
-        raise AgentError('invalid_argument', 'disabled_tools must be a list of tool names')
-    denied = set(disabled)
+    name = server.get('name', '?')
     mode = server.get('default_tools_approval_mode', 'prompt')
     if mode not in APPROVAL_MODES:
-        diagnostics.append(Diagnostic('mcp', server.get('name', '?'), f'unknown default_tools_approval_mode {mode!r}; using confirm'))
+        diagnostics.append(Diagnostic('mcp', name, f'unknown default_tools_approval_mode {mode!r}; using confirm'))
         mode = 'prompt'
     if mode == 'writes':
-        diagnostics.append(Diagnostic('mcp', server.get('name', '?'),
+        diagnostics.append(Diagnostic('mcp', name,
                                       'approval_mode writes cannot be enforced without trusting readOnlyHint; using confirm'))
-        mode = 'prompt'
+    default = 'auto' if mode == 'auto' else 'confirm'
+    tools: dict[str, str] = {}
+    denied: set[str] = set(server.get('disabled_tools') or [])
     for tool_name, tool_cfg in (server.get('tools') or {}).items():
         if not isinstance(tool_cfg, dict):
             continue
-        unknown = set(tool_cfg) - {'approval_mode', 'output_token_limit'}
+        unknown = set(tool_cfg) - {'approval_mode'}
         if unknown:
-            diagnostics.append(Diagnostic('mcp', f"{server.get('name', '?')}.{tool_name}",
-                                          f'unsupported tool config keys ignored: {sorted(unknown)}'))
+            # Authorization/output limits we do not implement must not be
+            # accepted-and-ignored: the tool is denied with a reason instead.
+            denied.add(tool_name)
+            diagnostics.append(Diagnostic('mcp', f'{name}.{tool_name}',
+                                          f'denied: unsupported tool config keys cannot be honored: {sorted(unknown)}'))
             continue
         tmode = tool_cfg.get('approval_mode')
-        if tmode == 'auto':
-            mode = mode  # per-tool auto handled in bridge via auto_tools set
-    auto_tools = {t for t, cfg in (server.get('tools') or {}).items()
-                  if isinstance(cfg, dict) and cfg.get('approval_mode') == 'auto'}
-    return allowed, denied, mode, diagnostics + [Diagnostic('mcp', '__auto_tools__', ','.join(sorted(auto_tools)))]
+        if tmode is None:
+            continue
+        if tmode not in APPROVAL_MODES:
+            denied.add(tool_name)
+            diagnostics.append(Diagnostic('mcp', f'{name}.{tool_name}',
+                                          f'denied: unknown approval_mode {tmode!r}'))
+            continue
+        if tmode == 'writes':
+            diagnostics.append(Diagnostic('mcp', f'{name}.{tool_name}',
+                                          'approval_mode writes cannot be enforced; using confirm'))
+        tools[tool_name] = 'auto' if tmode == 'auto' else 'confirm'
+    return {'default': default, 'tools': tools, 'denied': sorted(denied)}, diagnostics
 
 
 def _int_field(server: dict, key: str, default: int) -> tuple[int, list[Diagnostic]]:
@@ -224,11 +252,59 @@ def _int_field(server: dict, key: str, default: int) -> tuple[int, list[Diagnost
     return value, diagnostics
 
 
+def _resolve_self_paths(command: str, args: list[str], cwd: str | None,
+                        codex_home: Path) -> list[Path]:
+    """All paths this server's execution definition could resolve to.
+
+    Covers the command itself, absolute/relative entry-script args (including
+    the installer-generated `python <...>/bin/subagent-pi mcp` wrapper) and
+    `python -m subagent_pi` module forms. No configured command is executed.
+    """
+    candidates: list[Path] = []
+    resolved_command = shutil.which(command) if not Path(command).is_absolute() else None
+    raw = Path(resolved_command or command).expanduser()
+    candidates.append(raw)
+    anchors = [Path(cwd) if cwd else None, codex_home]
+    for arg in args or []:
+        p = Path(arg).expanduser()
+        if p.is_absolute():
+            candidates.append(p)
+        elif arg not in ('-m', '-c', '-I', '-S', '-E', '-s') and not arg.startswith('-'):
+            for anchor in anchors:
+                if anchor is not None:
+                    candidates.append(anchor / p)
+    out: list[Path] = []
+    for p in candidates:
+        try:
+            out.append(p.resolve())
+        except OSError:
+            out.append(p)
+    return out
+
+
+def _is_self_server(entry: dict, codex_home: Path) -> bool:
+    plugin_bin = Path(__file__).resolve().parent.parent / 'bin' / 'subagent-pi'
+    plugin_bin_real = plugin_bin.resolve() if plugin_bin.exists() else None
+    args = entry.get('args') or []
+    for idx, arg in enumerate(args):
+        if arg == '-m' and idx + 1 < len(args) and args[idx + 1] in ('subagent_pi', 'subagent-pi'):
+            return True
+    if plugin_bin_real is None:
+        return False
+    for resolved in _resolve_self_paths(entry.get('command', ''), args, entry.get('cwd'), codex_home):
+        if resolved == plugin_bin_real:
+            return True
+    return False
+
+
 def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Diagnostic]]:
     """Convert [mcp_servers.*] TOML into normalized in-memory server configs.
 
-    Values are NOT resolved here (no environment access). Unknown critical keys
-    disable the server with an explicit reason; the rest of the config continues.
+    Values are NOT resolved here (no environment access). Every declared server
+    keeps a disposition ('ok' | 'failed' | 'disabled') and, for failed ones, its
+    reasons — a failed required server must not silently vanish. Unknown keys
+    that affect execution or authorization mark the server failed with an
+    explicit reason; the rest of the config continues.
     """
     diagnostics: list[Diagnostic] = []
     servers: list[dict] = []
@@ -238,102 +314,118 @@ def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Dia
     if not isinstance(table, dict):
         diagnostics.append(Diagnostic('mcp', 'mcp_servers', 'not a table; ignored'))
         return [], diagnostics
-    plugin_bin = Path(__file__).resolve().parent.parent / 'bin' / 'subagent-pi'
-    plugin_bin_real = plugin_bin.resolve() if plugin_bin.exists() else None
+def _enabled_tools(server: dict, diagnostics: list[Diagnostic]) -> list[str] | None:
+    """Validate enabled_tools; an explicitly empty list allows no tools."""
+    enabled = server.get('enabled_tools')
+    if enabled is None:
+        return None
+    if not isinstance(enabled, list) or any(not isinstance(t, str) for t in enabled):
+        raise AgentError('invalid_argument', 'enabled_tools must be a list of tool names')
+    return sorted(set(enabled))
+
+def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Diagnostic]]:
+    """Convert [mcp_servers.*] TOML into normalized in-memory server configs.
+
+    Values are NOT resolved here (no environment access). Every declared server
+    keeps a disposition ('ok' | 'failed' | 'disabled') and, for failed ones, its
+    reasons — a failed required server must not silently vanish. Unknown keys
+    that affect execution or authorization mark the server failed with an
+    explicit reason; the rest of the config continues.
+    """
+    diagnostics: list[Diagnostic] = []
+    servers: list[dict] = []
+    table = raw.get('mcp_servers')
+    if table is None:
+        return [], diagnostics
+    if not isinstance(table, dict):
+        diagnostics.append(Diagnostic('mcp', 'mcp_servers', 'not a table; ignored'))
+        return [], diagnostics
+
+    def _failed(name, transport, required, reason):
+        servers.append({'name': name, 'transport': transport, 'required': required,
+                        'disposition': 'failed', 'reasons': [reason]})
+        diagnostics.append(Diagnostic('mcp', name, f'disabled: {reason}'))
+
     for name, server in table.items():
+        transport = 'http' if isinstance(server, dict) and 'url' in server else 'stdio'
+        required = bool(server.get('required', False)) if isinstance(server, dict) else False
         if not isinstance(server, dict):
-            diagnostics.append(Diagnostic('mcp', name, 'server entry is not a table; skipped'))
+            _failed(name, transport, required, 'server entry is not a table')
             continue
         if server.get('enabled') is False:
+            servers.append({'name': name, 'transport': transport, 'required': False,
+                            'disposition': 'disabled', 'reasons': ['disabled in codex config']})
             diagnostics.append(Diagnostic('mcp', name, 'disabled in codex config'))
             continue
-        if len(servers) >= MAX_MCP_SERVERS:
-            diagnostics.append(Diagnostic('mcp', name, 'server limit exceeded; remaining servers skipped'))
+        if len([s for s in servers if s['disposition'] == 'ok']) >= MAX_MCP_SERVERS:
+            _failed(name, transport, required, 'server limit exceeded')
             continue
+        entry: dict = {'name': name, 'required': required, 'disposition': 'ok', 'reasons': []}
         is_http = 'url' in server
         allowed_keys = MCP_HTTP_KEYS if is_http else MCP_STDIO_KEYS
         unknown = set(server) - allowed_keys - MCP_HARMLESS_KEYS
-        critical = {k for k in unknown if k not in MCP_HARMLESS_KEYS}
-        if critical:
-            diagnostics.append(Diagnostic('mcp', name, f'disabled: unsupported config keys affecting execution or auth: {sorted(critical)}'))
+        if unknown:
+            _failed(name, transport, required,
+                    f'unsupported config keys affecting execution or auth: {sorted(unknown)}')
             continue
-        entry: dict = {'name': name, 'required': bool(server.get('required', False))}
         try:
-            allowed, denied, approval, extra = _tool_policy(server, server)
-            entry.update(allowed_tools=sorted(allowed) if allowed is not None else None,
-                         disabled_tools=sorted(denied))
-            auto = extra[-1].name and extra[-1].reason
-            entry['auto_approval_tools'] = [t for t in (auto or '').split(',') if t]
-            entry['approval_mode'] = approval
-            entry['diagnostics'] = [d.as_dict() for d in extra[:-1]]
+            policy, pdiag = _tool_policy(server)
+            entry.update(allowed_tools=_enabled_tools(server, diagnostics),
+                         disabled_tools=policy['denied'],
+                         approval_default=policy['default'],
+                         tool_approval=policy['tools'])
+            diagnostics.extend(pdiag)
             timeout, tdiag = _int_field(server, 'startup_timeout_sec', 10)
             tool_timeout, ttdiag = _int_field(server, 'tool_timeout_sec', 60)
             entry['startup_timeout_sec'] = timeout
             entry['tool_timeout_sec'] = tool_timeout
-            diagnostics.extend(extra[:-1] + tdiag + ttdiag)
+            diagnostics.extend(tdiag + ttdiag)
             if is_http:
                 entry['transport'] = 'http'
                 url = server['url']
                 if not isinstance(url, str) or not url.startswith(('http://', 'https://')):
-                    diagnostics.append(Diagnostic('mcp', name, 'disabled: url must be http(s)'))
-                    continue
+                    raise AgentError('invalid_argument', 'url must be http(s)')
                 entry['url'] = url
                 if 'auth' in server and server['auth'] != 'bearer':
-                    diagnostics.append(Diagnostic('mcp', name, f"disabled: auth={server['auth']!r} (oauth/chatgpt) is not supported in managed children"))
-                    continue
+                    raise AgentError('invalid_argument', f"auth={server['auth']!r} (oauth/chatgpt) is not supported in managed children")
                 if 'http_headers_helper' in server:
-                    diagnostics.append(Diagnostic('mcp', name, 'disabled: http_headers_helper is not supported in managed children'))
-                    continue
+                    raise AgentError('invalid_argument', 'http_headers_helper is not supported in managed children')
                 headers = server.get('http_headers') or {}
                 env_headers = server.get('env_http_headers') or {}
                 if not isinstance(headers, dict) or not isinstance(env_headers, dict) or \
                    any(not isinstance(k, str) or not isinstance(v, str) for k, v in {**headers, **env_headers}.items()):
-                    diagnostics.append(Diagnostic('mcp', name, 'disabled: http_headers/env_http_headers must map strings to strings'))
-                    continue
+                    raise AgentError('invalid_argument', 'http_headers/env_http_headers must map strings to strings')
                 entry['static_headers'] = dict(headers)
                 entry['env_header_names'] = dict(env_headers)
                 entry['bearer_token_env_var'] = server.get('bearer_token_env_var') if isinstance(server.get('bearer_token_env_var'), str) else None
-                servers.append(entry)
             else:
                 entry['transport'] = 'stdio'
                 if server.get('experimental_environment') not in (None, 'local'):
-                    diagnostics.append(Diagnostic('mcp', name, 'disabled: experimental_environment remote executor is not supported in managed children'))
-                    continue
+                    raise AgentError('invalid_argument', 'experimental_environment remote executor is not supported in managed children')
                 command = server.get('command')
                 if not isinstance(command, str) or not command.strip():
-                    diagnostics.append(Diagnostic('mcp', name, 'disabled: missing command'))
-                    continue
+                    raise AgentError('invalid_argument', 'missing command')
                 args = server.get('args', [])
                 if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
-                    diagnostics.append(Diagnostic('mcp', name, 'disabled: args must be a list of strings'))
-                    continue
+                    raise AgentError('invalid_argument', 'args must be a list of strings')
                 env_static = server.get('env') or {}
                 env_refs = server.get('env_vars') or []
                 if not isinstance(env_static, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env_static.items()):
-                    diagnostics.append(Diagnostic('mcp', name, 'disabled: env must map strings to strings'))
-                    continue
+                    raise AgentError('invalid_argument', 'env must map strings to strings')
                 refs: list[str] = []
-                broken = False
                 for ref in env_refs:
                     if isinstance(ref, str):
                         refs.append(ref)
                     elif isinstance(ref, dict) and isinstance(ref.get('name'), str) and ref.get('source', 'local') in (None, 'local'):
                         refs.append(ref['name'])
                     elif isinstance(ref, dict) and ref.get('source') == 'remote':
-                        diagnostics.append(Diagnostic('mcp', name, f"disabled: env_vars source=remote ({ref['name']}) requires remote executor"))
-                        broken = True
-                        break
+                        raise AgentError('invalid_argument', f"env_vars source=remote ({ref.get('name')}) requires remote executor")
                     else:
-                        diagnostics.append(Diagnostic('mcp', name, 'disabled: env_vars entries must be names'))
-                        broken = True
-                        break
-                if broken:
-                    continue
+                        raise AgentError('invalid_argument', 'env_vars entries must be names')
                 cwd = server.get('cwd')
                 if cwd is not None:
                     if not isinstance(cwd, str) or not cwd.strip():
-                        diagnostics.append(Diagnostic('mcp', name, 'disabled: cwd must be a path string'))
-                        continue
+                        raise AgentError('invalid_argument', 'cwd must be a path string')
                     cwd_path = Path(cwd).expanduser()
                     if not cwd_path.is_absolute():
                         # Codex does not document relative-cwd resolution; anchor it to the
@@ -341,18 +433,17 @@ def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Dia
                         cwd_path = (codex_home / cwd_path).resolve()
                         diagnostics.append(Diagnostic('mcp', name, f'relative cwd anchored to codex home: {cwd_path}'))
                     cwd = str(cwd_path)
-                resolved = command if Path(command).is_absolute() else (shutil.which(command) or command)
-                try:
-                    real_command = Path(resolved).resolve()
-                except OSError:
-                    real_command = Path(resolved)
-                if plugin_bin_real and real_command == plugin_bin_real:
-                    diagnostics.append(Diagnostic('mcp', name, 'excluded: subagent-pi management server (recursion guard)'))
-                    continue
                 entry.update(command=command, args=args, static_env=dict(env_static),
                              env_var_names=sorted(set(refs)), cwd=cwd)
-                servers.append(entry)
+                if _is_self_server(entry, codex_home):
+                    # Recursion guard by execution definition: covers the direct
+                    # entrypoint, symlinks, the installer's python+script wrapper
+                    # and `-m subagent_pi` forms. Renaming the server evades nothing.
+                    raise AgentError('invalid_argument', 'subagent-pi management server (recursion guard)')
+            servers.append(entry)
         except AgentError as exc:
+            servers.append({'name': name, 'transport': transport, 'required': required,
+                            'disposition': 'failed', 'reasons': [exc.message]})
             diagnostics.append(Diagnostic('mcp', name, f'disabled: {exc.message}'))
     return servers, diagnostics
 
@@ -360,12 +451,16 @@ def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Dia
 def resolve_environment(servers: list[dict], env_snapshot: dict) -> tuple[list[dict], list[Diagnostic]]:
     """Fill referenced env values from the bound scope snapshot, in memory only.
 
-    Returns payload-ready servers plus diagnostics. Missing values are named,
-    never guessed from other scopes or from the daemon environment.
+    Missing values mark the server disposition='failed' with named reasons —
+    required servers are never silently dropped. After collecting every
+    failure, required servers abort with inheritance_required_server_failed so
+    a spawn/respawn cannot start a task with a missing dependency.
     """
     diagnostics: list[Diagnostic] = []
-    usable: list[dict] = []
+    required_failures: list[str] = []
     for server in servers:
+        if server.get('disposition') != 'ok':
+            continue
         problems: list[str] = []
         out = {k: v for k, v in server.items() if k not in ('env_var_names', 'env_header_names', 'static_env', 'static_headers')}
         out['env'] = dict(server.get('static_env', {}))
@@ -393,37 +488,51 @@ def resolve_environment(servers: list[dict], env_snapshot: dict) -> tuple[list[d
                 else:
                     out['bearer_token'] = value
         if problems:
+            server['disposition'] = 'failed'
+            server['reasons'] = problems
             for p in problems:
                 diagnostics.append(Diagnostic('mcp', server['name'], p))
             if server.get('required'):
-                raise AgentError('inheritance_required_server_failed',
-                                 f"required MCP server {server['name']!r} cannot start: {'; '.join(problems)}")
-            diagnostics.append(Diagnostic('mcp', server['name'], 'excluded: environment unavailable in this daemon generation'))
+                required_failures.append(server['name'])
+            else:
+                diagnostics.append(Diagnostic('mcp', server['name'], 'excluded: environment unavailable in this daemon generation'))
             continue
-        usable.append(out)
-    return usable, diagnostics
+        server.update(out)
+    if required_failures:
+        raise AgentError('inheritance_required_server_failed',
+                         'required MCP server(s) cannot start: ' + ', '.join(sorted(required_failures)))
+    return servers, diagnostics
 
 
 def policy_filter(servers: list[dict], access: str) -> tuple[list[dict], list[Diagnostic]]:
-    """Child-limit intersection. Read children only get explicitly allow-listed
-    tools without approval, or readOnlyHint tools behind per-call confirmation."""
+    """Child-limit intersection for read children.
+
+    The parent's enabled_tools declares what children may use at all; it is not
+    a read-safety endorsement of each tool. A read child WITH an explicit
+    allowlist may call exactly those tools, subject to the inherited approval
+    policy. A read child WITHOUT an allowlist sees only readOnly-advertised
+    tools and every call confirms (confirm_all) — parent-side 'auto' can never
+    relax this child rule, and readOnlyHint is a server self-report, not a
+    trusted capability, so it only affects visibility.
+    """
     diagnostics: list[Diagnostic] = []
     if access == 'write':
         return servers, diagnostics
-    usable = []
     for server in servers:
-        if server.get('allowed_tools') is not None:
-            usable.append(server)
-        else:
+        if server.get('disposition') != 'ok':
+            continue
+        if server.get('allowed_tools') is None:
+            server['confirm_all'] = True
             diagnostics.append(Diagnostic('mcp', server['name'],
-                                          'read child: server has no explicit enabled_tools allowlist; tools require per-call confirmation'))
-            usable.append({**server, 'confirm_all': True})
-    return usable, diagnostics
+                                          'read child: server has no explicit enabled_tools allowlist; only readOnly tools are visible and every call confirms'))
+    return servers, diagnostics
 
 
-def capture_scope_env(codex_home: Path | None, environ: dict) -> dict:
-    """Client-side snapshot: base keys plus every var the current config references."""
-    names = set(BASE_ENV_KEYS)
+def capture_scope_env(codex_home: Path | None, environ: dict,
+                      extra_names: list[str] | tuple[str, ...] = ()) -> dict:
+    """Client-side snapshot: base keys plus every var the current config references
+    plus explicitly authorized child-env names (inheritance.child_env)."""
+    names = set(BASE_ENV_KEYS) | {n for n in extra_names if isinstance(n, str) and n.strip()}
     if codex_home is not None:
         try:
             raw = read_codex_config(codex_home)

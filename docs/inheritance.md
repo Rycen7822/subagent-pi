@@ -1,4 +1,4 @@
-# Codex Inheritance for Managed Children (0.2.0)
+# Codex Inheritance for Managed Children (0.2.1)
 
 Managed subagents started by this plugin can use your Codex-side global skills
 and MCP servers. Normal `pi` sessions are never affected: inheritance is added
@@ -109,42 +109,69 @@ not bypass this; renaming the binary itself is out of scope).
 
 Booted children receive the converted configuration through an anonymous pipe
 (fd number in `PI_AGENTS_BOOTSTRAP_FD`), passed daemon → worker guard → Pi
-with `pass_fds` on every hop; the daemon writes the payload asynchronously
-after the child starts, so payloads larger than the pipe buffer cannot
-deadlock; the child reads it to EOF, closes the fd immediately, and answers
-with a non-secret stderr receipt (`subagent-pi-bridge ready servers=N`) that
-the daemon verifies before any task is sent — a successful `get_state` alone
-never proves the bridge loaded.
+with `pass_fds` on every hop; the daemon writes the payload asynchronously in
+a thread that owns and closes the fd (a timeout abandons the wait, never
+closes the fd mid-write). The bridge exposes one tool, `codex_mcp`, with:
 
-The bridge (`extensions/codex-mcp-bridge.ts`, loaded only via explicit
-`--extension` on managed children) exposes one tool, `codex_mcp`:
+- `action = "list"`: configured servers and policy only — no connections.
+- `action = "describe"`: the full `inputSchema` of one tool, kept in process
+  memory (no disk cache). Deny/allow filtering applies to list/describe/call.
+- `action = "call"`: invokes `server` + `tool` with `args`.
 
-- `action = "list"`: connects to configured servers on demand (bounded
-  concurrency) and lists their tools (names and short descriptions only; no
-  full schemas are injected into the context).
-- `action = "call"`: invokes `server` + `tool` with `args`. Connections live in
-  memory for the worker's lifetime (stateful servers keep their state between
-  calls); metadata caches invalidate on `tools/list_changed`; pagination,
-  per-tool timeouts and cancellation are handled; a failed call is never
-  retried automatically (side effects); results support text and
-  `structuredContent`; other content types are reported as unsupported without
-  creating files; server errors are surfaced as errors, not successes.
+Connections live in memory for the worker's lifetime (stateful servers keep
+their state between calls). The supported lifecycle subset is initialize
+(protocol 2025-06-18), `tools/list` with pagination bounds and cursor-loop
+protection, `tools/call`, `notifications/initialized`,
+`notifications/cancelled` and `notifications/tools/list_changed`, over
+newline-delimited stdio JSON-RPC or the streamable-HTTP transport (JSON or
+SSE responses, `mcp-session-id`). Anything outside this subset is rejected
+explicitly instead of half-implemented.
 
-Read-only children (`access = "read"`) see the intersection of the server
-policy and the child limit: tools inside an explicit `enabled_tools` allowlist
-are callable; other tools are callable only if they advertise
-`readOnlyHint = true` and every call is confirmed through
-`pi_answer_agent`; everything else is invisible. The tool policy is not an OS
-sandbox and does not recreate Codex sandboxing.
+After registering the tool, the bridge writes a STRUCTURED receipt — JSON,
+non-secret, carrying the agent id, generation and per-server status — to the
+fd in `PI_AGENTS_BRIDGE_RECEIPT_FD`. The daemon parses it exactly from the
+private stream (never a substring scan of the size-capped stderr.log).
+REQUIRED servers are initialized eagerly before the receipt; the daemon does
+not send a task until the receipt says ready for this exact agent generation.
+Optional servers connect lazily on first use.
+
+## Approval policy and read-only children
+
+The effective approval for a tool is resolved top-down: deny (disabled_tools
+or unimplementable tool config) highest, then the per-tool `approval_mode`
+override, then the server `default_tools_approval_mode`, then "confirm".
+`writes` and unknown values degrade to confirm with a named diagnostic.
+
+A read child WITHOUT an explicit allowlist sees only readOnly-advertised
+tools and every call confirms (`confirm_all`); the bridge derives this rule
+itself from the child access, so parent-side `auto` can never relax it. A
+read child WITH an allowlist may call exactly those tools under the inherited
+approval policy. `readOnlyHint` is a server self-report: it affects visibility
+only and never removes a mandatory confirmation. Confirmations flow through
+the normal `pi_answer_agent` channel; a denied or cancelled confirmation sends
+no `tools/call` at all.
+
+The tool policy is not an OS sandbox and does not recreate Codex sandboxing.
+MCP `isError` results and transport failures surface as real tool errors via
+Pi's error mechanism; a failed call is never retried automatically, and a call
+cancelled in flight is reported with an explicit "outcome unknown" rather
+than pretending it did not run.
 
 ## Secrets
 
 - The bound scope keeps a minimal env snapshot in daemon memory: base keys
   (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `SHELL`, `USER`,
-  `LOGNAME`, `CODEX_HOME`) plus exactly the variables the current codex config
-  references. It is never persisted, logged, or included in events.
+  `LOGNAME`, `CODEX_HOME`), exactly the variables the current codex config
+  references, and explicitly configured `inheritance.child_env` names (for
+  model-auth env vars). It is never persisted, logged, or included in events.
+- The guard and Pi worker do NOT inherit the daemon's environ: their base
+  environment is built from the scope snapshot above, so session B never sees
+  session A's credentials. The bridge gives each MCP stdio server only the
+  same base keys plus that server's declared `env` values.
 - Persistence stores non-secret source fields only (codex_home, mode, enabled
-  flag, variable names in diagnostics).
+  flag, variable NAMES in diagnostics, env NAMES in launch.json); profile env
+  VALUES are re-read from the operator config at every boot and never enter
+  the ledger, launch.json, requests or events.
 - After a daemon restart the scope's source path is still known, but parent
   env values are gone: env-referencing servers are excluded with named
   diagnostics, and required ones fail with
@@ -171,7 +198,7 @@ sandbox and does not recreate Codex sandboxing.
 - Model pinning, run/request identities, single-session writer, receipts and
   result-hash acknowledgement are unchanged.
 
-## Known boundaries (unsupported in 0.2.0)
+## Known boundaries (unsupported in 0.2.1)
 
 - OAuth / ChatGPT-session authenticated MCP servers, dynamic
   `http_headers_helper`, remote executor stdio, sampling/elicitation, and
@@ -180,5 +207,9 @@ sandbox and does not recreate Codex sandboxing.
 - The official Codex user skill location `~/.agents/skills` is not scanned;
   this plugin inherits `<codex_home>/skills` (and the project `.agents`
   skills) by design.
+- Codex-specific skill policy metadata (`agents/openai.yaml`) is not
+  interpreted or enforced by Pi; such skills load with a diagnostic saying so.
 - Renaming the subagent-pi binary itself would evade the recursion guard;
-  renaming servers or skills in the configs does not.
+  renaming servers or skills in the configs does not. The guard is a managed
+  tool-surface restriction, not a sandbox against arbitrary same-user
+  processes.

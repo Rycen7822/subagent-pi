@@ -29,7 +29,7 @@ mcp = true       # 继承 config.toml 的 mcp_servers
 # codex_home = "/abs/path"  # 显式受信任来源；缺省按 显式设置 → CODEX_HOME → ~/.codex 解析
 ```
 
-来源在 scope 绑定时确定并持久化（非秘密字段）；环境变量的**值**只保存在 daemon 内存中，重启后需所属客户端重新绑定。respawn 总是从原文件重建继承，不追加历史参数。诊断：`subagent-pi doctor --inheritance`。完整语义（冲突策略、只读子代理交集、审批模式、不支持的认证形式）见 `docs/inheritance.md`。
+来源在 scope 绑定时确定并持久化（非秘密字段）；显式 `codex_home` 或已设置的 `CODEX_HOME` 不存在时报错而非静默回退。环境变量的**值**只保存在 daemon 内存中，重启后需所属客户端重新绑定；子进程基础环境同样来自 scope 快照（不复制 daemon 全量环境），模型认证如依赖环境变量，需在 `child_env` 中显式授权（只写名字，值不落盘）。respawn 总是从原文件重建继承，不追加历史参数。诊断：`subagent-pi doctor --inheritance`。完整语义（冲突策略、只读子代理、审批模型、required 回执、取消的"结果未知"语义）见 `docs/inheritance.md`。
 
 ## Profiles
 

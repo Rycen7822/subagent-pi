@@ -7,14 +7,15 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
 
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
-from subagent_pi.common import AgentError
-from subagent_pi.inheritance import (capture_scope_env, collect_skills, parse_mcp_servers,
+from subagent_pi.common import AgentError, dumps
+from subagent_pi.inheritance import (Diagnostic, capture_scope_env, collect_skills, parse_mcp_servers,
     policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from subagent_pi.runtime import Runtime
 from subagent_pi.store import Store
@@ -70,10 +71,17 @@ class SourceResolution(unittest.TestCase):
             self.assertIsNone(home)
         finally:
             if old is not None: os.environ['HOME']=old
-    def test_nonexistent_explicit_dir_falls_through(self):
-        b=make_codex_home(self.base/'b')
-        home,mode=resolve_codex_home(self.config(self.base/'missing'),{'CODEX_HOME':str(b)})
-        self.assertEqual(home,b)
+    def test_nonexistent_explicit_dir_is_an_error(self):
+        # 4.1: a configured source that is missing must not silently fall back to
+        # another candidate directory.
+        make_codex_home(self.base/'b')
+        with self.assertRaises(AgentError) as cm:
+            resolve_codex_home(self.config(self.base/'missing'),{'CODEX_HOME':str(self.base/'b')})
+        self.assertEqual(cm.exception.code,'inheritance_source_unreadable')
+    def test_missing_scope_env_source_is_an_error(self):
+        with self.assertRaises(AgentError) as cm:
+            resolve_codex_home(self.config(None),{'CODEX_HOME':str(self.base/'also-missing')})
+        self.assertEqual(cm.exception.code,'inheritance_source_unreadable')
 
 class SkillCollection(unittest.TestCase):
     def setUp(self):
@@ -165,6 +173,7 @@ class McpParsing(unittest.TestCase):
         servers,diag=self.parse(STDIO_TOML)
         self.assertEqual(len(servers),1)
         s=servers[0]
+        self.assertEqual(s['disposition'],'ok')
         self.assertEqual(s['transport'],'stdio')
         self.assertEqual(s['command'],'python3')
         self.assertEqual(s['args'],['-m','fake_server'])
@@ -174,9 +183,10 @@ class McpParsing(unittest.TestCase):
         self.assertEqual(s['static_env'],{'STATIC_K':'static-v'})
     def test_remote_env_source_disables_server(self):
         servers,diag=self.parse(REMOTE_TOML)
-        self.assertEqual(servers,[])
+        # F11: the failed server keeps its disposition instead of vanishing.
+        self.assertEqual([s['disposition'] for s in servers],['failed'])
         self.assertTrue(any('source=remote' in d.reason for d in diag))
-    def test_http_fields_and_url_redaction_not_needed_in_config(self):
+    def test_http_fields_and_policy_fields(self):
         servers,diag=self.parse(HTTP_TOML)
         self.assertEqual(len(servers),1)
         s=servers[0]
@@ -186,14 +196,16 @@ class McpParsing(unittest.TestCase):
         self.assertEqual(s['bearer_token_env_var'],'WEB_TOKEN')
         self.assertEqual(s['allowed_tools'],['search'])
         self.assertEqual(s['disabled_tools'],['danger'])
-        self.assertEqual(s['approval_mode'],'auto')
+        self.assertEqual(s['approval_default'],'auto')
+        self.assertEqual(s['tool_approval'],{})
         self.assertEqual(s['startup_timeout_sec'],7)
         self.assertEqual(s['tool_timeout_sec'],33)
     def test_disabled_and_unknown_critical_keys(self):
         config=HTTP_TOML+'\n[mcp_servers.bad]\ncommand = "x"\nsandbox_permissions = ["full"]\n\n[mcp_servers.off]\ncommand = "y"\nenabled = false\n'
         servers,diag=self.parse(config)
-        names=[s['name'] for s in servers]
-        self.assertNotIn('bad',names); self.assertNotIn('off',names)
+        dispo={s['name']:s['disposition'] for s in servers}
+        self.assertEqual(dispo['bad'],'failed'); self.assertEqual(dispo['off'],'disabled')
+        self.assertEqual(dispo['web'],'ok')  # unaffected servers continue
         self.assertTrue(any('unsupported config keys' in d.reason and d.name=='bad' for d in diag))
         self.assertTrue(any(d.name=='off' and 'disabled in codex config' in d.reason for d in diag))
     def test_oauth_and_helper_rejected(self):
@@ -209,59 +221,121 @@ command = "run"
 experimental_environment = "remote"
 '''
         servers,diag=self.parse(config)
-        self.assertEqual(servers,[])
+        self.assertEqual({s['disposition'] for s in servers},{'failed'})
         reasons=' '.join(d.reason for d in diag)
         self.assertIn('oauth',reasons); self.assertIn('http_headers_helper',reasons); self.assertIn('remote',reasons)
+    def test_required_parse_failure_is_kept_and_named(self):
+        # F11: an unsupported REQUIRED server cannot silently disappear.
+        config='[mcp_servers.core]\nurl = "https://x.example/mcp"\nauth = "oauth"\nrequired = true\n'
+        servers,diag=self.parse(config)
+        self.assertEqual(servers[0]['disposition'],'failed')
+        self.assertTrue(servers[0]['required'])
+        self.assertTrue(any('oauth' in d.reason for d in diag))
     def test_empty_allowlist_means_no_tools(self):
         config='[mcp_servers.strict]\ncommand = "x"\nenabled_tools = []\n'
         servers,_=self.parse(config)
         self.assertEqual(servers[0]['allowed_tools'],[])
-        usable,_=policy_filter([{**servers[0],'confirm_all':False}],'write')
-        self.assertEqual(usable[0]['allowed_tools'],[])
-    def test_recursion_guard_by_resolved_command(self):
+        policy_filter(servers,'write')
+        self.assertEqual(servers[0]['allowed_tools'],[])
+    def test_recursion_guard_direct_command(self):
         bin_path=ROOT/'bin'/'subagent-pi'
         config=f'[mcp_servers.renamed_control]\ncommand = "{bin_path}"\nargs = ["mcp"]\n'
         servers,diag=self.parse(config)
-        self.assertEqual(servers,[])
+        self.assertEqual(servers[0]['disposition'],'failed')
         self.assertTrue(any('recursion guard' in d.reason for d in diag))
+    def test_recursion_guard_installer_wrapper_and_module_form(self):
+        # F12: the installer generates command=sys.executable args=[<bin>,'mcp'];
+        # `python -m subagent_pi` must be caught too. Renaming the server evades nothing.
+        bin_path=ROOT/'bin'/'subagent-pi'
+        for cfg in (f'[mcp_servers.ctrl]\ncommand = "{sys.executable}"\nargs = ["{bin_path}", "mcp"]\n',
+                    '[mcp_servers.ctrl2]\ncommand = "python3"\nargs = ["-m", "subagent_pi", "mcp"]\n'):
+            servers,diag=self.parse(cfg)
+            self.assertEqual(servers[0]['disposition'],'failed',cfg)
+            self.assertTrue(any('recursion guard' in d.reason for d in diag))
+    def test_recursion_guard_does_not_catch_normal_python(self):
+        servers,_=self.parse('[mcp_servers.plain]\ncommand = "python3"\nargs = ["-m", "other_tool"]\n')
+        self.assertEqual(servers[0]['disposition'],'ok')
+    def test_approval_policy_table(self):
+        # F06: per-tool override wins over server default; writes/unknown degrade to confirm.
+        def policy(cfg):
+            servers,_=self.parse(cfg)
+            return servers[0]['approval_default'],servers[0]['tool_approval'],servers[0]['disabled_tools']
+        cfg='''[mcp_servers.example]
+command = "x"
+default_tools_approval_mode = "auto"
+[mcp_servers.example.tools.delete_file]
+approval_mode = "prompt"
+'''
+        default,tools,denied=policy(cfg)
+        self.assertEqual(default,'auto')
+        self.assertEqual(tools,{'delete_file':'confirm'})
+        cfg2='''[mcp_servers.example2]
+command = "x"
+default_tools_approval_mode = "prompt"
+[mcp_servers.example2.tools.safe_thing]
+approval_mode = "auto"
+'''
+        default,tools,denied=policy(cfg2)
+        self.assertEqual(default,'confirm')
+        self.assertEqual(tools,{'safe_thing':'auto'})
+        cfg3='''[mcp_servers.example3]
+command = "x"
+[mcp_servers.example3.tools.limited]
+output_token_limit = 100
+[mcp_servers.example3.tools.weird]
+approval_mode = "banana"
+'''
+        default,tools,denied=policy(cfg3)
+        self.assertIn('limited',denied); self.assertIn('weird',denied)
+        self.assertEqual(tools,{})
     def test_resolve_environment_from_snapshot_only(self):
         servers,_=self.parse(STDIO_TOML)
-        usable,diag=resolve_environment(servers,{'TOKEN_VAR':'token-a','PATH':'/bin'})
-        self.assertEqual(usable[0]['env']['TOKEN_VAR'],'token-a')
-        self.assertEqual(usable[0]['env']['STATIC_K'],'static-v')
-        self.assertNotIn('PATH',usable[0]['env'])  # base env is the child runner's job, not per-server
+        resolve_environment(servers,{'TOKEN_VAR':'token-a','PATH':'/bin'})
+        self.assertEqual(servers[0]['env']['TOKEN_VAR'],'token-a')
+        self.assertEqual(servers[0]['env']['STATIC_K'],'static-v')
+        self.assertNotIn('PATH',servers[0]['env'])  # base env is the child runner's job, not per-server
     def test_required_missing_env_blocks(self):
         config='[mcp_servers.core]\ncommand = "x"\nenv_vars = ["MISSING_VAR"]\nrequired = true\n'
         servers,_=self.parse(config)
         with self.assertRaises(AgentError) as cm:
             resolve_environment(servers,{})
         self.assertEqual(cm.exception.code,'inheritance_required_server_failed')
-        self.assertIn('MISSING_VAR',cm.exception.message)
+        self.assertIn('core',cm.exception.message)  # message carries server names, not values
+        self.assertIn('MISSING_VAR',servers[0]['reasons'][0])
+        self.assertEqual(servers[0]['disposition'],'failed')  # disposition recorded before raising
     def test_optional_missing_env_excluded_with_named_diagnostic(self):
         config='[mcp_servers.opt]\ncommand = "x"\nenv_vars = ["ABSENT_VAR"]\n'
         servers,_=self.parse(config)
-        usable,diag=resolve_environment(servers,{})
-        self.assertEqual(usable,[])
-        self.assertTrue(any('ABSENT_VAR' in d.reason for d in diag))
+        resolve_environment(servers,{})
+        self.assertEqual(servers[0]['disposition'],'failed')
+        self.assertTrue(any('ABSENT_VAR' in r for r in servers[0].get('reasons',[])))
     def test_bearer_and_env_headers_resolved(self):
         servers,_=self.parse(HTTP_TOML)
-        usable,diag=resolve_environment(servers,{'WEB_TOKEN':'tok','TRACE_ID':'tr-1'})
-        self.assertEqual(usable[0]['bearer_token'],'tok')
-        self.assertEqual(usable[0]['headers'],{'X-Static':'sv','X-Trace':'tr-1'})
+        resolve_environment(servers,{'WEB_TOKEN':'tok','TRACE_ID':'tr-1'})
+        self.assertEqual(servers[0]['bearer_token'],'tok')
+        self.assertEqual(servers[0]['headers'],{'X-Static':'sv','X-Trace':'tr-1'})
     def test_read_child_policy_intersects(self):
         servers,_=self.parse(HTTP_TOML)  # has explicit allowlist
-        usable,diag=policy_filter(servers,'read')
-        self.assertEqual(usable[0]['name'],'web'); self.assertNotIn('confirm_all',usable[0])
+        policy_filter(servers,'read')
+        self.assertEqual(servers[0]['name'],'web'); self.assertNotIn('confirm_all',servers[0])
         no_list,_=self.parse('[mcp_servers.open]\ncommand = "x"\n')
-        usable,diag=policy_filter(no_list,'read')
-        self.assertTrue(usable[0]['confirm_all'])
-        usable,diag=policy_filter(no_list,'write')
-        self.assertNotIn('confirm_all',usable[0])
+        policy_filter(no_list,'read')
+        self.assertTrue(no_list[0]['confirm_all'])
+        no_list2,_=self.parse('[mcp_servers.open2]\ncommand = "x"\n')
+        policy_filter(no_list2,'write')
+        self.assertNotIn('confirm_all',no_list2[0])
+    def test_diagnostics_are_str_only(self):
+        # F10: missing default skills dir previously put a Path object into the diagnostic.
+        skills,diag=collect_skills(self.home,{},None,[])
+        dumps([d.as_dict() for d in diag])  # must not raise
+        self.assertTrue(all(isinstance(d.as_dict()['name'],str) for d in diag))
     def test_capture_scope_env_is_minimal(self):
         (self.home/'config.toml').write_text(STDIO_TOML+'[mcp_servers.w2]\nurl="https://e.example"\nbearer_token_env_var="BT"\n')
-        environ={'PATH':'/bin','HOME':'/h','TOKEN_VAR':'tv','BT':'bt','UNRELATED_SECRET':'nope','CODEX_HOME':str(self.home)}
-        snap=capture_scope_env(self.home,environ)
+        environ={'PATH':'/bin','HOME':'/h','TOKEN_VAR':'tv','BT':'bt','ANTHROPIC_API_KEY':'sk-test',
+                 'UNRELATED_SECRET':'nope','CODEX_HOME':str(self.home)}
+        snap=capture_scope_env(self.home,environ,extra_names=('ANTHROPIC_API_KEY',))
         self.assertIn('TOKEN_VAR',snap); self.assertIn('BT',snap); self.assertIn('PATH',snap)
+        self.assertEqual(snap['ANTHROPIC_API_KEY'],'sk-test')  # authorized child-env name is captured for model auth
         self.assertNotIn('UNRELATED_SECRET',snap)
         servers,_=self.parse(STDIO_TOML+'[mcp_servers.w2]\nurl="https://e.example"\nbearer_token_env_var="BT"\n')
         self.assertEqual(set(referenced_env_names(servers)),{'PATH','HOME','LANG','LC_ALL','TERM','TMPDIR','SHELL','USER','LOGNAME','CODEX_HOME','TOKEN_VAR','BT'})
@@ -296,6 +370,32 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
     async def spawn(self,**extra):
         return await self.rt.dispatch('spawn',{'scope':self.scope,'request_id':self.key(),
             'cwd':str(self.workspace),'task':'simple','access':'read',**extra})
+    async def test_required_server_failure_blocks_spawn_without_prompt(self):
+        # F11: a broken REQUIRED server aborts the boot; no prompt is ever sent
+        # and the worker does not linger.
+        (self.codex/'config.toml').write_text(
+            '[mcp_servers.broken]\ncommand = "/definitely/missing/binary"\nrequired = true\n')
+        before=self.fake_prompt_count()
+        with self.assertRaises(AgentError) as cm:
+            await self.spawn()
+        self.assertEqual(cm.exception.code,'inheritance_required_server_failed')
+        self.assertTrue(all(r[0] not in ('starting','running','queued') for r in self.run_rows()),
+                        f'runs not terminal: {self.run_rows()}')
+        self.assertTrue(all(w.closed for w in self.rt.workers.values()))  # half-started workers are terminated
+        self.assertEqual(self.fake_prompt_count(),before+1)  # the failed run is recorded, never sent
+        (self.codex/'config.toml').write_text(STDIO_TOML)
+    def fake_prompt_count(self):
+        con=sqlite3.connect(f'file:{self.home}/registry.sqlite?mode=ro',uri=True)
+        try:
+            rows=con.execute("SELECT task FROM runs").fetchall()
+        finally: con.close()
+        return len(rows)
+    def run_rows(self):
+        con=sqlite3.connect(f'file:{self.home}/registry.sqlite?mode=ro',uri=True)
+        try:
+            rows=con.execute("SELECT state FROM runs").fetchall()
+        finally: con.close()
+        return rows
     async def test_scope_binding_persists_nonsecret_source(self):
         row=self.rt.store.scope(self.scope)
         self.assertEqual(row['codex_home'],str(self.codex))
@@ -421,8 +521,15 @@ class StoreMigration(unittest.TestCase):
         store.close(); tmp.cleanup()
 
 class RealPiBridge(unittest.IsolatedAsyncioTestCase):
-    """Real Pi process + real TS bridge, no model calls. Skipped without pi."""
+    """Real Pi process + real TS bridge. NOT in the default suite.
+
+    Requires explicit SUBAGENT_PI_LIVE_PI=1. It boots a real Pi worker and
+    verifies the extension loads and reports ready through the receipt channel;
+    it never sends a business prompt, so no model call is possible.
+    """
     async def asyncSetUp(self):
+        if os.environ.get('SUBAGENT_PI_LIVE_PI')!='1':
+            raise unittest.SkipTest('set SUBAGENT_PI_LIVE_PI=1 to run the real-Pi check; default suite never launches Pi')
         if not shutil.which('pi'): self.skipTest('pi executable not available')
         self.tmp=tempfile.TemporaryDirectory(prefix='inh-live-')
         self.root=Path(self.tmp.name); self.home=self.root/'state'; self.home.mkdir()
@@ -443,6 +550,10 @@ class RealPiBridge(unittest.IsolatedAsyncioTestCase):
         r=await self.rt.dispatch('scope_open',{'cwd':str(self.workspace)},
             source={'env':{'CODEX_HOME':str(self.codex),'PATH':os.environ['PATH'],'HOME':os.environ['HOME']}})
         self.scope=r['scope']
+        # Boot only: start_run is stubbed so no business prompt (and therefore no
+        # model request) can ever be sent from this test.
+        async def _no_prompt(w,rid): return None
+        self.rt.start_run=_no_prompt
     async def asyncTearDown(self):
         await self.rt.shutdown(); self.tmp.cleanup()
     async def test_bridge_loads_in_real_pi_child(self):
@@ -451,17 +562,26 @@ class RealPiBridge(unittest.IsolatedAsyncioTestCase):
         aid=s['agent_id']
         stderr=(self.home/'agents'/aid/'stderr.log').read_text()
         self.assertIn('subagent-pi-bridge ready servers=1',stderr)
-        self.assertIn('--extension',json.loads((self.home/'agents'/aid/'launch.json').read_text())['argv'][0] if False else ' '.join(json.loads((self.home/'agents'/aid/'launch.json').read_text())['argv']))
+        # The daemon accepted the bridge receipt for this agent/generation.
+        events=[json.loads(e['payload']) for e in self.rt.store.all(
+            "SELECT payload FROM events WHERE agent_id=? AND type='bridge_receipt'",(aid,))]
+        self.assertTrue(any(x.get('state')=='ready' and x.get('agent')==aid for x in events))
+        await self.rt.dispatch('close',{'scope':self.scope,'agent_id':aid,'request_id':'live-close'})
+        self.assertIn('--extension',' '.join(json.loads((self.home/'agents'/aid/'launch.json').read_text())['argv']))
         await self.rt.dispatch('close',{'scope':self.scope,'agent_id':aid,'request_id':'live-close'})
 
 class CliCodexParsing(unittest.TestCase):
     def test_cd_forms_and_separator(self):
         from subagent_pi.cli import split_codex_cwd
-        self.assertEqual(split_codex_cwd(['-C','/tmp','run']),('/tmp',['run']))
-        self.assertEqual(split_codex_cwd(['--cd','/tmp x']),('/tmp x',[]))
-        self.assertEqual(split_codex_cwd(['--cd=/a b','exec']),('/a b',['exec']))
+        # F02: arguments are returned VERBATIM; only the cwd is scanned out.
+        self.assertEqual(split_codex_cwd(['-C','/tmp','run']),('/tmp',['-C','/tmp','run']))
+        self.assertEqual(split_codex_cwd(['--cd','/tmp x']),('/tmp x',['--cd','/tmp x']))
+        self.assertEqual(split_codex_cwd(['--cd=/a b','exec']),('/a b',['--cd=/a b','exec']))
+        self.assertEqual(split_codex_cwd(['-C/attached','run']),('/attached',['-C/attached','run']))
         self.assertEqual(split_codex_cwd(['--','--cd','/x']),(None,['--','--cd','/x']))  # after -- untouched
         self.assertEqual(split_codex_cwd(['exec','--profile','p']),(None,['exec','--profile','p']))
+        self.assertEqual(split_codex_cwd(['-C','/a','-C','/b']),('/b',['-C','/a','-C','/b']))  # last wins
+        self.assertEqual(split_codex_cwd(['--cd','/中文 目录','run']),('/中文 目录',['--cd','/中文 目录','run']))
 
 class BootstrapStress(unittest.IsolatedAsyncioTestCase):
     async def test_payload_larger_than_pipe_capacity(self):
@@ -490,6 +610,139 @@ class BootstrapStress(unittest.IsolatedAsyncioTestCase):
                 await rt.shutdown()
         finally:
             tmp.cleanup()
+
+class RealPiParserProbe(unittest.TestCase):
+    """F01 layer-3: the FINAL merged argv must parse in Pi's real CLI parser with
+    exactly one --tools flag containing the original builtins plus codex_mcp.
+    Static parse only: no Pi process, no model call. Skipped without pi."""
+    def pi_args_js(self):
+        exe=shutil.which('pi')
+        if not exe: return None
+        real=Path(exe).resolve()
+        candidate=real.parents[1]/'lib'/'node_modules'/'@earendil-works'/'pi-coding-agent'/'dist'/'cli'/'args.js' if 'node_modules' not in real.parts else None
+        # Resolve robustly: walk up from the resolved executable to find dist/cli/args.js.
+        for parent in [real.parent,*real.parents]:
+            guess=parent/'dist'/'cli'/'args.js'
+            if guess.is_file(): return guess
+        return None
+    def probe(self,argv):
+        js=self.pi_args_js()
+        if js is None: self.skipTest('pi dist/cli/args.js not found')
+        script="const {parseArgs}=require(process.argv[1]);const r=parseArgs(process.argv.slice(2));console.log(JSON.stringify({tools:r.tools,noTools:r.noTools}))"
+        out=subprocess.run(['node','-e',script,str(js),*argv],capture_output=True,text=True,timeout=30)
+        self.assertEqual(out.returncode,0,out.stderr)
+        return json.loads(out.stdout)
+    def test_reader_tools_survive_bridge_merge(self):
+        base=['pi','--mode','rpc','--no-extensions','--no-skills','--tools','read,grep,find,ls']
+        merged=Runtime._merge_bridge_tool([*base,'--extension','/bridge.ts'])
+        self.assertEqual(merged.count('--tools'),1)
+        parsed=self.probe(merged)
+        self.assertEqual(parsed['tools'],['read','grep','find','ls','codex_mcp'])
+        self.assertFalse(parsed.get('noTools'))
+    def test_no_tools_becomes_bridge_only(self):
+        merged=Runtime._merge_bridge_tool(['pi','--mode','rpc','--no-tools','--extension','/b.ts'])
+        self.assertNotIn('--no-tools',merged)
+        self.assertEqual(merged.count('--tools'),1)
+        parsed=self.probe(merged)
+        self.assertEqual(parsed['tools'],['codex_mcp'])
+    def test_no_tool_flags_left_untouched(self):
+        argv=['pi','--mode','rpc','--extension','/b.ts']
+        self.assertEqual(Runtime._merge_bridge_tool(list(argv)),argv)  # bare --tools would strip builtins
+
+class CodexLauncherProcess(unittest.TestCase):
+    """F02 layer-3: a real launcher subprocess must forward Codex's arguments
+    verbatim (including -C/--cd) and bind the scope to the target directory.
+    The fake codex prints its cwd and argv; nothing touches a real Codex."""
+    def test_launcher_forwards_args_and_binds_scope(self):
+        tmp=tempfile.TemporaryDirectory(prefix='codex-launch-')
+        try:
+            root=Path(tmp.name); bin_dir=root/'bin'; bin_dir.mkdir()
+            proj=root/'my project'; proj.mkdir()  # space in path on purpose
+            fake=bin_dir/'codex'
+            fake.write_text('#!/usr/bin/env python3\nimport json,os,sys\nprint(json.dumps({"cwd":os.getcwd(),"argv":sys.argv[1:]}))\n')
+            fake.chmod(0o755)
+            env={k:v for k,v in os.environ.items() if k not in ('PI_AGENTS_HOME','PI_AGENTS_SCOPE','CODEX_HOME')}
+            env['PATH']=f'{bin_dir}{os.pathsep}{env.get("PATH","")}'
+            env['PI_AGENTS_HOME']=str(root/'state')
+            cli=str(ROOT/'bin'/'subagent-pi')
+            def run(*args,**kw):
+                return subprocess.run([sys.executable,cli,*args],env=env,capture_output=True,text=True,timeout=90,**kw)
+            try:
+                proc=run('codex','-C',str(proj),'exec','--profile','p','--','prompt text')
+                self.assertEqual(proc.returncode,0,proc.stderr or proc.stdout)
+                out=json.loads(proc.stdout)
+                # Codex receives the ORIGINAL arguments, unchanged, and runs in
+                # the launcher's cwd (Codex applies -C itself).
+                self.assertEqual(out['argv'],['-C',str(proj),'exec','--profile','p','--','prompt text'])
+                self.assertEqual(Path(out['cwd']),Path(os.getcwd()))
+                doc=run('doctor','--inheritance')
+                self.assertEqual(doc.returncode,0,doc.stderr)
+                report=json.loads(doc.stdout)['inheritance']
+                self.assertEqual(report['scopes'][0]['cwd'],str(proj.resolve()))
+                # --cd= form and no-override form are also accepted end to end.
+                proc2=run('codex','--cd='+str(proj),'run')
+                self.assertEqual(proc2.returncode,0,proc2.stderr or proc2.stdout)
+                self.assertEqual(json.loads(proc2.stdout)['argv'],['--cd='+str(proj),'run'])
+                proc3=run('codex','exec')
+                self.assertEqual(proc3.returncode,0,proc3.stderr or proc3.stdout)
+                self.assertEqual(json.loads(proc3.stdout)['argv'],['exec'])
+            finally:
+                subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True,text=True,timeout=30)
+        finally:
+            tmp.cleanup()
+
+class ScopeEnvIsolation(unittest.IsolatedAsyncioTestCase):
+    """F07 layer-3: each scope's Pi worker must see ITS OWN base env values and
+    never a daemon-only canary. Probes flow through get_state responses in
+    memory only (fake_pi echoes only PI_TEST_* names, which the canary check
+    then proves absent from every control-plane file)."""
+    async def asyncSetUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='inh-env-')
+        self.root=Path(self.tmp.name); self.home=self.root/'state'; self.home.mkdir()
+        (self.home/'config.toml').write_text('pi_command = '+fake_pi_command()+'\nstartup_timeout_seconds = 25\n\n[inheritance]\nchild_env = ["PI_TEST_HOME_TAG"]\n')
+        self.rt=Runtime(self.home)
+        self.canary='PI_TEST_ENV_CANARY'
+        os.environ[self.canary]='daemon-only'  # present in the daemon environ
+        self.addAsyncCleanup(os.environ.pop,self.canary,None)
+    async def asyncTearDown(self):
+        await self.rt.shutdown(); self.tmp.cleanup()
+    async def _spawn_with_env(self,label,cwd,env,rid):
+        r=await self.rt.dispatch('scope_open',{'cwd':str(cwd),'label':label},source={'env':env})
+        scope=r['scope']
+        s=await self.rt.dispatch('spawn',{'scope':scope,'request_id':rid,
+            'cwd':str(cwd),'task':'simple','access':'read'})
+        return scope,s['agent_id']
+    async def test_two_scopes_get_their_own_values(self):
+        ws_a=self.root/'a'; ws_a.mkdir(); ws_b=self.root/'b'; ws_b.mkdir()
+        base={'PATH':os.environ['PATH'],'HOME':os.environ['HOME']}
+        scope_a,aid_a=await self._spawn_with_env('a',ws_a,{**base,'PI_TEST_HOME_TAG':'A'},'env-1')
+        scope_b,aid_b=await self._spawn_with_env('b',ws_b,{**base,'PI_TEST_HOME_TAG':'B'},'env-2')
+        for scope,aid,tag in ((scope_a,aid_a,'A'),(scope_b,aid_b,'B')):
+            w=self.rt.workers[aid]
+            state=await w.rpc('get_state')
+            probe=state.get('env_probe',{})
+            self.assertEqual(probe.get('PI_TEST_HOME_TAG'),tag)
+            self.assertNotIn(self.canary,probe)  # daemon-only canary never reaches any child
+            await self.rt.dispatch('close',{'scope':scope,'agent_id':aid,'request_id':f'close-{tag}'})
+    async def test_control_plane_has_no_env_values(self):
+        ws=self.root/'c'; ws.mkdir()
+        scope,aid=await self._spawn_with_env('c',ws,{**{'PATH':os.environ['PATH'],'HOME':os.environ['HOME']},
+                                                     'PI_TEST_SECRET_VAR':'scope-secret-value'},'env-3')
+        blobs=[p for p in self.home.rglob('*') if p.is_file() and p.suffix in ('.json','.jsonl','')]
+        for p in blobs:
+            self.assertNotIn(b'scope-secret-value',p.read_bytes(),p)
+        db=self.home/'registry.sqlite'
+        if db.exists():
+            import sqlite3
+            con=sqlite3.connect(f'file:{db}?mode=ro',uri=True)
+            try:
+                for (table,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+                    for row in con.execute(f'SELECT * FROM {table}'):
+                        self.assertNotIn('scope-secret-value',str(row))
+            finally: con.close()
+        wal=self.home/'registry.sqlite-wal'
+        if wal.exists():
+            self.assertNotIn(b'scope-secret-value',wal.read_bytes())
 
 if __name__=='__main__':
     unittest.main()

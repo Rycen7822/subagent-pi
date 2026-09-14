@@ -23,7 +23,6 @@ BASE_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL', 'USER'
 
 RESULT_CAP = 1024 * 1024
 BOOTSTRAP_MAX = 4 * 1024 * 1024
-BRIDGE_MARKER = 'subagent-pi-bridge ready'
 
 def message_text(message):
     content = message.get('content',[])
@@ -142,6 +141,8 @@ class Runtime:
         Persisted launch argv is never touched; additions are recomputed for every
         new process, so respawn never accumulates stale flags. Secrets are resolved
         into the pipe payload only; diagnostics carry names, never values.
+        Project .agents resources resolve against this worker's effective cwd
+        (the spawn directory), not merely the scope root.
         """
         inh = self.config['inheritance']
         empty = {'argv': [], 'payload': None, 'diagnostics': [], 'bridge': False, 'servers': []}
@@ -164,46 +165,63 @@ class Runtime:
         existing_skills = [spec['argv'][i + 1] for i, flag in enumerate(spec['argv']) if flag == '--skill']
         skill_paths, skill_diag = [], []
         if inh.get('skills', True):
-            skill_paths, skill_diag = collect_skills(codex_home, raw, scope['cwd'], existing_skills)
+            skill_paths, skill_diag = collect_skills(codex_home, raw, a['cwd'], existing_skills)
         servers, mcp_diag = [], []
         if inh.get('mcp', True):
             servers, mcp_diag = parse_mcp_servers(codex_home, raw)
+            # A parse-level failure must not erase a required server: dispositions
+            # carry the reason and required failures abort the boot below.
             servers, env_diag = resolve_environment(servers, source_env or {})
             mcp_diag += env_diag
             servers, access_diag = policy_filter(servers, spec['access'])
             mcp_diag += access_diag
+        required_broken = [s['name'] for s in servers if s.get('required') and s.get('disposition') != 'ok']
+        if required_broken:
+            raise AgentError('inheritance_required_server_failed',
+                             'required MCP server(s) cannot start: ' + ', '.join(sorted(required_broken)))
+        usable = [s for s in servers if s.get('disposition') == 'ok']
         diagnostics = [d.as_dict() for d in skill_diag + mcp_diag]
         argv = []
         for path in (p for p in skill_paths if p not in existing_skills):
             argv += ['--skill', path]
         bridge_path = Path(__file__).resolve().parent.parent / 'extensions' / 'codex-mcp-bridge.ts'
-        load_bridge = bool(inh.get('mcp', True) and servers and bridge_path.exists())
+        load_bridge = bool(inh.get('mcp', True) and usable and bridge_path.exists())
         payload = None
         if load_bridge:
             argv += ['--extension', str(bridge_path)]
-            argv = self._enable_bridge_tool(list(argv))
+            # The bridge tool is merged into the full launch allowlist in
+            # boot_worker (a second --tools flag would wipe the existing one).
+            internal = ('env_var_names', 'env_header_names', 'static_env', 'static_headers',
+                        'disposition', 'reasons')
             payload = {'v': 1,
                        'agent': {'id': a['id'], 'access': spec['access'], 'generation': generation},
                        'source': {'codex_home': str(codex_home), 'mode': mode},
-                       'mcp': {'servers': servers}}
+                       'mcp': {'servers': [{k: v for k, v in s.items() if k not in internal} for s in usable]}}
         return {'argv': argv, 'payload': payload, 'diagnostics': diagnostics,
-                'bridge': load_bridge, 'servers': [s['name'] for s in servers],
+                'bridge': load_bridge, 'servers': [s['name'] for s in usable],
                 'source': {'codex_home': str(codex_home), 'mode': mode}}
 
     @staticmethod
-    def _enable_bridge_tool(argv, tool='codex_mcp'):
-        """Pi's --tools allowlist also gates extension tools; --no-tools disables them."""
-        if '--no-tools' in argv:
-            argv = [x for x in argv if x != '--no-tools']
-            if '--tools' not in argv:
-                argv += ['--tools', tool]
-        if '--tools' in argv:
-            i = argv.index('--tools')
-            names = argv[i + 1].split(',')
+    def _merge_bridge_tool(argv, tool='codex_mcp'):
+        """Merge the bridge tool into Pi's tool allowlist over the FULL launch argv.
+
+        Pi's CLI parser assigns on every --tools occurrence, so the last flag wins;
+        appending a second --tools would wipe the reader/writer builtin allowlist.
+        The merged list is serialized exactly once. Cases:
+        - existing --tools/-t: append the bridge tool to that single flag;
+        - --no-tools: keep "no builtin tools" but allow exactly the bridge tool;
+        - no tool flag at all (custom pi_command): leave argv untouched — Pi then
+          allows extension tools by default, and a bare --tools would strip builtins.
+        Called only when the bridge is loaded (plan['bridge']).
+        """
+        i = next((k for k, x in enumerate(argv) if x in ('--tools', '-t')), None)
+        if i is not None and i + 1 < len(argv):
+            names = [n for n in argv[i + 1].split(',') if n]
             if tool not in names:
-                argv = [*argv[:i], '--tools', ','.join(names + [tool]), *argv[i + 2:]]
-        else:
-            argv += ['--tools', tool]
+                names.append(tool)
+            return [*argv[:i], '--tools', ','.join(names), *argv[i + 2:]]
+        if '--no-tools' in argv:
+            return [x for x in argv if x != '--no-tools'] + ['--tools', tool]
         return argv
 
     @staticmethod
@@ -214,32 +232,27 @@ class Runtime:
             view = view[written:]
 
     async def _write_bootstrap(self, fd, agent_id, generation, data):
-        try:
-            await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, self._write_all, fd, data), 30)
-        except Exception as exc:
-            # Child exited early or the pipe broke; never record payload contents.
-            self.store.event(agent_id, None, generation, 'bootstrap_write_failed', {'error': type(exc).__name__})
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-
-    async def _wait_bridge_ready(self, directory, timeout, offset=0, expected=None):
-        path = directory / 'stderr.log'
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        """Write the payload from a worker thread; the thread owns the fd and
+        closes it when the write finishes or breaks. A timeout abandons the
+        WAIT, never the write mid-close: closing an fd another thread may still
+        use risks writing into a reused descriptor."""
+        def _write_and_close():
             try:
-                size = path.stat().st_size
-                if size > offset:
-                    content = path.read_bytes()[offset:]
-                    if expected is not None:
-                        if expected.encode() in content:
-                            return True
-                    elif BRIDGE_MARKER.encode() in content:
-                        return True
+                self._write_all(fd, data)
+                return 'ok'
             except OSError:
-                pass
-            await asyncio.sleep(0.1)
-        return False
+                return 'broken'
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        try:
+            status = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, _write_and_close), 30)
+            # Store writes happen on the event-loop thread (sqlite is single-thread bound).
+            if status == 'broken':
+                self.store.event(agent_id, None, generation, 'bootstrap_write_failed', {'error': 'BrokenPipeError'})
+        except asyncio.TimeoutError:
+            self.store.event(agent_id, None, generation, 'bootstrap_write_timeout', {})
+
     def spawn_task(self,coro):
         t = asyncio.create_task(coro)
         self.background.add(t)
@@ -331,6 +344,58 @@ class Runtime:
         if kind in {'auto_retry_start','auto_retry_end','auto_compaction_start','auto_compaction_end'}:
             self.event(w,kind,e)
 
+    def _child_env(self, sid, spec):
+        """Base environment for the guard/Pi child, built from the scope's bound
+        snapshot — never a copy of the daemon's own environment. Session B gets
+        B's PATH/HOME and credentials, not whoever started the daemon. Model
+        authentication keeps working via HOME-based auth files; env-based auth
+        requires explicitly configured names (inheritance.child_env). Profile
+        env values come from the current config, never from the persisted copy.
+        """
+        snapshot = self.scope_env.get(sid) or {}
+        inh = self.config['inheritance']
+        allowed = set(BASE_KEYS) | {k for k in inh.get('child_env', []) if isinstance(k, str)}
+        env = {k: v for k, v in snapshot.items() if k in allowed and isinstance(v, str)}
+        profile = self.config['profiles'].get(spec.get('profile'), {}) if isinstance(self.config['profiles'], dict) else {}
+        penv = profile.get('env', {}) if isinstance(profile, dict) else {}
+        if isinstance(penv, dict):
+            env.update({k: v for k, v in penv.items() if isinstance(k, str) and isinstance(v, str)})
+        env['PI_AGENTS_MANAGED_CHILD'] = '1'
+        return env
+
+    async def _read_receipt(self, fd, aid, generation, timeout):
+        """Read the bridge's structured receipt straight from the pipe (in-memory
+        stream, not the size-capped stderr.log) and parse it exactly."""
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        transport, _ = await loop.connect_read_pipe(lambda: protocol, os.fdopen(fd, 'rb', buffering=0))
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout)
+        except asyncio.TimeoutError:
+            transport.close()  # owns the fd after connect_read_pipe
+            raise AgentError('bridge_unavailable', 'Managed MCP bridge did not report readiness in time; inspect the agent stderr log')
+        transport.close()
+        if not line:
+            raise AgentError('bridge_unavailable', 'Managed MCP bridge closed without a readiness receipt; inspect the agent stderr log')
+        try:
+            receipt = json.loads(line)
+        except ValueError:
+            raise AgentError('bridge_unavailable', 'Managed MCP bridge receipt was malformed')
+        if not isinstance(receipt, dict) or receipt.get('kind') != 'subagent-pi-bridge-receipt':
+            raise AgentError('bridge_unavailable', 'Managed MCP bridge receipt was malformed')
+        if receipt.get('agent') != aid or receipt.get('generation') != generation:
+            raise AgentError('bridge_unavailable', 'Managed MCP bridge receipt did not match this agent generation')
+        self.store.event(aid, None, generation, 'bridge_receipt', bounded(receipt, 4096))
+        failed_required = [s.get('name') for s in receipt.get('servers', [])
+                           if isinstance(s, dict) and s.get('required') and s.get('status') != 'ready']
+        if failed_required:
+            raise AgentError('inheritance_required_server_failed',
+                             'required MCP server(s) failed to initialize in the child: ' + ', '.join(sorted(map(str, failed_required))))
+        if receipt.get('state') != 'ready':
+            raise AgentError('bridge_unavailable', 'Managed MCP bridge reported failure to start; inspect the agent stderr log')
+        return receipt
+
     async def boot_worker(self, a):
         aid=a['id']
         if len([w for w in self.workers.values() if not w.closed]) >= self.config['max_resident_agents']:
@@ -360,28 +425,38 @@ class Runtime:
         # boot; the persisted launch spec and argv stay untouched.
         plan=self._inheritance_plan(a,spec,generation)
         argv=[*argv,*plan['argv']]
+        # F01: Pi assigns on every --tools occurrence, so the bridge tool must be
+        # merged into the single allowlist over the FULL argv — never appended as
+        # a second flag, which would wipe the reader/writer builtin tools.
+        if plan['bridge']:
+            argv=self._merge_bridge_tool(argv)
         payload={**spec,'argv':argv,'generation':generation}
         atomic_json(directory/'launch.json',payload)
         if plan['diagnostics']:
             self.store.event(aid,None,generation,'inheritance_diagnostics',
                 bounded({'source':plan.get('source'),'servers':plan['servers'],'diagnostics':plan['diagnostics']},4096))
         stderr_path=directory/'stderr.log'
-        stderr_offset=stderr_path.stat().st_size if stderr_path.exists() else 0
-        bootstrap_r=None; bootstrap_w=None
+        bootstrap_r=None; bootstrap_w=None; receipt_r=None; receipt_w=None
         if plan['payload'] is not None:
             body=dumps(plan['payload']).encode()
             if len(body)>BOOTSTRAP_MAX:
                 raise AgentError('bootstrap_too_large','Inherited MCP configuration exceeds the private channel limit')
             bootstrap_r,bootstrap_w=os.pipe()
+            receipt_r,receipt_w=os.pipe()
         handed_off=False
         try:
             self.store.agent_update(aid,state='starting',generation=generation,cleanup='pending')
             guard=Path(__file__).with_name('worker_guard.py')
-            guard_env=dict(os.environ)
+            # Structured child environment: the guard and Pi see the scope's own
+            # base env plus authorized names — not the daemon's full environ.
+            guard_env=self._child_env(a['scope'],spec)
             pass_fds=()
             if bootstrap_r is not None:
                 guard_env['PI_AGENTS_BOOTSTRAP_FD']=str(bootstrap_r)
-                pass_fds=(bootstrap_r,)
+                # The CHILD writes the receipt, so it gets the write end; the
+                # daemon keeps the read end and parses the JSON line itself.
+                guard_env['PI_AGENTS_BRIDGE_RECEIPT_FD']=str(receipt_w)
+                pass_fds=(bootstrap_r,receipt_w)
             proc=await asyncio.create_subprocess_exec(sys.executable,str(guard),str(directory/'launch.json'),
                 stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,limit=MAX_FRAME,cwd=spec['cwd'],env=guard_env,pass_fds=pass_fds)
@@ -390,8 +465,9 @@ class Runtime:
             a=self.store.agent(a['scope'],aid)
             w=Worker(self,a,proc); self.workers[aid]=w; w.start()
             if bootstrap_r is not None:
-                os.close(bootstrap_r)  # daemon keeps only the write end
-                bootstrap_r=None
+                os.close(bootstrap_r)  # daemon keeps only the payload write end
+                os.close(receipt_w)    # child keeps the receipt write end
+                bootstrap_r=None; receipt_w=None
                 handed_off=True
                 self.spawn_task(self._write_bootstrap(bootstrap_w,aid,generation,body))
             try:
@@ -410,11 +486,10 @@ class Runtime:
                     raise AgentError('unexpected_activity','Pi started a model turn without an explicit task')
                 if plan['payload'] is not None:
                     # get_state success does not prove the bridge loaded; require its
-                    # non-secret stderr receipt for the exact configured server count.
-                    expected=f"{BRIDGE_MARKER} servers={len(plan['payload']['mcp']['servers'])}"
-                    ready=await self._wait_bridge_ready(directory,min(self.config['startup_timeout_seconds'],20),stderr_offset,expected)
-                    if not ready:
-                        raise AgentError('bridge_unavailable','Managed MCP bridge did not report ready for the configured server count; inspect the agent stderr log')
+                    # structured receipt for this exact agent generation. Required
+                    # servers must have initialized before any task is sent.
+                    await self._read_receipt(receipt_r,aid,generation,min(self.config['startup_timeout_seconds'],20))
+                    receipt_r=None
                 # Pin the actual model selected by Pi, so a later global default change
                 # does not silently alter a recovered agent's model.
                 resolved_model=state.get('model')
@@ -437,32 +512,41 @@ class Runtime:
                 with contextlib.suppress(OSError): os.close(bootstrap_r)
             if not handed_off and bootstrap_w is not None:
                 with contextlib.suppress(OSError): os.close(bootstrap_w)
+            if receipt_r is not None:
+                with contextlib.suppress(OSError): os.close(receipt_r)
+            if receipt_w is not None:
+                with contextlib.suppress(OSError): os.close(receipt_w)
 
     def _bind_scope_source(self, sid, p, source):
         """Persist non-secret source fields; keep secret env values in memory only."""
         inh=self.config['inheritance']
+        scope=self.store.scope(sid)
+        if not inh.get('enabled',True):
+            # Master switch off: do not touch the binding or demand a source.
+            return
         env = source.get('env') if isinstance(source,dict) else None
         explicit_home = p.get('codex_home')
         if explicit_home is not None:
             explicit_home = str(Path(text(explicit_home,'codex_home',4096)).expanduser().resolve())
             if not Path(explicit_home).is_dir(): raise AgentError('invalid_cwd','codex_home must be an existing directory')
         home,mode = resolve_codex_home({**inh,'codex_home':explicit_home or inh.get('codex_home')},env)
-        scope=self.store.scope(sid)
         stored=scope['codex_home']
         if stored and home and Path(stored)!=Path(home) and explicit_home is None and p.get('inheritance') is None:
             raise AgentError('inheritance_source_conflict',
                 f'Scope is bound to codex source {stored}; rebind explicitly with codex_home or inheritance parameters')
-        enabled=bool(inh.get('enabled',True))
+        # A credential refresh must not silently flip the per-scope switch: keep
+        # the current state unless the client passes inheritance explicitly.
+        enabled=bool(scope['inheritance'])
         if p.get('inheritance') is False: enabled=False
         elif p.get('inheritance') is True: enabled=True
         self.store.execute('UPDATE scopes SET codex_home=?,codex_source=?,inheritance=? WHERE id=?',
             (str(home) if home else None, mode if home else None, 1 if enabled else 0, sid))
         if env is not None:
-            names=set(BASE_KEYS)
+            names=set(BASE_KEYS) | {k for k in inh.get('child_env',[]) if isinstance(k,str)}
             if home is not None:
                 try:
                     servers,_=parse_mcp_servers(home,read_codex_config(home))
-                    names=referenced_env_names(servers)
+                    names |= referenced_env_names(servers)
                 except AgentError:
                     pass
             # Minimal per-scope snapshot: referenced names only; never persisted.
@@ -490,9 +574,10 @@ class Runtime:
                         mcp_diag+=acc_diag
                     except AgentError as exc:
                         mcp_diag.append(Diagnostic('mcp','required',exc.message))
-                        servers=[]
                     entry.update(inherited_skills=[{'path':path,'name':Path(path).name} for path in skills],
-                                 mcp_servers=[{'name':x['name'],'transport':x['transport']} for x in servers],
+                                 mcp_servers=[{'name':x['name'],'transport':x['transport'],
+                                               'disposition':x.get('disposition'),'required':x.get('required',False),
+                                               'reasons':x.get('reasons',[])} for x in servers],
                                  diagnostics=[d.as_dict() for d in skill_diag+mcp_diag])
                 except AgentError as exc:
                     entry['error']=exc.as_dict()
@@ -750,6 +835,10 @@ class Runtime:
                             raise AgentError('writer_conflict','Another managed writer owns an overlapping cwd; close it or use read access',agent_id=other['id'])
                 profile=p.get('profile','reader' if access=='read' else 'default')
                 spec=launch_spec(self.config,profile,p.get('model'),cwd,access)
+                # Persist environment NAMES only; values are re-read from the
+                # operator config at every boot and never enter the ledger, the
+                # launch.json description or events.
+                spec={**spec,'env':{},'env_names':sorted(spec.get('env',{}))}
                 aid=new_id('pi_'); name=text(p.get('name',aid),'name',128)
                 task=text(p.get('task'),'task')
                 if task.lstrip().startswith('/'):

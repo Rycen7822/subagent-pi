@@ -13,7 +13,19 @@ runtime 测试覆盖任务状态机、幂等、read/write 冲突、steering 消�
 
 transport 测试通过真正的 MCP stdio 和 Unix socket，覆盖并发初始化、MCP/CLI 共享账本、取消等待、adapter 退出、daemon 重启和断线幂等。
 
+继承测试覆盖来源解析与错误回退、skill/MCP 转换与 disposition、审批优先级表、递归身份识别（含安装器包装）、诊断可序列化、环境隔离（双 scope 各自取值、daemon-only canary 不可达、控制面无值）、required 失败阻止 spawn 且零 prompt，以及最终 argv 经 Pi 真实 parseArgs 探针验证（单一 `--tools` 合并 codex_mcp）。
+
+bridge 主机测试（tests/test_bridge_host.py + tests/bridge_host.mjs）用 jiti 加载**真实** TypeScript bridge（与 Pi 相同的加载器），对本地假 stdio/HTTP MCP server 驱动 list/describe/call、超时、中途退出、取消、审批拒绝/接受、白名单与递归拒绝；回执（receipt）为结构化 JSON。该层不启动 Pi 进程、不调模型。
+
+TypeScript 类型检查（一次性 `npm install && npm run setup`，仅开发期，固定 typescript 版本，运行时零 npm 依赖）：
+
+```bash
+npm run typecheck
+```
+
 包结构测试只验证当前包内部清单/路径/Skill长度/工具定义，不等同于官方 marketplace 审核，也不替代安装到实际 Codex 的验收。
+
+默认测试集合即使机器装有 Pi 与登录凭据也**不调用模型**：真实 Pi 检查被门控在 `SUBAGENT_PI_LIVE_PI=1`，只 boot worker（不发 prompt）并验证 bridge 回执。
 
 ## 实际 Pi 测试
 

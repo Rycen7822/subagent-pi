@@ -12,12 +12,12 @@ build/
 
 # Archives
 *.zip
+node_modules/
 
 # Local agent / dev tooling
 .pi/
 .claude/
 .codex/
-.codex-plugin/
 .cursor/
 .windsurf/
 .aider*
