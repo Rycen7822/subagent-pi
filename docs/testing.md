@@ -19,7 +19,13 @@ bridge 主机测试（tests/test_bridge_host.py + tests/bridge_host.mjs）用 ji
 
 环境绑定链测试（test_inheritance.EnvironmentBindingChain）经真实 CLI 子进程 → daemon → guard → fake-Pi 执行：自定义 PATH 中的无害解释器实际运行（rc=0 证明环境绑定）、授权 child_env 名单送达、daemon-only canary 不可达、总开关关闭时 config.toml 为 FIFO（任何读取都会阻塞）仍正常启动、秘密值不落控制面。
 
-上述五项核心回归均做过红-绿验证：对 d7ff1e9（未修复实现）运行会失败，对修复后代码通过。
+上述核心回归均做过红-绿验证：对未修复实现运行会失败，对修复后代码通过。
+
+协议一致性夹具（0.2.4）：`fake_mcp_http.py` 提供 strict modern 2026-07-28 模式（缺
+`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name`/modern `_meta` 即 400 拒绝）、legacy-only
+discovery 模式（`server/discover` → 404 证明可回退）与 legacy session 过期模式
+（第 N 个 session 请求后 404）；EVENTS 证据记录每个请求实际收到的协议头与 `_meta`，
+测试据此断言 bridge 发送的头/体与服务器端 call 次数。
 
 回执 FD 所有权测试（test_runtime.ReceiptFdOwnership）在真实启动失败路径中，用 socketpair 在 `terminate` 清理窗口内抢占已释放的回执 FD 编号，断言失败路径不触碰新连接（修复前该 socket 被 `finally` 误关、写端 EBADF）；并覆盖超时/取消/transport 创建失败三条路径的“恰好关闭一次”。
 

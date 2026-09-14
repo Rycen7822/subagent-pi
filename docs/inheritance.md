@@ -1,4 +1,4 @@
-# Codex Inheritance for Managed Children (0.2.2)
+# Codex Inheritance for Managed Children (0.2.4)
 
 Managed subagents started by this plugin can use your Codex-side global skills
 and MCP servers. Normal `pi` sessions are never affected: inheritance is added
@@ -106,6 +106,63 @@ excluded by its execution definition (renaming the server in the config does
 not bypass this; renaming the binary itself is out of scope).
 
 ## The private channel and the child extension
+
+## MCP protocol compatibility (0.2.4)
+
+The HTTP transport supports two protocol eras, selected ONCE per deployment via
+`[inheritance] mcp_protocol_mode = "auto" | "legacy_2025_06_18" |
+"modern_2026_07_28"` (default `auto`) — never per call by the model. stdio
+servers stay on legacy: modern requires the upstream `CODEX_MCP_PROTOCOL_VERSION`
+env opt-in, which managed children never forward, so a modern-only stdio server
+fails loudly instead of silently misbehaving.
+
+Legacy 2025-06-18: `initialize` NEGOTIATES the protocol version (the server's
+returned version is used on every later request via the `MCP-Protocol-Version`
+header) and carries `Mcp-Session-Id`. A 404 on a session-scoped request marks
+the connection stale: the sent request is NEVER replayed, a sent `tools/call`
+reports "outcome is unknown", and the next explicit operation re-initializes a
+fresh session. Closing the worker sends a best-effort session DELETE; an
+unconfirmed DELETE is a documented boundary.
+
+Modern 2026-07-28: stateless — no handshake and no session id. Every request
+self-describes through `_meta` (`io.modelcontextprotocol/protocolVersion`,
+`clientInfo`, `clientCapabilities`) plus the `MCP-Protocol-Version` and
+`Mcp-Method` headers (`Mcp-Name` on `tools/call`). `auto` probes once with the
+side-effect-free `server/discover` and falls back to the legacy handshake ONLY
+on proof of legacy-only (HTTP 404/405 or JSON-RPC -32601 on that probe); a
+generic 4xx/5xx is an error, never a downgrade trigger. `x-mcp-header`
+argument mirroring is unsupported: such calls are refused before sending, so
+model-controlled values can never become HTTP headers.
+
+## Codex MCP config compatibility (0.2.4)
+
+`subagent_pi/inheritance.py` keeps ONE declarative table
+(`MCP_FIELD_COMPAT`) classifying every current Codex `RawMcpServerConfig`
+field; the doctor reports the supported surface as `baseline` instead of a
+frozen upstream version string.
+
+- mapped: transport fields (`command/args/env/env_vars/cwd`,
+  `url/auth/bearer_token_env_var/http_headers/env_http_headers`),
+  `startup_timeout_sec`/`startup_timeout_ms` (ms wins, full precision kept),
+  `tool_timeout_sec`, `enabled`, `required`, `enabled_tools`,
+  `disabled_tools`, `default_tools_approval_mode`, `tools.<n>.approval_mode`.
+- accepted_no_effect: `supports_parallel_tool_calls` (the proxy tool executes
+  calls sequentially — do not advertise parallel safety) and the legacy
+  per-server `name` label; recorded as diagnostics, never fatal.
+- explicitly_unsupported: `http_headers_helper`, `experimental_environment`
+  (remote executor), `omit_tools_from` (ToolExposureSurface cannot be mapped
+  without guessing), `scopes`/`oauth`/`oauth_resource` (no token or credential
+  store is ever created or copied). required servers fail the boot; optional
+  ones are excluded with named diagnostics.
+- conditional_local: `environment_id` — absent or `local` works; anything else
+  is unsupported (no remote executor in children).
+- unknown_fail_closed: any field not in the table disables that server, so a
+  future upstream field fails the compatibility matrix test loudly instead of
+  being accepted or dropped silently.
+
+Tool-level `output_token_limit` is mapped, not denied: the bridge enforces it
+at the proxy result serialization boundary as a tighten-only byte budget
+(conservative 4 bytes/token), capped at the global result limit.
 
 ## Tool discovery (unknown tool names)
 

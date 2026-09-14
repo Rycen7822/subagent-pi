@@ -11,6 +11,14 @@ New features need regression coverage at their real boundary (RPC, subprocess, I
 Use the offline fake Pi for routine tests. Live model calls require explicit operator consent.
 Document limitations rather than silently weakening safety checks.
 
+# Edit reliability
+
+- Never transcribe oldText from memory. Read the exact current region first, especially if your own earlier edit just touched it.
+- One batch, one region: never split adjacent or overlapping regions into multiple edits[] entries — the whole batch is rejected all-or-nothing. Merge nearby changes into a single edit.
+- Every edits[] entry matches against the ORIGINAL file. Never anchor a later entry on an earlier entry's newText; drop redundant follow-ups.
+- For blocks longer than ~15 lines, or after two exact-match failures on the same spot, switch to a Python line-range replacement or rewrite the whole file.
+- Before deleting a suspected duplicate or editing a region you recently created, re-read it: earlier edits may have left ambiguous copies.
+
 # Working conventions (.work/)
 
 All temporary files, scratch documents, and intermediate artifacts go under `.work/` subdirectories (e.g. `.work/tmp/`, `.work/docs/`), never in the repo root.

@@ -6,6 +6,19 @@ tools/call was RECEIVED and headers were FLUSHED before asserting deadline,
 cancel or close behavior on the body phase. `hang_body_json` and
 `hang_body_sse` deliberately keep the connection open after the headers, which
 is exactly the phase the bridge's exchange lifecycle must terminate.
+
+Modes (FAKE_MCP_HTTP_MODE):
+  normal|headers_then_hang|slow_json|bad_status|hang_body_json|hang_body_sse  legacy 2025-06-18
+  modern          strict 2026-07-28: rejects requests missing MCP-Protocol-Version,
+                  Mcp-Method, (tools/call) Mcp-Name, or modern params._meta
+  modern_hang_json modern + hang_body_json behavior
+  legacy_only     strict modern violation on server/discover (HTTP 404), proving the
+                  endpoint is legacy-only so an auto client may fall back
+
+FAKE_MCP_SESSION_EXPIRE_AFTER=N: legacy mode; the N-th request that carries a
+session id gets HTTP 404 (expired session), later re-initialized sessions work.
+FAKE_MCP_REQUIRE_LEGACY_HEADER=1: legacy mode; requests after initialize must
+carry mcp-protocol-version: 2025-06-18 or get HTTP 400.
 """
 from __future__ import annotations
 import json
@@ -15,9 +28,12 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODE = os.environ.get('FAKE_MCP_HTTP_MODE', 'normal')
-# normal|headers_then_hang|slow_json|bad_status|hang_body_json|hang_body_sse
 EVENTS = os.environ.get('FAKE_MCP_HTTP_EVENTS')
 CALL_LOG = os.environ.get('FAKE_MCP_HTTP_CALL_LOG')
+EXPIRE_AFTER = int(os.environ.get('FAKE_MCP_SESSION_EXPIRE_AFTER', '0'))
+REQUIRE_LEGACY_HEADER = os.environ.get('FAKE_MCP_REQUIRE_LEGACY_HEADER') == '1'
+MODERN_VERSION = '2026-07-28'
+MODERN_META_KEY = 'io.modelcontextprotocol/protocolVersion'
 
 def event(kind, **kw):
     if EVENTS:
@@ -39,15 +55,19 @@ TOOLS = [
      "annotations": {"readOnlyHint": False}},
 ]
 
+STATE = {'session_counter': 0, 'expire_counter': 0}
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     def log_message(self, *a): pass
 
-    def _flush_headers(self, ctype, length=None, session=True):
-        self.send_response(200)
+    def _flush_headers(self, ctype, length=None, session=True, status=200, extra=None):
+        self.send_response(status)
         self.send_header('content-type', ctype)
-        if session:
-            self.send_header('mcp-session-id', 'sess-123')
+        if session and status == 200 and not MODE.startswith('modern') and MODE != 'legacy_only':
+            self.send_header('mcp-session-id', f"sess-{STATE['session_counter']}")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         if length is not None:
             self.send_header('content-length', str(length))
         self.end_headers()
@@ -55,6 +75,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except OSError:
             pass
+
+    def do_DELETE(self):
+        event('session-delete', session=self.headers.get('mcp-session-id'))
+        self.send_response(200); self.send_header('content-length', '0'); self.end_headers()
 
     def do_POST(self):
         length = int(self.headers.get('content-length', 0))
@@ -64,13 +88,38 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_response(400); self.send_header('content-length', '0'); self.end_headers(); return
         rid, method = req.get('id'), req.get('method')
+        params = req.get('params') or {}
+        proto_header = self.headers.get('mcp-protocol-version')
+        event('request', method=method, protocol_header=proto_header,
+              mcp_method_header=self.headers.get('mcp-method'),
+              mcp_name_header=self.headers.get('mcp-name'),
+              session=self.headers.get('mcp-session-id'),
+              has_modern_meta=(MODERN_META_KEY in (params.get('_meta') or {})))
         if MODE == 'bad_status':
             self.send_response(503); self.send_header('content-length', '0'); self.end_headers(); return
 
-        def reply(payload, sse=False):
+        modern = MODE.startswith('modern')
+        if MODE == 'legacy_only' and method == 'server/discover':
+            self.send_response(404); self.send_header('content-length', '0'); self.end_headers()
+            event('discover-404-legacy-only')
+            return
+        if modern:
+            what = None
+            if proto_header != MODERN_VERSION: what = 'MCP-Protocol-Version'
+            elif self.headers.get('mcp-method') != method: what = 'Mcp-Method'
+            elif method == 'tools/call' and self.headers.get('mcp-name') != params.get('name'): what = 'Mcp-Name'
+            elif params.get('_meta', {}).get(MODERN_META_KEY) != MODERN_VERSION: what = 'modern _meta protocolVersion'
+            if what:
+                event('strict-rejected', what=what)
+                err = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": -32600, "message": f"strict modern violation: missing {what}"}}).encode()
+                self._flush_headers('application/json', len(err), session=False, status=400)
+                self.wfile.write(err)
+                return
+
+        def reply(payload, sse=False, session=True):
             encoded = json.dumps(payload).encode()
             data = (b'data: ' + encoded + b'\n\n') if sse else encoded
-            self._flush_headers('text/event-stream' if sse else 'application/json', len(data))
+            self._flush_headers('text/event-stream' if sse else 'application/json', len(data), session=session)
             self.wfile.write(data)
             try:
                 self.wfile.flush()
@@ -78,33 +127,36 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
         if method == 'initialize':
-            event('initialize-received')
+            if REQUIRE_LEGACY_HEADER and proto_header and proto_header != '2025-06-18':
+                self.send_response(400); self.send_header('content-length', '0'); self.end_headers(); return
+            STATE['session_counter'] += 1
+            STATE['expire_counter'] = 0
+            event('initialize-received', session=f"sess-{STATE['session_counter']}")
             reply({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-06-18",
                    "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-http", "version": "1.0"}}})
+        elif method == 'server/discover':
+            reply({"jsonrpc": "2.0", "id": rid, "result": {
+                "serverInfo": {"name": "fake-http", "version": "1.0"},
+                "capabilities": {"tools": {"listChanged": False}}}}, session=False)
         elif method == 'tools/list':
+            if self._expired(): return
             reply({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}, sse=True)
         elif method == 'tools/call':
-            name = (req.get('params') or {}).get('name')
-            args = (req.get('params') or {}).get('arguments') or {}
+            name = params.get('name')
+            args = params.get('arguments') or {}
+            if self._expired(): return
             log_call(f"{name}:{json.dumps(args, sort_keys=True)}")
             event('call-received', tool=name)
-            if MODE == 'headers_then_hang':
-                # Legacy mode kept for older tests: headers go out, no body ever.
-                self._flush_headers('application/json', 999999)
-                event('headers-sent')
-                time.sleep(30)
-                return
-            if MODE == 'slow_json':
-                time.sleep(5)
-                reply({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "late"}]}})
-                return
             result = {"jsonrpc": "2.0", "id": rid,
                       "result": {"content": [{"type": "text", "text": f"handled {name} {args.get('body') or args.get('query') or ''}"}]}}
-            if MODE == 'hang_body_json':
+            if MODE in ('headers_then_hang', 'hang_body_json', 'modern_hang_json'):
                 encoded = json.dumps(result).encode()
-                self._flush_headers('application/json', len(encoded))
+                if MODE == 'headers_then_hang':
+                    self._flush_headers('application/json', 999999)  # promised length never arrives
+                else:
+                    self._flush_headers('application/json', len(encoded))
+                    self.wfile.write(encoded[:len(encoded) // 2])  # one fragment, then hold the rest forever
                 event('headers-sent')
-                self.wfile.write(encoded[:len(encoded) // 2])  # one fragment, then hold the rest forever
                 try:
                     self.wfile.flush()
                 except OSError:
@@ -123,11 +175,33 @@ class Handler(BaseHTTPRequestHandler):
                 event('body-fragment-sent')
                 time.sleep(30)
                 return
+            if MODE == 'slow_json':
+                time.sleep(5)
+                reply({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "late"}]}})
+                return
             reply(result)
+        elif method == 'tools/unsupported_legacy':
+            reply({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "not implemented"}})
         elif rid is not None:
             reply({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "not implemented"}})
         else:
+            event('notification-received', method=method)
             self.send_response(202); self.send_header('content-length', '0'); self.end_headers()
+
+    def _expired(self):
+        """Kill the FIRST session after EXPIRE_AFTER session-scoped requests (404);
+        sessions created later work normally, so a client that re-initializes on
+        404 can keep making progress."""
+        sid = self.headers.get('mcp-session-id')
+        if not sid or not EXPIRE_AFTER:
+            return False
+        if sid == f"sess-{STATE['session_counter']}":
+            STATE['expire_counter'] += 1
+            if STATE['session_counter'] == 1 and STATE['expire_counter'] >= EXPIRE_AFTER:
+                event('session-404', session=sid)
+                self.send_response(404); self.send_header('content-length', '0'); self.end_headers()
+                return True
+        return False
 
 if __name__ == '__main__':
     server = ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), Handler)

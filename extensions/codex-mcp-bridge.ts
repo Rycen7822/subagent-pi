@@ -30,6 +30,8 @@ interface ServerCfg {
   startup_timeout_sec: number;
   tool_timeout_sec: number;
   required: boolean;
+  protocol_mode?: "auto" | "legacy_2025_06_18" | "modern_2026_07_28";
+  tool_output_limits?: Record<string, number>;
   allowed_tools: string[] | null;
   disabled_tools: string[];
   approval_default: "auto" | "confirm";
@@ -146,6 +148,8 @@ abstract class McpConnection {
     this.catalogEpoch += 1;
   }
   abstract get dead(): boolean;
+  /** False when the next explicit operation must build a fresh connection (closed, or legacy session expired). */
+  get reusable(): boolean { return !this.dead; }
   abstract request(method: string, params: unknown, timeoutSec: number, opts?: { notification?: boolean; signal?: AbortSignal }): Promise<unknown>;
   abstract initialize(): Promise<void>;
   abstract callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal): Promise<unknown>;
@@ -356,10 +360,13 @@ class StdioConnection extends McpConnection {
   }
 
   async initialize(): Promise<void> {
+    // Managed children never forward the CODEX_MCP_PROTOCOL_VERSION env opt-in, so
+    // stdio stays on the legacy handshake; a modern-only stdio server must fail loudly.
+    if (this.cfg.protocol_mode === "modern_2026_07_28") throw new Error("modern 2026-07-28 requires streamable HTTP; managed stdio servers stay on legacy 2025-06-18");
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
-      clientInfo: { name: "subagent-pi-bridge", version: "0.2.3" },
+      clientInfo: CLIENT_INFO,
     }, this.cfg.startup_timeout_sec);
     await this.request("notifications/initialized", {}, this.cfg.startup_timeout_sec, { notification: true });
   }
@@ -382,6 +389,18 @@ class StdioConnection extends McpConnection {
 
 /** Distinguishes why an in-flight HTTP exchange was aborted. */
 const ABORT_DEADLINE = Symbol("deadline");
+
+// MCP protocol eras. Legacy (2025-06-18): initialize handshake + Mcp-Session-Id.
+// Modern (2026-07-28): stateless — no handshake, every request self-describes via
+// _meta and the MCP-Protocol-Version / Mcp-Method / Mcp-Name headers.
+const MODERN_VERSION = "2026-07-28";
+const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.4" };
+const MODERN_META = {
+  "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
+  "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
+  "io.modelcontextprotocol/clientCapabilities": {},
+};
+class StaleSessionError extends Error { constructor(m: string) { super(m); this.name = "StaleSessionError"; } }
 const ABORT_USER = Symbol("user");
 const ABORT_CLOSED = Symbol("closed");
 
@@ -390,19 +409,38 @@ class HttpConnection extends McpConnection {
   private nextId = 1;
   private closed = false;
   private active = new Set<AbortController>();  // every in-flight exchange, so close() can end them all
+  private mode: "undecided" | "legacy" | "modern" = "undecided";
+  private stale = false;  // legacy session expired (HTTP 404); re-initialize on the next explicit operation
+  private negotiatedVersion: string | null = null;
 
   constructor(private cfg: ServerCfg) { super(); }
 
   get dead(): boolean { return this.closed; }
+  get reusable(): boolean { return !this.closed && !this.stale; }
 
-  private headers(): Record<string, string> {
+  private withMeta(params: unknown): unknown {
+    const base = (typeof params === "object" && params !== null ? params : {}) as Record<string, unknown>;
+    return { ...base, _meta: { ...((base._meta ?? {}) as Record<string, unknown>), ...MODERN_META } };
+  }
+
+  private headers(method?: string, toolName?: string, httpMethod = "POST"): Record<string, string> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       ...(this.cfg.headers ?? {}),
     };
     if (this.cfg.bearer_token) headers.authorization = `Bearer ${this.cfg.bearer_token}`;
-    if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
+    if (httpMethod === "DELETE") return headers;
+    if (this.mode !== "legacy") {
+      // 2026-07-28 (and the auto probe): every request is self-describing; the
+      // headers let gateways route and authorize without parsing JSON bodies.
+      headers["mcp-protocol-version"] = MODERN_VERSION;
+      if (method) headers["mcp-method"] = method;
+      if (method === "tools/call" && toolName) headers["mcp-name"] = toolName;
+    } else {
+      if (this.negotiatedVersion) headers["mcp-protocol-version"] = this.negotiatedVersion;  // negotiated at initialize
+      if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
+    }
     return headers;
   }
 
@@ -462,13 +500,15 @@ class HttpConnection extends McpConnection {
   }
 
   async request(method: string, params: unknown, timeoutSec: number,
-                opts: { notification?: boolean; signal?: AbortSignal } = {}): Promise<unknown> {
+                opts: { notification?: boolean; signal?: AbortSignal; toolName?: string } = {}): Promise<unknown> {
     // One exchange, one AbortController: the deadline, caller cancellation and
     // connection close all cover send/headers/body/parse until settlement, so a
     // hung body still hits the deadline. No exchange is ever retried here.
     if (this.closed) throw new Error(`connection ${this.cfg.name} is closed`);
     if (opts.signal?.aborted) throw new CancelledError(false);
     const id = opts.notification ? null : this.nextId++;
+    const sent = id !== null;
+    const wireParams = this.mode === "legacy" ? params : this.withMeta(params);
     const controller = new AbortController();
     this.active.add(controller);
     const timer = setTimeout(() => controller.abort(ABORT_DEADLINE), timeoutSec * 1000);
@@ -478,16 +518,27 @@ class HttpConnection extends McpConnection {
       opts.signal.addEventListener("abort", onOuterAbort, { once: true });
     }
     try {
-      const body = id === null ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", id, method, params };
+      const body = id === null ? { jsonrpc: "2.0", method, params: wireParams } : { jsonrpc: "2.0", id, method, params: wireParams };
       const response = await fetch(this.cfg.url as string, {
         method: "POST",
-        headers: this.headers(),
+        headers: this.headers(method, opts.toolName),
         body: JSON.stringify(body),
         signal: controller.signal,
       });
-      const session = response.headers.get("mcp-session-id");
-      if (session) this.sessionId = session;
-      if (!response.ok) throw new Error(`HTTP ${response.status} from ${redactUrl(this.cfg.url ?? "")}`);
+      if (!response.ok) {
+        // 2025-06-18 session lifecycle: a 404 on a session-scoped request means
+        // the session expired; the client must re-initialize. The sent request
+        // is never replayed automatically — its outcome stays unknown.
+        if (response.status === 404 && this.mode === "legacy" && this.sessionId && method !== "initialize") {
+          this.stale = true;
+          throw new StaleSessionError(`MCP session expired (HTTP 404)${sent ? "; the sent request's outcome is unknown" : ""}; the next explicit operation re-initializes`);
+        }
+        throw new Error(`HTTP ${response.status} from ${redactUrl(this.cfg.url ?? "")}`);
+      }
+      if (this.mode === "legacy") {
+        const session = response.headers.get("mcp-session-id");
+        if (session) this.sessionId = session;
+      }
       if (id === null) return null; // notification accepted; nothing to wait for
       const contentType = response.headers.get("content-type") ?? "";
       if (contentType.includes("text/event-stream")) return await this.parseSse(response, id);
@@ -496,7 +547,6 @@ class HttpConnection extends McpConnection {
       return msg.result;
     } catch (err) {
       // classify by WHO aborted; sent requests keep an outcome-unknown wording
-      const sent = id !== null;
       if (opts.signal?.aborted) {
         if (err instanceof CancelledError) throw err;
         throw new CancelledError(sent);
@@ -513,16 +563,49 @@ class HttpConnection extends McpConnection {
   }
 
   async initialize(): Promise<void> {
-    await this.request("initialize", {
+    const requested = this.cfg.protocol_mode ?? "auto";
+    if (this.cfg.transport === "stdio" || requested === "legacy_2025_06_18") {
+      this.mode = "legacy";
+    } else if (requested === "modern_2026_07_28") {
+      this.mode = "modern";
+    } else {
+      // auto: one modern discovery probe; fall back to legacy only on PROOF the
+      // endpoint is legacy-only (HTTP 404/405 or JSON-RPC "method not found" on
+      // server/discover — both side-effect free). A generic 4xx/5xx is an error,
+      // never a downgrade trigger, and a sent tools/call is never replayed.
+      this.mode = (await this.probeModern()) ? "modern" : "legacy";
+    }
+    if (this.mode === "modern") {
+      await this.request("tools/list", {}, this.cfg.startup_timeout_sec);  // readiness probe warms the catalog
+    } else {
+      await this.legacyInitialize();
+    }
+  }
+
+  private async legacyInitialize(): Promise<void> {
+    const result = await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
-      clientInfo: { name: "subagent-pi-bridge", version: "0.2.3" },
-    }, this.cfg.startup_timeout_sec);
+      clientInfo: CLIENT_INFO,
+    }, this.cfg.startup_timeout_sec) as { protocolVersion?: unknown } | undefined;
+    // Negotiate: honor the server's returned version for all later requests.
+    this.negotiatedVersion = typeof result?.protocolVersion === "string" && result.protocolVersion ? result.protocolVersion : "2025-06-18";
     await this.request("notifications/initialized", {}, this.cfg.startup_timeout_sec, { notification: true });
   }
 
+  private async probeModern(): Promise<boolean> {
+    try {
+      await this.request("server/discover", {}, this.cfg.startup_timeout_sec);
+      return true;
+    } catch (err) {
+      const m = (err as Error).message;
+      if (m.startsWith("HTTP 404 ") || m.startsWith("HTTP 405 ") || m.includes("server error -32601")) return false;
+      throw err;
+    }
+  }
+
   async callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal): Promise<unknown> {
-    return await this.request("tools/call", { name, arguments: args ?? {} }, timeoutSec, { signal });
+    return await this.request("tools/call", { name, arguments: args ?? {} }, timeoutSec, { signal, toolName: name });
   }
 
   close(): void {
@@ -530,6 +613,17 @@ class HttpConnection extends McpConnection {
     this.closed = true;
     for (const controller of this.active) controller.abort(ABORT_CLOSED);
     this.active.clear();
+    // Best-effort session termination per the 2025-06-18 spec (DELETE the session).
+    // Fire-and-forget: the worker may be exiting, so an unconfirmed DELETE is a
+    // documented boundary, never a retry path.
+    if (this.mode === "legacy" && this.sessionId) {
+      try {
+        void fetch(this.cfg.url as string, {
+          method: "DELETE", headers: this.headers(undefined, undefined, "DELETE"),
+          signal: AbortSignal.timeout(2000),
+        }).then(r => { void r.body?.cancel(); }).catch(() => { });
+      } catch { /* ignore */ }
+    }
     this.sessionId = null;
   }
 }
@@ -567,7 +661,7 @@ export default async function (pi: ExtensionAPI) {
 
   async function ensureConnection(cfg: ServerCfg, signal?: AbortSignal): Promise<McpConnection> {
     const existing = connections.get(cfg.name);
-    if (existing && !existing.dead) return existing;
+    if (existing && existing.reusable) return existing;
     if (existing) {
       existing.close();
       connections.delete(cfg.name);
@@ -699,9 +793,21 @@ export default async function (pi: ExtensionAPI) {
       }
     }
     if (signal?.aborted) throw new CancelledError(false);
+    if (params.args && typeof params.args === "object" && "x-mcp-header" in (params.args as Record<string, unknown>)) {
+      // Header mirroring from tool arguments would turn model-controlled values into
+      // HTTP headers; unsupported here, so such calls are refused, never sent.
+      throw new Error("x-mcp-header mirroring is not supported by this bridge; the tool cannot be called");
+    }
     try {
       const result = await conn.callTool(toolName, params.args ?? {}, cfg.tool_timeout_sec, signal) as { isError?: boolean } | undefined;
-      const text = describeResult(result);
+      let text = describeResult(result);
+      // output_token_limit: enforced here at the serialization boundary with a
+      // conservative 4 bytes/token budget; it can only TIGHTEN the default cap.
+      const budget = cfg.tool_output_limits?.[toolName];
+      if (budget && budget > 0) {
+        const bytes = Buffer.from(text, "utf8");
+        if (bytes.length > budget) text = bytes.subarray(0, budget).toString("utf8") + "\n[output truncated to the configured output_token_limit budget]";
+      }
       if (result?.isError) throw new Error(`MCP tool reported failure: ${text.slice(0, 1000)}`);  // Pi sets isError on throw
       return { content: [{ type: "text", text }], details: { server: serverName, tool: toolName } };
     } catch (err) {

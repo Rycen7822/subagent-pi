@@ -14,7 +14,7 @@ from .common import (TERMINAL, MAX_FRAME, AgentError, atomic_json, bounded,
     crop, dumps, group_members, identifier, integer, live_identity, new_id, now,
     private_dir, process_identity, read_frame, text)
 from .config import load_config, launch_spec
-from .inheritance import (Diagnostic, collect_skills, parse_mcp_servers, policy_filter,
+from .inheritance import (CODEX_MCP_BASELINE, Diagnostic, collect_skills, parse_mcp_servers, policy_filter,
     read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from .store import Store
 
@@ -162,7 +162,7 @@ class Runtime:
             skill_paths, skill_diag = collect_skills(codex_home, raw, a['cwd'], existing_skills)
         servers, mcp_diag = [], []
         if inh.get('mcp', True):
-            servers, mcp_diag = parse_mcp_servers(codex_home, raw)
+            servers, mcp_diag = parse_mcp_servers(codex_home, raw, inh.get('mcp_protocol_mode', 'auto'))
             servers, env_diag = resolve_environment(servers, source_env or {})
             mcp_diag += env_diag
             servers, access_diag = policy_filter(servers, spec['access'])
@@ -552,7 +552,8 @@ class Runtime:
 
     def inheritance_doctor(self):
         inh=self.config['inheritance']
-        report={'config':{k:inh.get(k) for k in ('enabled','skills','mcp','codex_home')},'scopes':[],
+        report={'baseline':CODEX_MCP_BASELINE,
+                'config':{k:inh.get(k) for k in ('enabled','skills','mcp','codex_home','mcp_protocol_mode')},'scopes':[],
                 'note':'Environment variable and header values are never shown; only names and sources.'}
         for s in self.store.all('SELECT * FROM scopes ORDER BY created DESC LIMIT 100'):
             entry={'scope':s['id'],'label':s['label'],'cwd':s['cwd'],

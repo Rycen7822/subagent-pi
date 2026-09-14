@@ -10,7 +10,7 @@ DEFAULT = {
     'rpc_timeout_seconds': 20, 'startup_timeout_seconds': 30,
     'default_run_timeout_seconds': 1800, 'max_wait_seconds': 600,
     'event_max_count_per_agent': 20000,
-    'inheritance': {'enabled': True, 'skills': True, 'mcp': True, 'codex_home': None, 'child_env': []},
+    'inheritance': {'enabled': True, 'skills': True, 'mcp': True, 'codex_home': None, 'child_env': [], 'mcp_protocol_mode': 'auto'},
     'profiles': {
         'default': {'extensions': [], 'skills': [], 'ambient_extensions': False,
                     'ambient_skills': False, 'tools': ['read','bash','edit','write','grep','find','ls']},
@@ -38,6 +38,8 @@ def load_config(home: Path):
                 merged = dict(result['inheritance']); merged.update(value)
                 for flag in ('enabled','skills','mcp'):
                     if not isinstance(merged[flag],bool): raise AgentError('invalid_config',f'inheritance.{flag} must be a TOML boolean')
+                if merged['mcp_protocol_mode'] not in ('auto','legacy_2025_06_18','modern_2026_07_28'):
+                    raise AgentError('invalid_config','inheritance.mcp_protocol_mode must be auto, legacy_2025_06_18 or modern_2026_07_28')
                 child_env = merged.get('child_env',[])
                 if not isinstance(child_env,list) or any(not isinstance(x,str) or not x.strip() for x in child_env):
                     raise AgentError('invalid_config','inheritance.child_env must be a list of environment variable names')

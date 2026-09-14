@@ -16,7 +16,7 @@ import unittest
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.common import AgentError, dumps
-from subagent_pi.inheritance import (capture_scope_env, collect_skills, parse_mcp_servers,
+from subagent_pi.inheritance import (CODEX_MCP_BASELINE, capture_scope_env, collect_skills, parse_mcp_servers,
     policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from subagent_pi.runtime import Runtime
 from subagent_pi.store import Store
@@ -260,14 +260,14 @@ experimental_environment = "remote"
         # F06: per-tool override wins over server default; writes/unknown degrade to confirm.
         def policy(cfg):
             servers,_=self.parse(cfg)
-            return servers[0]['approval_default'],servers[0]['tool_approval'],servers[0]['disabled_tools']
+            return servers[0]['approval_default'],servers[0]['tool_approval'],servers[0]['disabled_tools'],servers[0].get('tool_output_limits')
         cfg='''[mcp_servers.example]
 command = "x"
 default_tools_approval_mode = "auto"
 [mcp_servers.example.tools.delete_file]
 approval_mode = "prompt"
 '''
-        default,tools,denied=policy(cfg)
+        default,tools,denied,budgets=policy(cfg)
         self.assertEqual(default,'auto')
         self.assertEqual(tools,{'delete_file':'confirm'})
         cfg2='''[mcp_servers.example2]
@@ -276,7 +276,7 @@ default_tools_approval_mode = "prompt"
 [mcp_servers.example2.tools.safe_thing]
 approval_mode = "auto"
 '''
-        default,tools,denied=policy(cfg2)
+        default,tools,denied,budgets=policy(cfg2)
         self.assertEqual(default,'confirm')
         self.assertEqual(tools,{'safe_thing':'auto'})
         cfg3='''[mcp_servers.example3]
@@ -286,8 +286,10 @@ output_token_limit = 100
 [mcp_servers.example3.tools.weird]
 approval_mode = "banana"
 '''
-        default,tools,denied=policy(cfg3)
-        self.assertIn('limited',denied); self.assertIn('weird',denied)
+        default,tools,denied,budgets=policy(cfg3)
+        self.assertNotIn('limited',denied)  # output_token_limit is now mapped, not denied
+        self.assertEqual(budgets.get('limited'),400)  # 100 tokens -> conservative 4 bytes/token
+        self.assertIn('weird',denied)
         self.assertEqual(tools,{})
     def test_resolve_environment_from_snapshot_only(self):
         servers,_=self.parse(STDIO_TOML)
@@ -894,3 +896,69 @@ class EnvironmentBindingChain(unittest.TestCase):
 
 if __name__=='__main__':
     unittest.main()
+
+
+class CodexConfigCompatTests(McpParsing):
+    """P1-B: every current Codex RawMcpServerConfig field lands in exactly one
+    compatibility class; unknown fields still fail closed."""
+    def test_field_classification_matrix(self):
+        cfg='''[mcp_servers.s]
+command = "x"
+startup_timeout_sec = 7
+startup_timeout_ms = 2500
+tool_timeout_sec = 33
+supports_parallel_tool_calls = true
+name = "legacy-label"
+environment_id = "local"
+[mcp_servers.s.tools.t]
+approval_mode = "auto"
+output_token_limit = 50
+'''
+        servers,diag=self.parse(cfg)
+        self.assertEqual(servers[0]['disposition'],'ok')
+        self.assertEqual(servers[0]['startup_timeout_sec'],2.5)  # ms wins; precision preserved
+        reasons=[d.reason for d in diag]
+        self.assertTrue(any('startup_timeout_ms takes precedence' in r for r in reasons))
+        self.assertTrue(any('supports_parallel_tool_calls' in r for r in reasons))
+        self.assertTrue(any('legacy name label' in r for r in reasons))
+        self.assertEqual(servers[0]['tool_output_limits'].get('t'),200)  # 50 tokens * 4 bytes, tighten-only
+        self.assertEqual(servers[0]['protocol_mode'],'legacy_2025_06_18')  # stdio stays legacy
+
+    def test_unsupported_fields_required_vs_optional(self):
+        for field,value in [('oauth','true'),('scopes',"['a']"),('oauth_resource','"https://x"'),
+                            ('omit_tools_from',"['model']"),('http_headers_helper','"cmd"'),
+                            ('experimental_environment','"remote"')]:
+            for required in ('true','false'):
+                cfg=f'''[mcp_servers.s]
+command = "x"
+required = {required}
+{field} = {value}
+'''
+                servers,diag=self.parse(cfg)
+                self.assertEqual(servers[0]['disposition'],'failed',f'{field} required={required}')
+                self.assertTrue(any(field in d.reason for d in diag),field)
+
+    def test_environment_id_local_ok_remote_failed(self):
+        ok,_=self.parse('[mcp_servers.s]\ncommand = "x"\nenvironment_id = "local"\n')
+        self.assertEqual(ok[0]['disposition'],'ok')
+        remote,diag=self.parse('[mcp_servers.s]\ncommand = "x"\nenvironment_id = "exec-7"\n')
+        self.assertEqual(remote[0]['disposition'],'failed')
+        self.assertTrue(any('environment_id' in d.reason for d in diag))
+
+    def test_unknown_field_still_fails_closed(self):
+        servers,diag=self.parse('[mcp_servers.s]\ncommand = "x"\nsome_new_future_field = "v"\n')
+        self.assertEqual(servers[0]['disposition'],'failed')
+        self.assertTrue(any('some_new_future_field' in d.reason for d in diag))
+
+    def test_http_protocol_mode_passthrough_and_fallback_default(self):
+        http='[mcp_servers.s]\nurl = "http://x/mcp"\n'
+        servers,_=parse_mcp_servers(self.home,__import__('tomllib').loads(http),'modern_2026_07_28')
+        self.assertEqual(servers[0]['protocol_mode'],'modern_2026_07_28')
+        servers,_=parse_mcp_servers(self.home,__import__('tomllib').loads(http),'banana')
+        self.assertEqual(servers[0]['protocol_mode'],'auto')
+        servers,_=parse_mcp_servers(self.home,__import__('tomllib').loads(http))
+        self.assertEqual(servers[0]['protocol_mode'],'auto')
+
+    def test_compatibility_baseline_constant(self):
+        self.assertIn('2026-07-28',CODEX_MCP_BASELINE)
+        self.assertIn('RawMcpServerConfig',CODEX_MCP_BASELINE)

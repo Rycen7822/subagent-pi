@@ -15,14 +15,40 @@ MAX_ENV_VARS = 64
 MAX_ENV_VALUE = 16384
 BASE_ENV_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME', 'CODEX_HOME')
 MANAGEMENT_SKILL_NAMES = {'pi-subagents'}
-# Keys that affect authorization, credentials, or execution environment.
-# An unknown key from this set disables the server instead of being ignored.
-MCP_STDIO_KEYS = {'command', 'args', 'env', 'env_vars', 'cwd', 'startup_timeout_sec', 'tool_timeout_sec',
-                  'enabled', 'required', 'enabled_tools', 'disabled_tools', 'default_tools_approval_mode',
-                  'tools', 'experimental_environment'}
-MCP_HTTP_KEYS = {'url', 'auth', 'bearer_token_env_var', 'http_headers', 'env_http_headers', 'http_headers_helper',
-                 'startup_timeout_sec', 'tool_timeout_sec', 'enabled', 'required', 'enabled_tools',
-                 'disabled_tools', 'default_tools_approval_mode', 'tools'}
+# Compatibility classification for every current Codex RawMcpServerConfig field.
+# Single source of truth: a field missing from this table fails closed, so a new
+# upstream field surfaces in the compatibility matrix test instead of being
+# silently accepted or dropped. Classes: mapped = converted to an in-memory
+# effect; accepted_no_effect = valid upstream with no child-side effect (a note
+# diagnostic, never fatal); explicitly_unsupported = valid upstream but no honest
+# mapping here (required servers fail, optional are excluded, with a reason);
+# conditional_local = environment_id, absent/'local' ok, anything else unsupported.
+CODEX_MCP_BASELINE = 'legacy 2025-06-18 + modern 2026-07-28 discovery; Codex RawMcpServerConfig surface as of 2026-09'
+MCP_FIELD_COMPAT = {
+    'command': ('mapped', '', 'stdio'), 'args': ('mapped', '', 'stdio'),
+    'env': ('mapped', '', 'stdio'), 'env_vars': ('mapped', '', 'stdio'), 'cwd': ('mapped', '', 'stdio'),
+    'url': ('mapped', '', 'http'), 'auth': ('mapped', '', 'http'),
+    'bearer_token_env_var': ('mapped', '', 'http'),
+    'http_headers': ('mapped', '', 'http'), 'env_http_headers': ('mapped', '', 'http'),
+    'http_headers_helper': ('explicitly_unsupported', 'dynamic header helper has no in-child equivalent', 'http'),
+    'startup_timeout_sec': ('mapped', '', 'stdio http'), 'startup_timeout_ms': ('mapped', '', 'stdio http'),
+    'tool_timeout_sec': ('mapped', '', 'stdio http'),
+    'enabled': ('mapped', '', 'stdio http'), 'required': ('mapped', '', 'stdio http'),
+    'enabled_tools': ('mapped', '', 'stdio http'), 'disabled_tools': ('mapped', '', 'stdio http'),
+    'default_tools_approval_mode': ('mapped', '', 'stdio http'), 'tools': ('mapped', '', 'stdio http'),
+    'experimental_environment': ('explicitly_unsupported', 'remote executor is not supported in managed children', 'stdio'),
+    'supports_parallel_tool_calls': ('accepted_no_effect', 'concurrency hint; the proxy tool executes calls sequentially', 'stdio http'),
+    'name': ('accepted_no_effect', 'legacy name label; the config key identifies the server', 'stdio http'),
+    'environment_id': ('conditional_local', 'no remote executor in managed children', 'stdio http'),
+    'omit_tools_from': ('explicitly_unsupported', 'ToolExposureSurface cannot be mapped onto the proxy tool surface without guessing', 'stdio http'),
+    'scopes': ('explicitly_unsupported', 'OAuth scopes need a token store managed children must not create', 'stdio http'),
+    'oauth': ('explicitly_unsupported', 'OAuth needs a credential store managed children must not create or copy', 'stdio http'),
+    'oauth_resource': ('explicitly_unsupported', 'OAuth resource indicator requires oauth support', 'stdio http'),
+}
+TOOL_FIELD_COMPAT = {'approval_mode': 'mapped', 'output_token_limit': 'mapped'}
+MCP_STDIO_KEYS = {f for f, (_, _, t) in MCP_FIELD_COMPAT.items() if 'stdio' in t}
+MCP_HTTP_KEYS = {f for f, (_, _, t) in MCP_FIELD_COMPAT.items() if 'http' in t}
+MAX_RESULT_TEXT_BYTES = 256 * 1024
 APPROVAL_MODES = {'auto', 'prompt', 'writes', 'approve'}
 
 
@@ -193,16 +219,28 @@ def _tool_policy(server: dict, name: str) -> tuple[dict, list[Diagnostic]]:
                                       'approval_mode writes cannot be enforced without trusting readOnlyHint; using confirm'))
     default = 'auto' if mode == 'auto' else 'confirm'
     tools: dict[str, str] = {}
+    budgets: dict[str, int] = {}
     denied: set[str] = set(server.get('disabled_tools') or [])
     for tool_name, tool_cfg in (server.get('tools') or {}).items():
         if not isinstance(tool_cfg, dict):
             continue
-        unknown = set(tool_cfg) - {'approval_mode'}
-        if unknown:  # unimplementable authorization/output limits must not be accepted-and-ignored
+        unknown = set(tool_cfg) - set(TOOL_FIELD_COMPAT)
+        if unknown:  # a genuinely unknown tool field stays fail-closed for that tool
             denied.add(tool_name)
             diagnostics.append(Diagnostic('mcp', f'{name}.{tool_name}',
                                           f'denied: unsupported tool config keys cannot be honored: {sorted(unknown)}'))
             continue
+        limit = tool_cfg.get('output_token_limit')
+        if limit is not None:
+            if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+                budgets[tool_name] = min(limit * 4, MAX_RESULT_TEXT_BYTES)  # 4 bytes/token, tighten-only
+                diagnostics.append(Diagnostic('mcp', f'{name}.{tool_name}',
+                                              f'output budget {budgets[tool_name]} bytes (output_token_limit={limit})'))
+            else:
+                denied.add(tool_name)
+                diagnostics.append(Diagnostic('mcp', f'{name}.{tool_name}',
+                                              f'denied: invalid output_token_limit {limit!r}'))
+                continue
         tmode = tool_cfg.get('approval_mode')
         if tmode is None:
             continue
@@ -215,14 +253,14 @@ def _tool_policy(server: dict, name: str) -> tuple[dict, list[Diagnostic]]:
             diagnostics.append(Diagnostic('mcp', f'{name}.{tool_name}',
                                           'approval_mode writes cannot be enforced; using confirm'))
         tools[tool_name] = 'auto' if tmode == 'auto' else 'confirm'
-    return {'default': default, 'tools': tools, 'denied': sorted(denied)}, diagnostics
+    return {'default': default, 'tools': tools, 'denied': sorted(denied), 'budgets': budgets}, diagnostics
 
 
-def _int_field(server: dict, key: str, default: int) -> tuple[int, list[Diagnostic]]:
+def _int_field(server: dict, key: str, default: int, maximum: int = 3600) -> tuple[int, list[Diagnostic]]:
     value = server.get(key, default)
     diagnostics: list[Diagnostic] = []
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0 or value > 3600:
-        diagnostics.append(Diagnostic('mcp', server.get('name', '?'), f'invalid {key}; using {default}s'))
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0 or value > maximum:
+        diagnostics.append(Diagnostic('mcp', server.get('name', '?'), f'invalid {key}; using default'))
         return default, diagnostics
     return value, diagnostics
 
@@ -278,7 +316,7 @@ def _enabled_tools(server: dict) -> list[str] | None:
         raise AgentError('invalid_argument', 'enabled_tools must be a list of tool names')
     return sorted(set(enabled))
 
-def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Diagnostic]]:
+def parse_mcp_servers(codex_home: Path, raw: dict, protocol_mode: str = 'auto') -> tuple[list[dict], list[Diagnostic]]:
     """Convert [mcp_servers.*] TOML into normalized in-memory server configs (no
     environment access here). Every declared server keeps a disposition
     ('ok'|'failed'|'disabled') with reasons; unknown keys that affect execution
@@ -315,10 +353,23 @@ def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Dia
         is_http = 'url' in server
         allowed_keys = MCP_HTTP_KEYS if is_http else MCP_STDIO_KEYS
         unknown = set(server) - allowed_keys
-        if unknown:
+        if unknown:  # unknown_fail_closed: a field absent from the compat table
             _failed(name, transport, required,
                     f'unsupported config keys affecting execution or auth: {sorted(unknown)}')
             continue
+        unsupported = [f for f in server if MCP_FIELD_COMPAT[f][0] == 'explicitly_unsupported']
+        env_id = server.get('environment_id')
+        if env_id not in (None, 'local'):
+            unsupported.append('environment_id')
+        if unsupported:  # required servers fail; optional ones are excluded with reasons
+            why = '; '.join(f'{f}: {MCP_FIELD_COMPAT[f][1]}' for f in unsupported if f != 'environment_id')
+            if 'environment_id' in unsupported:
+                why = (why + '; ' if why else '') + f'environment_id={env_id!r}: no remote executor in managed children'
+            _failed(name, transport, required, why)
+            continue
+        for f in server:
+            if MCP_FIELD_COMPAT[f][0] == 'accepted_no_effect':
+                diagnostics.append(Diagnostic('mcp', name, f'{f}: {MCP_FIELD_COMPAT[f][1]}'))
         try:
             policy, pdiag = _tool_policy(server, name)
             entry.update(allowed_tools=_enabled_tools(server),
@@ -326,11 +377,28 @@ def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Dia
                          approval_default=policy['default'],
                          tool_approval=policy['tools'])
             diagnostics.extend(pdiag)
-            timeout, tdiag = _int_field(server, 'startup_timeout_sec', 10)
+            if server.get('startup_timeout_ms') is not None:
+                ms, mdiag = _int_field(server, 'startup_timeout_ms', 10000, maximum=3600000)
+                entry['startup_timeout_sec'] = ms / 1000  # ms wins, matching Codex; precision is preserved
+                if server.get('startup_timeout_sec') is not None:
+                    diagnostics.append(Diagnostic('mcp', name,
+                                                  'startup_timeout_sec ignored: startup_timeout_ms takes precedence (Codex semantics)'))
+                diagnostics.extend(mdiag)
+            else:
+                timeout, tdiag = _int_field(server, 'startup_timeout_sec', 10)
+                entry['startup_timeout_sec'] = timeout
+                diagnostics.extend(tdiag)
             tool_timeout, ttdiag = _int_field(server, 'tool_timeout_sec', 60)
-            entry['startup_timeout_sec'] = timeout
             entry['tool_timeout_sec'] = tool_timeout
-            diagnostics.extend(tdiag + ttdiag)
+            entry['tool_output_limits'] = policy['budgets']
+            diagnostics.extend(ttdiag)
+            if is_http:
+                entry['protocol_mode'] = protocol_mode if protocol_mode in ('auto', 'legacy_2025_06_18', 'modern_2026_07_28') else 'auto'
+            else:
+                entry['protocol_mode'] = 'legacy_2025_06_18'
+                if protocol_mode == 'modern_2026_07_28':
+                    diagnostics.append(Diagnostic('mcp', name,
+                                                  'stdio uses legacy 2025-06-18; modern requires the CODEX_MCP_PROTOCOL_VERSION env opt-in, which managed children do not forward'))
             if is_http:
                 entry['transport'] = 'http'
                 url = server['url']
@@ -339,8 +407,6 @@ def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Dia
                 entry['url'] = url
                 if 'auth' in server and server['auth'] != 'bearer':
                     raise AgentError('invalid_argument', f"auth={server['auth']!r} (oauth/chatgpt) is not supported in managed children")
-                if 'http_headers_helper' in server:
-                    raise AgentError('invalid_argument', 'http_headers_helper is not supported in managed children')
                 headers = server.get('http_headers') or {}
                 env_headers = server.get('env_http_headers') or {}
                 if not isinstance(headers, dict) or not isinstance(env_headers, dict) or \
@@ -351,8 +417,6 @@ def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Dia
                 entry['bearer_token_env_var'] = server.get('bearer_token_env_var') if isinstance(server.get('bearer_token_env_var'), str) else None
             else:
                 entry['transport'] = 'stdio'
-                if server.get('experimental_environment') not in (None, 'local'):
-                    raise AgentError('invalid_argument', 'experimental_environment remote executor is not supported in managed children')
                 command = server.get('command')
                 if not isinstance(command, str) or not command.strip():
                     raise AgentError('invalid_argument', 'missing command')

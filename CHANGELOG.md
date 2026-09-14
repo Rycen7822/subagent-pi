@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.4 — 2026-09-15
+
+Two MCP/Codex compatibility P1 fixes, each verified red against 6741777.
+
+- P1-A (protocol eras): the HTTP transport now has an explicit protocol
+  compatibility layer — `legacy_2025_06_18`, `modern_2026_07_28`, `auto`
+  (configured once via `[inheritance] mcp_protocol_mode`, never filled in by
+  the model; stdio stays legacy because managed children never forward the
+  upstream env opt-in). Legacy now NEGOTIATES the initialize version and sends
+  the negotiated `MCP-Protocol-Version` on every later request; a 404 on a
+  session-scoped request marks the connection stale, returns "outcome is
+  unknown" for a sent call, never replays it, and the next explicit operation
+  re-initializes a fresh session. `auto` probes with `server/discover` and
+  falls back to the legacy handshake ONLY on proof of legacy-only (HTTP 404/405
+  or JSON-RPC -32601 on the side-effect-free discover). Modern mode is
+  stateless: no handshake, every request self-describes via `_meta`
+  (protocolVersion/clientInfo/clientCapabilities) plus `MCP-Protocol-Version`,
+  `Mcp-Method` and (for tools/call) `Mcp-Name` headers. `x-mcp-header` argument
+  mirroring is refused (model-controlled values must not become HTTP headers).
+  Legacy sessions are closed with a best-effort DELETE (documented boundary).
+- P1-B (config compatibility): the two hardcoded stdio/http key whitelists are
+  replaced by one declarative classification table for the current Codex
+  `RawMcpServerConfig` surface (mapped / accepted_no_effect /
+  explicitly_unsupported / unknown_fail_closed), reported by doctor as
+  `baseline`. `startup_timeout_ms` maps with Codex precedence over
+  `startup_timeout_sec` (no truncation); `supports_parallel_tool_calls` and the
+  legacy `name` label are accepted without effect; `environment_id` is local-
+  only; `omit_tools_from`, `scopes`, `oauth`, `oauth_resource` fail/exclude
+  with precise diagnostics instead of disabling servers for unknown reasons;
+  tool-level `output_token_limit` is enforced at the proxy serialization
+  boundary as a tighten-only 4 bytes/token budget. Genuinely unknown fields
+  still fail closed.
+
+New conformance fixtures (localhost fakes, zero model calls): a strict modern
+server that rejects requests missing the required headers/_meta, a legacy
+server with session expiry, and a legacy-only discovery endpoint; plus the
+Codex config field matrix and required/optional unsupported-field matrix.
+
 ## 0.2.3 — 2026-09-14
 
 - P1 (receipt fd ownership): the receipt read end now has exactly one closer.

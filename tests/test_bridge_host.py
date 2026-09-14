@@ -57,13 +57,15 @@ class HostHarness:
         self.procs.append(None)
         return {'log': Path(env['FAKE_MCP_CALL_LOG']), 'events': Path(env['FAKE_MCP_EVENTS']),
                 'dyn_file': Path(env['FAKE_MCP_DYN_FILE']), 'env': env}
-    def start_http(self, mode='normal'):
+    def start_http(self, mode='normal', extra=None):
         port = free_port()
         n = len(self.procs)
         env = {k: v for k, v in os.environ.items()}
         env['FAKE_MCP_HTTP_MODE'] = mode
         env['FAKE_MCP_HTTP_CALL_LOG'] = str(self.tmp / f'http-calls-{n}.log')
         env['FAKE_MCP_HTTP_EVENTS'] = str(self.tmp / f'http-events-{n}.log')
+        for k, v in (extra or {}).items():
+            env[k] = v
         proc = subprocess.Popen([sys.executable, str(HERE / 'fake_mcp_http.py'), str(port)],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True)
         proc.stdout.readline()  # ready
@@ -111,6 +113,27 @@ def stdio_cfg(name='local', server_env=None, **over):
            'tool_approval': {}}
     cfg.update(over)
     return cfg
+
+
+class HttpHostCase(unittest.TestCase):
+    """Shared fixture for tests that drive the real bridge against fake HTTP servers."""
+    prefix = 'bridge-http-'
+    def setUp(self):
+        if find_pi_dir() is None: self.skipTest('installed pi distribution not found')
+        if shutil.which('node') is None: self.skipTest('node not available')
+        self.tmp = tempfile.TemporaryDirectory(prefix=self.prefix)
+        self.h = HostHarness(Path(self.tmp.name))
+        self.addCleanup(self.h.stop)
+        self.addCleanup(self.tmp.cleanup)
+    def http_cfg(self, srv, **over):
+        cfg = {'name': 'web', 'transport': 'http', 'url': srv['url'], 'headers': {},
+               'bearer_token': None, 'startup_timeout_sec': 10, 'tool_timeout_sec': 5,
+               'required': False, 'allowed_tools': None, 'disabled_tools': [],
+               'approval_default': 'auto', 'tool_approval': {}}
+        cfg.update(over)
+        return cfg
+
+
 
 class BridgeHostTests(unittest.TestCase):
     def setUp(self):
@@ -468,25 +491,11 @@ class DiscoveryFlowTests(unittest.TestCase):
         self.assertIn('failed to initialize', by['broken_list']['message'])
         self.assertEqual(by['good_list']['kind'], 'result')
 
-class HttpExchangeLifecycleTests(unittest.TestCase):
+class HttpExchangeLifecycleTests(HttpHostCase):
     """P1-A: after the response HEADERS arrive, a hung body must still be ended
     by the deadline, the caller's cancellation and connection close. Every test
     proves the tools/call reached the server and headers were flushed first."""
-    def setUp(self):
-        if find_pi_dir() is None: self.skipTest('installed pi distribution not found')
-        if shutil.which('node') is None: self.skipTest('node not available')
-        self.tmp = tempfile.TemporaryDirectory(prefix='bridge-http-')
-        self.h = HostHarness(Path(self.tmp.name))
-        self.addCleanup(self.h.stop)
-        self.addCleanup(self.tmp.cleanup)
 
-    def http_cfg(self, srv, **over):
-        cfg = {'name': 'web', 'transport': 'http', 'url': srv['url'], 'headers': {},
-               'bearer_token': None, 'startup_timeout_sec': 10, 'tool_timeout_sec': 5,
-               'required': False, 'allowed_tools': None, 'disabled_tools': [],
-               'approval_default': 'auto', 'tool_approval': {}}
-        cfg.update(over)
-        return cfg
 
     def assert_reached_body_phase(self, srv):
         events = self.h.events(srv['events'])
@@ -698,3 +707,121 @@ class StdioTransportFailureTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+class LegacySessionTests(HttpHostCase):
+    """2025-06-18 legacy HTTP lifecycle: negotiation, protocol header, session
+    prefix = 'legacy-sess-'
+    expiry (404) recovery — and proof that an expired-session call is never replayed."""
+
+
+    def test_negotiates_version_and_sends_headers(self):
+        srv = self.h.start_http('normal')
+        res = self.h.run_host([self.http_cfg(srv, protocol_mode='legacy_2025_06_18')],
+                              [{'action': 'list'}, {'action': 'list', 'server': 'web'}], access='write')['results']
+        self.assertEqual([r['kind'] for r in res], ['result', 'result'])
+        ev = self.h.events(srv['events'])
+        inits = [e for e in ev if e['event'] == 'initialize-received']
+        self.assertEqual(len(inits), 1)
+        lists = [e for e in ev if e.get('method') == 'tools/list']
+        self.assertTrue(lists)
+        for e in lists:  # negotiated version travels on every later request, with the session id
+            self.assertEqual(e['protocol_header'], '2025-06-18')
+            self.assertTrue((e['session'] or '').startswith('sess-'))
+
+    def test_session_404_marks_stale_never_replays_and_recovers(self):
+        srv = self.h.start_http('normal', extra={'FAKE_MCP_SESSION_EXPIRE_AFTER': '2'})
+        res = self.h.run_host([self.http_cfg(srv, protocol_mode='legacy_2025_06_18')],
+                              [{'name': 'l1', 'action': 'list', 'server': 'web'},
+                               {'name': 'c1', 'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}},
+                               {'name': 'l2', 'action': 'list', 'server': 'web'},
+                               {'name': 'c2', 'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'y'}}],
+                              access='write')['results']
+        by = {r['step']: r for r in res}
+        # the call that hit the expired session reports an error with an unknown outcome...
+        self.assertEqual(by['c1']['kind'], 'error')
+        self.assertIn('session expired', by['c1']['message'])
+        self.assertIn('outcome is unknown', by['c1']['message'])
+        # ...the server never executed it (the 404 happened before dispatch)
+        self.assertEqual(self.h.calls(srv['log']), ['search:{"query": "y"}'])
+        # the next explicit list re-initialized and the follow-up call succeeded
+        self.assertEqual(by['l2']['kind'], 'result')
+        self.assertEqual(by['c2']['kind'], 'result')
+        ev = self.h.events(srv['events'])
+        self.assertEqual(len([e for e in ev if e['event'] == 'session-404']), 1)
+        self.assertEqual(len([e for e in ev if e['event'] == 'initialize-received']), 2)
+
+
+class ModernProtocolTests(HttpHostCase):
+    """2026-07-28 modern lifecycle against a strict fixture that rejects requests
+    prefix = 'modern-mcp-'
+    missing MCP-Protocol-Version / Mcp-Method / Mcp-Name / modern _meta."""
+
+
+    def test_strict_server_accepts_bridge_requests(self):
+        srv = self.h.start_http('modern')
+        res = self.h.run_host([self.http_cfg(srv)],
+                              [{'action': 'list'}, {'action': 'list', 'server': 'web'},
+                               {'action': 'describe', 'server': 'web', 'tool': 'search'},
+                               {'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}],
+                              access='write')['results']
+        self.assertTrue(all(r['kind'] == 'result' for r in res), res)
+        ev = self.h.events(srv['events'])
+        self.assertEqual([e for e in ev if e['event'] == 'strict-rejected'], [])
+        reqs = [e for e in ev if e.get('event') == 'request']
+        for e in reqs:
+            self.assertEqual(e['protocol_header'], '2026-07-28')
+            self.assertEqual(e['mcp_method_header'], e['method'])
+            self.assertTrue(e['has_modern_meta'])
+        calls = [e for e in reqs if e['method'] == 'tools/call']
+        self.assertEqual(calls[0]['mcp_name_header'], 'search')
+        # no initialize handshake and no session id in modern mode
+        self.assertEqual([e for e in ev if e['event'] == 'initialize-received'], [])
+        self.assertTrue(all(not e['session'] for e in reqs))
+
+    def test_auto_falls_back_to_legacy_only_on_proof(self):
+        srv = self.h.start_http('legacy_only')  # server/discover -> 404: proof of legacy-only
+        res = self.h.run_host([self.http_cfg(srv)],  # default protocol_mode = auto
+                              [{'action': 'list', 'server': 'web'}], access='write')['results']
+        self.assertEqual(res[0]['kind'], 'result')
+        ev = self.h.events(srv['events'])
+        self.assertEqual(len([e for e in ev if e['event'] == 'discover-404-legacy-only']), 1)
+        self.assertEqual(len([e for e in ev if e['event'] == 'initialize-received']), 1)
+        lists = [e for e in ev if e.get('method') == 'tools/list']
+        self.assertTrue(lists and all(e['protocol_header'] == '2025-06-18' for e in lists))
+
+    def test_auto_picks_modern_without_handshake(self):
+        srv = self.h.start_http('modern')
+        res = self.h.run_host([self.http_cfg(srv)], [{'action': 'list', 'server': 'web'}], access='write')['results']
+        self.assertEqual(res[0]['kind'], 'result')
+        ev = self.h.events(srv['events'])
+        self.assertEqual(len([e for e in ev if e['event'] == 'initialize-received']), 0)
+        self.assertEqual(len([e for e in ev if e.get('method') == 'server/discover']), 1)
+
+    def test_legacy_client_cannot_talk_to_modern_server(self):
+        srv = self.h.start_http('modern')
+        res = self.h.run_host([self.http_cfg(srv, protocol_mode='legacy_2025_06_18')],
+                              [{'action': 'list', 'server': 'web'}], access='write')['results']
+        self.assertEqual(res[0]['kind'], 'error')
+        self.assertIn('failed to initialize', res[0]['message'])
+        self.assertTrue(any(e['event'] == 'strict-rejected' for e in self.h.events(srv['events'])))
+
+    def test_modern_body_hang_hits_deadline_without_retry(self):
+        srv = self.h.start_http('modern_hang_json')
+        res = self.h.run_host([self.http_cfg(srv, tool_timeout_sec=1)],
+                              [{'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}],
+                              access='write', timeout=90)['results']
+        self.assertEqual(res[0]['kind'], 'error')
+        self.assertIn('outcome is unknown', res[0]['message'])
+        kinds = [e['event'] for e in self.h.events(srv['events'])]
+        self.assertIn('call-received', kinds)   # the request actually arrived
+        self.assertIn('headers-sent', kinds)    # and headers were flushed
+        self.assertEqual(len(self.h.calls(srv['log'])), 1)  # exactly one server-side execution
+
+    def test_x_mcp_header_arguments_are_refused_never_sent(self):
+        srv = self.h.start_http('modern')
+        res = self.h.run_host([self.http_cfg(srv)],
+                              [{'action': 'call', 'server': 'web', 'tool': 'search',
+                                'args': {'query': 'x', 'x-mcp-header': {'X-Injected': 'value'}}}],
+                              access='write')['results']
+        self.assertEqual(res[0]['kind'], 'error')
+        self.assertIn('x-mcp-header', res[0]['message'])
+        self.assertEqual(self.h.calls(srv['log']), [])  # the non-conforming call never reached the server
