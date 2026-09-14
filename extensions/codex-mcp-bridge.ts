@@ -1,22 +1,16 @@
 /**
- * Codex MCP bridge for managed subagent-pi children.
+ * Codex MCP bridge for managed subagent-pi children. Loaded ONLY via explicit
+ * `--extension` on daemon-booted children. Configuration arrives over an
+ * anonymous pipe (fd in PI_AGENTS_BOOTSTRAP_FD); no user/global config is read
+ * and nothing is written to disk. A structured readiness receipt (JSON, no
+ * secrets) goes to the fd in PI_AGENTS_BRIDGE_RECEIPT_FD once required servers
+ * have initialized — or immediately on failure.
  *
- * Loaded ONLY via explicit `--extension` on children booted by the subagent-pi
- * daemon. Receives its whole configuration over an anonymous pipe (fd number in
- * PI_AGENTS_BOOTSTRAP_FD); it never reads user Pi config, global config files,
- * or any other source. Nothing is written to disk: metadata lives in process
- * memory, stderr carries non-secret diagnostics, and stdout stays reserved for
- * the parent RPC protocol. A structured readiness receipt (JSON, no secrets) is
- * written to the fd in PI_AGENTS_BRIDGE_RECEIPT_FD once tools are registered and
- * required servers have initialized — or immediately on failure.
- *
- * No third-party runtime dependencies: Node built-ins plus `typebox`, which Pi
- * itself provides to extensions. The supported MCP lifecycle subset is:
- * initialize (protocol 2025-06-18 handshake), tools/list (pagination),
+ * No third-party runtime deps beyond `typebox`, which Pi provides to extensions.
+ * Supported MCP subset: initialize (2025-06-18), tools/list (pagination),
  * tools/call, notifications/initialized, notifications/cancelled and
- * notifications/tools/list_changed, over newline-delimited stdio JSON-RPC or
- * the streamable-HTTP transport (JSON or SSE responses, mcp-session-id).
- * Anything outside this subset is rejected explicitly instead of half-working.
+ * notifications/tools/list_changed, over newline stdio JSON-RPC or streamable
+ * HTTP (JSON or SSE, mcp-session-id). Anything else is rejected explicitly.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -103,8 +97,7 @@ function readBootstrap(): { payload?: Bootstrap; error?: string } {
       const chunks: Buffer[] = [];
       let total = 0;
       const buf = Buffer.alloc(65536);
-      // Read to EOF; the parent writes asynchronously, so this blocks safely.
-      for (;;) {
+      for (;;) {  // read to EOF; the parent writes asynchronously, so this blocks safely
         const n = readSync(fd, buf, 0, buf.length, null);
         if (n === 0) break;
         total += n;
@@ -117,7 +110,6 @@ function readBootstrap(): { payload?: Bootstrap; error?: string } {
       result = { payload: parsed };
     } catch (err) {
       try { closeSync(fd); } catch { /* already closed */ }
-      // Message is capped and contains no payload fragments.
       result = { error: `bootstrap failed: ${((err as Error).message || "unknown error").slice(0, 200)}` };
     }
   }
@@ -128,7 +120,6 @@ function readBootstrap(): { payload?: Bootstrap; error?: string } {
 
 interface JsonRpcResponse { id?: number | string | null; result?: unknown; error?: { code: number; message: string } }
 
-/** Validates and keeps the FULL tool metadata in process memory (no disk cache). */
 function toToolMeta(raw: unknown): ToolMeta | null {
   if (typeof raw !== "object" || raw === null) return null;
   const t = raw as { name?: unknown; description?: unknown; annotations?: { readOnlyHint?: unknown }; inputSchema?: unknown };
@@ -149,9 +140,7 @@ function toToolMeta(raw: unknown): ToolMeta | null {
 abstract class McpConnection {
   toolsCache: ToolMeta[] | null = null;
   catalogTruncated = false;
-  /** Bumped by tools/list_changed so an in-flight crawl never repopulates a
-   * cache that was invalidated while it was running. */
-  private catalogEpoch = 0;
+  private catalogEpoch = 0; // bump on list_changed so an in-flight crawl never repopulates an invalidated cache
   protected invalidateCatalog(): void {
     this.toolsCache = null;
     this.catalogEpoch += 1;
@@ -161,13 +150,9 @@ abstract class McpConnection {
   abstract initialize(): Promise<void>;
   abstract callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal): Promise<unknown>;
   abstract close(): void;
-  /**
-   * Fetches and caches the tool catalog in memory. `catalogTruncated` records
-   * when a bound stopped the crawl, so callers can surface truncated: true
-   * instead of presenting a partial catalog as complete. The cache invalidates
-   * on notifications/tools/list_changed.
-   */
   async ensureTools(cfg: ServerCfg, signal?: AbortSignal): Promise<ToolMeta[]> {
+    // Cached in memory; catalogTruncated records a bound-stopped crawl instead of
+    // presenting a partial catalog as complete. Invalidated on list_changed.
     if (this.toolsCache) return this.toolsCache;
     const epochAtStart = this.catalogEpoch;
     const collected: ToolMeta[] = [];
@@ -190,9 +175,8 @@ abstract class McpConnection {
       cursor = typeof result?.nextCursor === "string" && result.nextCursor ? result.nextCursor : undefined;
       pages += 1;
     } while (cursor && pages < MAX_PAGES && collected.length < MAX_TOOLS);
-    if (cursor && pages >= MAX_PAGES) this.catalogTruncated = true; // page budget exhausted, not a complete catalog
-    // A list_changed that arrived mid-crawl must win over this result.
-    if (this.catalogEpoch === epochAtStart) this.toolsCache = collected;
+    if (cursor && pages >= MAX_PAGES) this.catalogTruncated = true;
+    if (this.catalogEpoch === epochAtStart) this.toolsCache = collected;  // a list_changed that arrived mid-crawl must win
     return collected;
   }
 }
@@ -259,13 +243,10 @@ class StdioConnection extends McpConnection {
     child.stderr?.on("data", (chunk: string) => {
       this.stderrTail = (this.stderrTail + chunk).slice(-4096);
     });
-    // The stdin Socket can fail ASYNCHRONOUSLY (classic case: the server closed
-    // its read end and the next write raises EPIPE). A ChildProcess 'error'
-    // listener does not cover this, and try/catch around write() only sees
-    // synchronous failures. This handler is the lifecycle hook: it settles this
-    // connection's pending requests with a deterministic transport error and
-    // marks the connection dead so the next explicit operation reconnects with
-    // a fresh handshake. It is not a silencer.
+    // The stdin Socket can fail ASYNCHRONOUSLY (server closed its read end; the
+    // next write raises EPIPE). ChildProcess 'error' does not cover this and
+    // try/catch only sees synchronous failures — this handler settles pending
+    // requests deterministically and marks the connection dead for reconnect.
     child.stdin?.on("error", (err: Error) => {
       if (myGeneration !== this.generation || this.closed) return;
       this.stdinBroken = true;
@@ -273,8 +254,7 @@ class StdioConnection extends McpConnection {
       this.exitError = this.exitError ?? `stdio transport broken: ${code}`;
       this.failPending(`stdio transport broken (${code}); the call may or may not have reached the server`);
     });
-    // Spawn failures and early exits must reject waiters, never crash Pi with
-    // an unhandled 'error' event.
+    // Spawn failures and early exits reject waiters; never an unhandled 'error' crash.
     child.on("error", (err: Error) => {
       if (myGeneration !== this.generation || this.closed) return;
       this.exitError = `server failed to start: ${err.message.slice(0, 200)}`;
@@ -288,13 +268,6 @@ class StdioConnection extends McpConnection {
     return child;
   }
 
-  /**
-   * Single controlled send path for requests and notifications. Synchronous
-   * failures throw; asynchronous failures (async EPIPE) are handled by the
-   * stdin 'error' listener installed at spawn time. write() returning false is
-   * backpressure, not failure or completion — Node keeps buffering and the
-   * reader-side MAX_LINE bound keeps the queue finite.
-   */
   private sendFrame(frame: unknown): void {
     const child = this.ensureProcess();
     if (this.stdinBroken || !child.stdin?.writable) {
@@ -339,17 +312,12 @@ class StdioConnection extends McpConnection {
     if (opts.signal?.aborted) throw new CancelledError(false);
     this.ensureProcess();
     if (opts.notification) {
-      // Notifications have no pending entry: a synchronous send failure is a
-      // deterministic transport error; an ASYNC failure (EPIPE) is handled by
-      // the stdin 'error' listener and must not crash the worker.
-      this.sendFrame({ jsonrpc: "2.0", method, params });
+      this.sendFrame({ jsonrpc: "2.0", method, params });  // no pending entry; async EPIPE is the stdin listener's job
       return null;
     }
     const id = this.nextId++;
     const promise = new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
-        // Reject through the pending entry so cleanup and double-settlement
-        // guards live in exactly one place.
         if (this.pending.has(id)) {
           this.pending.delete(id);
           reject(new Error(`${method} timed out after ${timeoutSec}s`));
@@ -358,8 +326,7 @@ class StdioConnection extends McpConnection {
       this.pending.set(id, { resolve, reject, timer });
     });
     try {
-      // A synchronous send failure must settle the pending entry before the
-      // rejection propagates, otherwise it would hang until the timeout.
+      // settle the pending entry synchronously, or the rejection would hang until timeout
       this.sendFrame({ jsonrpc: "2.0", id, method, params });
     } catch (err) {
       const entry = this.pending.get(id);
@@ -372,9 +339,7 @@ class StdioConnection extends McpConnection {
         this.pending.delete(id);
         clearTimeout(entry.timer);
         entry.reject(new CancelledError(true));
-        // Cancellation notice is best-effort: a send failure here must neither
-        // crash the worker nor turn this cancellation into a success.
-        try { this.sendFrame({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }); } catch { /* ignore */ }
+        try { this.sendFrame({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }); } catch { /* best-effort */ }
       }
     };
     if (opts.signal) {
@@ -394,7 +359,7 @@ class StdioConnection extends McpConnection {
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
-      clientInfo: { name: "subagent-pi-bridge", version: "0.2.2" },
+      clientInfo: { name: "subagent-pi-bridge", version: "0.2.3" },
     }, this.cfg.startup_timeout_sec);
     await this.request("notifications/initialized", {}, this.cfg.startup_timeout_sec, { notification: true });
   }
@@ -424,8 +389,7 @@ class HttpConnection extends McpConnection {
   private sessionId: string | null = null;
   private nextId = 1;
   private closed = false;
-  /** AbortControllers of every in-flight exchange, so close() can end them all. */
-  private active = new Set<AbortController>();
+  private active = new Set<AbortController>();  // every in-flight exchange, so close() can end them all
 
   constructor(private cfg: ServerCfg) { super(); }
 
@@ -442,7 +406,6 @@ class HttpConnection extends McpConnection {
     return headers;
   }
 
-  /** Reads a bounded JSON body. Aborts propagate from the exchange signal. */
   private async readBoundedJson(response: Response, limit: number): Promise<unknown> {
     const reader = response.body?.getReader();
     if (!reader) throw new Error("empty response body");
@@ -498,18 +461,11 @@ class HttpConnection extends McpConnection {
     throw new Error("event-stream closed before the JSON-RPC response arrived");
   }
 
-  /**
-   * One HTTP exchange owns its whole lifecycle: the deadline, the caller's
-   * cancellation, the fetch, header handling, body consumption and cleanup all
-   * share a single AbortController that is armed until the exchange SETTLES —
-   * not merely until the response headers arrive. A hung body therefore hits
-   * the deadline, and close()/user-cancel abort the body reader too. JSON
-   * parsing runs on a payload already bounded in bytes, so the synchronous
-   * parse phase is bounded without pretending AbortSignal can preempt it.
-   * No exchange is ever retried here: a tools/call may have reached the server.
-   */
   async request(method: string, params: unknown, timeoutSec: number,
                 opts: { notification?: boolean; signal?: AbortSignal } = {}): Promise<unknown> {
+    // One exchange, one AbortController: the deadline, caller cancellation and
+    // connection close all cover send/headers/body/parse until settlement, so a
+    // hung body still hits the deadline. No exchange is ever retried here.
     if (this.closed) throw new Error(`connection ${this.cfg.name} is closed`);
     if (opts.signal?.aborted) throw new CancelledError(false);
     const id = opts.notification ? null : this.nextId++;
@@ -539,8 +495,7 @@ class HttpConnection extends McpConnection {
       if (msg.error) throw new Error(`server error ${msg.error.code}: ${msg.error.message.slice(0, 300)}`);
       return msg.result;
     } catch (err) {
-      // Classify by WHO aborted the exchange; a request that was already sent
-      // keeps an outcome-unknown wording instead of claiming server-side state.
+      // classify by WHO aborted; sent requests keep an outcome-unknown wording
       const sent = id !== null;
       if (opts.signal?.aborted) {
         if (err instanceof CancelledError) throw err;
@@ -561,7 +516,7 @@ class HttpConnection extends McpConnection {
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
-      clientInfo: { name: "subagent-pi-bridge", version: "0.2.2" },
+      clientInfo: { name: "subagent-pi-bridge", version: "0.2.3" },
     }, this.cfg.startup_timeout_sec);
     await this.request("notifications/initialized", {}, this.cfg.startup_timeout_sec, { notification: true });
   }
@@ -570,9 +525,8 @@ class HttpConnection extends McpConnection {
     return await this.request("tools/call", { name, arguments: args ?? {} }, timeoutSec, { signal });
   }
 
-  /** Ends every in-flight exchange on this connection and rejects new ones. */
   close(): void {
-    if (this.closed) return; // idempotent
+    if (this.closed) return;
     this.closed = true;
     for (const controller of this.active) controller.abort(ABORT_CLOSED);
     this.active.clear();
@@ -595,13 +549,10 @@ export default async function (pi: ExtensionAPI) {
   function toolVisible(cfg: ServerCfg, meta: ToolMeta): boolean {
     if (isDenied(cfg, meta.name)) return false;
     if (access === "read") {
-      // P1-B: the parent's enabled_tools is NOT child authorization. A read
-      // child never sees or calls a tool that is not explicitly declared
-      // readOnly — not through per-tool auto, and a confirmation dialog never
-      // upgrades the worker either. An explicit parent allowlist can only
-      // SHRINK the child surface (an empty allowlist allows nothing); it can
-      // never add write tools back. readOnlyHint is a server self-report
-      // affecting the managed tool surface only; it is not a sandbox claim.
+      // P1-B: the parent's enabled_tools is NOT child authorization. A read child
+      // sees only explicitly readOnly tools; an explicit allowlist can only SHRINK
+      // the surface (empty = nothing). readOnlyHint is a self-report affecting the
+      // managed tool surface only, not a sandbox claim.
       if (meta.readOnly !== true) return false;
       if (cfg.allowed_tools !== null && !cfg.allowed_tools.includes(meta.name)) return false;
       return true;
@@ -610,14 +561,8 @@ export default async function (pi: ExtensionAPI) {
     return true;
   }
 
-  /**
-   * Effective confirmation AFTER a tool is allowed. The child rule wins:
-   * read children always confirm, regardless of parent-side auto; write
-   * children follow per-tool override > server default > confirm.
-   */
   function needsConfirmation(cfg: ServerCfg, meta: ToolMeta): boolean {
-    if (access === "read") return true;
-    return (cfg.tool_approval[meta.name] ?? cfg.approval_default) !== "auto";
+    return access === "read" || (cfg.tool_approval[meta.name] ?? cfg.approval_default) !== "auto";  // the child rule wins over parent-side auto
   }
 
   async function ensureConnection(cfg: ServerCfg, signal?: AbortSignal): Promise<McpConnection> {
@@ -627,7 +572,6 @@ export default async function (pi: ExtensionAPI) {
       existing.close();
       connections.delete(cfg.name);
     }
-    // Concurrent first uses share one creation+handshake per server name.
     const inflight = connecting.get(cfg.name);
     if (inflight) return inflight;
     const create = (async () => {
@@ -650,7 +594,6 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  /** Release every connection, reader and pending request on shutdown. */
   function closeAll(): void {
     for (const [, conn] of connections) conn.close();
     connections.clear();
@@ -687,8 +630,7 @@ export default async function (pi: ExtensionAPI) {
       throw new Error(`Inherited MCP is unavailable in this child: ${boot.error}`);
     }
     if (params.action === "list" && !params.server) {
-      // Discovery level 1: configured servers and policy only — cold start
-      // does not connect anything.
+      // level 1: cold start connects nothing
       const report = servers.map((cfg) => ({
         server: cfg.name,
         transport: cfg.transport,
@@ -706,17 +648,14 @@ export default async function (pi: ExtensionAPI) {
     const cfg = servers.find((s) => s.name === serverName);
     if (!cfg) throw new Error(`Unknown server ${serverName}; use action=list`);
     if (params.action === "list") {
-      // Discovery level 2: connect THIS server on demand (no other optional
-      // server is started) and list its VISIBLE tools — parent deny/allow and
-      // the child access rule are applied here, not just at call time.
+      // level 2: connect THIS server on demand; visibility rules apply here, not just at call time
       const conn = await ensureConnection(cfg, signal);
       const tools = await conn.ensureTools(cfg, signal);
       const visible = tools.filter((t) => toolVisible(cfg, t));
       const entries = visible.map((t) => ({ name: t.name, description: t.description ?? "", read_only: t.readOnly }));
-      // Byte bound WITHOUT breaking the JSON: drop whole entries until it fits.
       let truncated = conn.catalogTruncated || visible.length !== tools.length;
       while (JSON.stringify({ server: serverName, tools: entries, truncated }).length > MAX_RESULT_TEXT && entries.length > 0) {
-        entries.pop();
+        entries.pop();  // byte bound without breaking the JSON: drop whole entries
         truncated = true;
       }
       const report = { server: serverName, transport: cfg.transport, tools: entries, truncated };
@@ -743,12 +682,9 @@ export default async function (pi: ExtensionAPI) {
         throw new Error(`Tool ${serverName}.${toolName} has no usable inputSchema (missing or larger than ${MAX_SCHEMA_BYTES} bytes)`);
       }
       const report = { server: serverName, tool: toolMeta.name, description: toolMeta.description, inputSchema: toolMeta.inputSchema };
-      // inputSchema is validated <= MAX_SCHEMA_BYTES at discovery time, so this
-      // JSON always fits the result bound; no string slicing that could break it.
       return { content: [{ type: "text", text: JSON.stringify(report) }], details: report };
     }
-    // action === "call" — the same effective policy as list/describe, checked
-    // against the CURRENT metadata right before execution.
+    // action === "call": same effective policy, checked against current metadata right before execution
     if (!toolVisible(cfg, toolMeta)) {
       throw new Error(`Tool ${serverName}.${toolName} is not available to this managed child (access=${access}; only explicitly read-only tools are exposed)`);
     }
@@ -759,20 +695,18 @@ export default async function (pi: ExtensionAPI) {
         `Allow inherited MCP call ${serverName}.${toolName}? args: ${argsPreview}`,
       );
       if (!ok) {
-        // Denial is not an error: nothing was called.
-        return { content: [{ type: "text", text: "Approval denied; the MCP tool was not called" }], details: { confirmed: false } };
+        return { content: [{ type: "text", text: "Approval denied; the MCP tool was not called" }], details: { confirmed: false } };  // denial is not an error
       }
     }
     if (signal?.aborted) throw new CancelledError(false);
     try {
       const result = await conn.callTool(toolName, params.args ?? {}, cfg.tool_timeout_sec, signal) as { isError?: boolean } | undefined;
       const text = describeResult(result);
-      // MCP isError must surface as a real tool error (Pi sets isError on throw).
-      if (result?.isError) throw new Error(`MCP tool reported failure: ${text.slice(0, 1000)}`);
+      if (result?.isError) throw new Error(`MCP tool reported failure: ${text.slice(0, 1000)}`);  // Pi sets isError on throw
       return { content: [{ type: "text", text }], details: { server: serverName, tool: toolName } };
     } catch (err) {
       if ((err as Error).name === "AbortError" || (err as Error).name === "CancelledError") throw new CancelledError(true);
-      // Failures are never retried automatically: a tools/call may have had side effects.
+      // no automatic retry: a tools/call may have had side effects
       throw new Error(`MCP call ${serverName}.${toolName} failed: ${(err as Error).message.slice(0, 500)}`);
     }
   }
@@ -791,9 +725,8 @@ export default async function (pi: ExtensionAPI) {
     execute,
   });
 
-  // Readiness receipt: structured, non-secret, exact. Required servers are
-  // initialized eagerly so the daemon knows dependencies work BEFORE any task
-  // is sent; optional servers stay lazy.
+  // Readiness receipt: required servers initialize eagerly so the daemon knows
+  // dependencies work BEFORE any task is sent; optional servers stay lazy.
   const receiptFd = process.env.PI_AGENTS_BRIDGE_RECEIPT_FD;
   delete process.env.PI_AGENTS_BRIDGE_RECEIPT_FD;
   const agent = boot.payload?.agent;

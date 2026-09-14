@@ -83,7 +83,6 @@ def launch_spec(config, profile_name, model, cwd, access):
     env = p.get('env',{})
     if not isinstance(env,dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in env.items()):
         raise AgentError('invalid_config','profile env must contain string values')
-    # Keep only explicitly provided environment in the snapshot; inherited credentials are never serialized.
     argv = [executable,*config['pi_command'][1:],'--mode','rpc']
     if not p.get('ambient_extensions',False): argv.append('--no-extensions')
     if not p.get('ambient_skills',False): argv.append('--no-skills')

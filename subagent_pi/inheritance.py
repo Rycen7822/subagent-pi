@@ -1,10 +1,6 @@
-"""Narrow Codex-source resolver: codex home, global skills, and in-memory MCP config.
-
-Everything here reads the original files at resolution time and returns plain
-in-memory structures. Nothing writes configuration, snapshots, or caches.
-Secrets (env values) are resolved only in the daemon process and only for the
-bound scope; diagnostics never contain values, only names and sources.
-"""
+"""Narrow Codex-source resolver: codex home, global skills, in-memory MCP config.
+Reads original files at resolution time; secrets resolve only in the daemon for
+the bound scope, and diagnostics carry names/sources, never values."""
 from __future__ import annotations
 from pathlib import Path
 import re
@@ -41,9 +37,7 @@ def redact_url(url: str) -> str:
 
 class Diagnostic:
     def __init__(self, scope: str, name, reason: str):
-        # Diagnostics cross JSON boundaries (events, doctor, responses). Path
-        # objects and other non-string names are coerced here, at the edge, so
-        # serialization never fails on a missing directory or odd config value.
+        # diagnostics cross JSON boundaries; coerce names at the edge
         self.scope, self.name, self.reason = scope, (name if isinstance(name, str) else str(name)), reason
     def as_dict(self):
         return {'scope': self.scope, 'name': self.name, 'reason': self.reason}
@@ -51,12 +45,8 @@ class Diagnostic:
 
 def resolve_codex_home(config, source_env: dict | None) -> tuple[Path | None, str]:
     """Explicit trusted setting -> scope-bound CODEX_HOME -> ~/.codex.
-
-    Accepts either the full plugin config or its [inheritance] table directly.
-    A configured source that does not exist is an error, never a silent
-    fallback to another candidate: only an UNSET source falls back, and only
-    the user default may be absent (reported as empty capability).
-    """
+    A configured source that does not exist is an error, never a silent fallback:
+    only an UNSET source falls back, and only the user default may be absent."""
     inh = config.get('inheritance', config) if isinstance(config, dict) else {}
     explicit = inh.get('codex_home') if isinstance(inh, dict) else None
     if explicit:
@@ -115,12 +105,9 @@ def _disabled_skill_paths(codex_home: Path, raw: dict) -> set[Path]:
 
 def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
                    existing_skill_paths: list[str]) -> tuple[list[str], list[Diagnostic]]:
-    """Resolve managed-child skill sources, original paths only.
-
-    Sources: existing profile paths (kept as-is), project .agents/skills under the
-    scope cwd, and <codex_home>/skills. Dedup by real path; name conflicts refuse
-    ambiguity; disabled entries from [[skills.config]] are honored.
-    """
+    """Resolve managed-child skill sources (existing profile paths, project
+    .agents/skills, <codex_home>/skills); dedup by real path, refuse ambiguous
+    name conflicts, honor disabled entries."""
     diagnostics: list[Diagnostic] = []
     selected: list[str] = []
     by_real: dict[Path, str] = {}
@@ -160,7 +147,7 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
                 continue
             real = entry.resolve()
             if real in by_real:
-                continue  # same real path already provided by project/profile source
+                continue  # already provided by project/profile source
             label = entry.name
             if (entry / 'agents').is_dir():
                 diagnostics.append(Diagnostic('skills', label,
@@ -191,18 +178,11 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
 
 
 def _tool_policy(server: dict, name: str) -> tuple[dict, list[Diagnostic]]:
-    """Effective policy model for one server.
-
-    Returns (policy, diagnostics); policy = {'default': 'auto'|'confirm',
-    'tools': {name: 'auto'|'confirm'}, 'denied': sorted deny list}. For each
-    tool the effective mode is the per-tool approval_mode override, else the
-    server default, else 'prompt'. Values this bridge cannot enforce
-    ('writes', unknown strings) degrade to 'confirm' with a named diagnostic;
-    a per-tool 'auto' can never lift a child-side mandatory confirmation (the
-    child rule is applied separately and wins). Tool config keys this plugin
-    cannot honor (for example output_token_limit) deny that tool outright
-    instead of being silently ignored.
-    """
+    """Effective policy for one server: {'default', 'tools', 'denied'}. Per-tool
+    approval overrides the server default; 'writes'/unknown modes degrade to
+    'confirm' with a diagnostic; per-tool 'auto' never lifts a child-side
+    mandatory confirmation; tool config keys this plugin cannot honor deny the
+    tool outright instead of being silently ignored."""
     diagnostics: list[Diagnostic] = []
     mode = server.get('default_tools_approval_mode', 'prompt')
     if mode not in APPROVAL_MODES:
@@ -218,9 +198,7 @@ def _tool_policy(server: dict, name: str) -> tuple[dict, list[Diagnostic]]:
         if not isinstance(tool_cfg, dict):
             continue
         unknown = set(tool_cfg) - {'approval_mode'}
-        if unknown:
-            # Authorization/output limits we do not implement must not be
-            # accepted-and-ignored: the tool is denied with a reason instead.
+        if unknown:  # unimplementable authorization/output limits must not be accepted-and-ignored
             denied.add(tool_name)
             diagnostics.append(Diagnostic('mcp', f'{name}.{tool_name}',
                                           f'denied: unsupported tool config keys cannot be honored: {sorted(unknown)}'))
@@ -251,12 +229,9 @@ def _int_field(server: dict, key: str, default: int) -> tuple[int, list[Diagnost
 
 def _resolve_self_paths(command: str, args: list[str], cwd: str | None,
                         codex_home: Path) -> list[Path]:
-    """All paths this server's execution definition could resolve to.
-
-    Covers the command itself, absolute/relative entry-script args (including
-    the installer-generated `python <...>/bin/subagent-pi mcp` wrapper) and
-    `python -m subagent_pi` module forms. No configured command is executed.
-    """
+    """Every path this server's execution definition could resolve to: the command,
+    absolute/relative entry-script args (including the installer's
+    `python <...>/bin/subagent-pi mcp` wrapper) and `-m subagent_pi` forms."""
     candidates: list[Path] = []
     resolved_command = shutil.which(command) if not Path(command).is_absolute() else None
     raw = Path(resolved_command or command).expanduser()
@@ -304,14 +279,10 @@ def _enabled_tools(server: dict) -> list[str] | None:
     return sorted(set(enabled))
 
 def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Diagnostic]]:
-    """Convert [mcp_servers.*] TOML into normalized in-memory server configs.
-
-    Values are NOT resolved here (no environment access). Every declared server
-    keeps a disposition ('ok' | 'failed' | 'disabled') and, for failed ones, its
-    reasons — a failed required server must not silently vanish. Unknown keys
-    that affect execution or authorization mark the server failed with an
-    explicit reason; the rest of the config continues.
-    """
+    """Convert [mcp_servers.*] TOML into normalized in-memory server configs (no
+    environment access here). Every declared server keeps a disposition
+    ('ok'|'failed'|'disabled') with reasons; unknown keys that affect execution
+    or auth mark the server failed instead of being ignored."""
     diagnostics: list[Diagnostic] = []
     servers: list[dict] = []
     table = raw.get('mcp_servers')
@@ -408,34 +379,25 @@ def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Dia
                         raise AgentError('invalid_argument', 'cwd must be a path string')
                     cwd_path = Path(cwd).expanduser()
                     if not cwd_path.is_absolute():
-                        # Codex does not document relative-cwd resolution; anchor it to the
-                        # config source directory and record the decision.
+                        # Codex does not document relative-cwd resolution; anchor to the config source.
                         cwd_path = (codex_home / cwd_path).resolve()
                         diagnostics.append(Diagnostic('mcp', name, f'relative cwd anchored to codex home: {cwd_path}'))
                     cwd = str(cwd_path)
                 entry.update(command=command, args=args, static_env=dict(env_static),
                              env_var_names=sorted(set(refs)), cwd=cwd)
-                if _is_self_server(entry, codex_home):
-                    # Recursion guard by execution definition: covers the direct
-                    # entrypoint, symlinks, the installer's python+script wrapper
-                    # and `-m subagent_pi` forms. Renaming the server evades nothing.
+                if _is_self_server(entry, codex_home):  # recursion guard by execution definition, rename-evasive
                     raise AgentError('invalid_argument', 'subagent-pi management server (recursion guard)')
             servers.append(entry)
         except AgentError as exc:
-            servers.append({'name': name, 'transport': transport, 'required': required,
-                            'disposition': 'failed', 'reasons': [exc.message]})
-            diagnostics.append(Diagnostic('mcp', name, f'disabled: {exc.message}'))
+            _failed(name, transport, required, exc.message)
     return servers, diagnostics
 
 
 def resolve_environment(servers: list[dict], env_snapshot: dict) -> tuple[list[dict], list[Diagnostic]]:
     """Fill referenced env values from the bound scope snapshot, in memory only.
-
-    Missing values mark the server disposition='failed' with named reasons —
-    required servers are never silently dropped. After collecting every
-    failure, required servers abort with inheritance_required_server_failed so
-    a spawn/respawn cannot start a task with a missing dependency.
-    """
+    Missing values fail the server with named reasons; required failures abort
+    with inheritance_required_server_failed so a spawn never starts a task with
+    a missing dependency."""
     diagnostics: list[Diagnostic] = []
     required_failures: list[str] = []
     for server in servers:
@@ -485,16 +447,10 @@ def resolve_environment(servers: list[dict], env_snapshot: dict) -> tuple[list[d
 
 
 def policy_filter(servers: list[dict], access: str) -> tuple[list[dict], list[Diagnostic]]:
-    """Child-limit intersection for read children.
-
-    The parent's enabled_tools declares what children may use at all; it is not
-    a read-safety endorsement of each tool. A read child WITH an explicit
-    allowlist may call exactly those tools, subject to the inherited approval
-    policy. A read child WITHOUT an allowlist sees only readOnly-advertised
-    tools and every call confirms (confirm_all) — parent-side 'auto' can never
-    relax this child rule, and readOnlyHint is a server self-report, not a
-    trusted capability, so it only affects visibility.
-    """
+    """Child-limit intersection for read children. The parent's enabled_tools is a
+    parent-side declaration, not a read-safety endorsement; a read child without
+    an allowlist sees only readOnly-advertised tools and confirms every call
+    (confirm_all) — parent-side 'auto' can never relax this child rule."""
     diagnostics: list[Diagnostic] = []
     if access == 'write':
         return servers, diagnostics
@@ -510,8 +466,8 @@ def policy_filter(servers: list[dict], access: str) -> tuple[list[dict], list[Di
 
 def capture_scope_env(codex_home: Path | None, environ: dict,
                       extra_names: list[str] | tuple[str, ...] = ()) -> dict:
-    """Client-side snapshot: base keys plus every var the current config references
-    plus explicitly authorized child-env names (inheritance.child_env)."""
+    """Client-side snapshot: base keys + vars the config references + authorized
+    child-env names, bounded in count and size."""
     names = set(BASE_ENV_KEYS) | {n for n in extra_names if isinstance(n, str) and n.strip()}
     if codex_home is not None:
         try:
@@ -528,8 +484,8 @@ def capture_scope_env(codex_home: Path | None, environ: dict,
 
 
 def referenced_env_names(servers: list[dict]) -> set[str]:
-    """Env var NAMES a server list references (headers' values, bearer var, args).
-    Includes the base keys so callers can treat one set as the full allowlist."""
+    """Env var NAMES a server list references, including base keys, so callers can
+    treat one set as the full allowlist."""
     names: set[str] = set(BASE_ENV_KEYS)
     for server in servers:
         names.update(server.get('env_var_names', []))
@@ -540,13 +496,10 @@ def referenced_env_names(servers: list[dict]) -> set[str]:
 
 
 def scope_source_snapshot(home: Path, environ: dict) -> dict:
-    """Trusted client-side snapshot for scope binding: codex home resolution plus
-    the minimal env capture (base keys, referenced vars, authorized child-env
-    names). Called by the CLI launcher and the Codex-spawned MCP adapter; the
-    values live in daemon memory only and are never model-visible.
-    When the inheritance master switch is off this binds ONLY the base worker
-    environment: no Codex directory is read or resolved, so an invalid or
-    missing CODEX_HOME cannot break a normal worker start."""
+    """Trusted client-side snapshot for scope binding (CLI launcher and Codex-spawned
+    MCP adapter). With the inheritance master switch off this binds ONLY the base
+    worker environment: no Codex directory is read, so an invalid or missing
+    CODEX_HOME cannot break a normal worker start."""
     from .config import load_config  # local import: config owns the state home layout
     cfg = load_config(home)
     inh = cfg['inheritance']

@@ -59,15 +59,9 @@ def read_input(path):
     return sys.stdin.read(65537) if path=='-' else Path(path).expanduser().read_text(encoding='utf-8')
 
 def split_codex_cwd(tail):
-    """Read-only scan for Codex's -C/--cd (and --cd=DIR / -CDIR attached forms)
-    before the first `--` separator.
-
-    Returns (cwd_or_None, original_args): the arguments are returned VERBATIM —
-    the launcher must not strip the flag, because Codex applies it itself and
-    stripping it would leave Codex in the wrong project. The last occurrence
-    wins, matching flag-assignment semantics. Anything after `--` is left
-    alone, so a prompt that merely mentions --cd is never mistaken for one.
-    """
+    """Read-only scan for Codex's -C/--cd (also --cd=DIR / -CDIR) before the first
+    `--`; last occurrence wins. Arguments are returned VERBATIM: Codex applies the
+    chdir itself, so stripping the flag would leave it in the wrong project."""
     cwd=None; after_dd=False; i=0
     while i<len(tail):
         a=tail[i]
@@ -129,11 +123,7 @@ async def execute(args):
         exe=shutil.which('codex')
         if not exe: raise AgentError('codex_not_found','codex was not found on PATH')
         tail=args.codex_args[1:] if args.codex_args[:1]==['--'] else args.codex_args
-        # Read-only scan: bind the scope to Codex's actual working directory
-        # (-C/--cd), then exec Codex with the ORIGINAL arguments so Codex applies
-        # the chdir itself. Stripping the flag here left Codex in the launcher's
-        # directory while the scope pointed elsewhere.
-        found,rest=split_codex_cwd(tail)
+        found,rest=split_codex_cwd(tail)  # bind the scope to Codex's actual cwd; exec Codex verbatim
         cwd=os.getcwd()
         if found is not None:
             candidate=Path(found).expanduser()
@@ -167,10 +157,7 @@ async def execute(args):
 def main():
     argv=sys.argv[1:]
     if argv[:1]==['codex'] and argv[1:2] and argv[1].startswith('-') and argv[1] not in ('--','-h','--help'):
-        # argparse REMAINDER does not capture a leading flag after the subcommand
-        # (bpo-17050). The launcher must accept ANY Codex argument verbatim, so a
-        # leading -C/--cd/--cd= form is routed through the -- separator instead.
-        argv=['codex','--',*argv[1:]]
+        argv=['codex','--',*argv[1:]]  # argparse REMAINDER cannot capture a leading flag (bpo-17050)
     args=parser().parse_args(argv)
     try:
         result=asyncio.run(execute(args))

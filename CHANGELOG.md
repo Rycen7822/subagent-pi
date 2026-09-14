@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.3 — 2026-09-14
+
+- P1 (receipt fd ownership): the receipt read end now has exactly one closer.
+  `_read_receipt` takes ownership of the fd on entry and closes it exactly
+  once on every path (success, malformed receipt, required-server failure,
+  timeout, cancellation, transport-creation failure); `boot_worker` transfers
+  ownership BEFORE awaiting, so its failure cleanup can no longer close an fd
+  number that another connection reclaimed during `terminate`. Previously a
+  boot failure could double-close the receipt fd and kill an unrelated agent's
+  RPC pipe or CLI/MCP IPC socket in the shared daemon (reproduced with a real
+  socketpair reclaiming the freed number: peer EPIPE / writer EBADF).
+  Regressions: boot-level test re-occupies the freed receipt fd with a live
+  socketpair inside the cleanup window and asserts it stays functional, plus
+  fd-closed-exactly-once tests for the timeout, cancellation and
+  transport-creation-failure paths. Red verified against a0cf6cb.
+
 ## 0.2.2 — 2026-09-14
 
 Five P1 fixes found by the d7ff1e9 review; each has a regression that was

@@ -1,7 +1,4 @@
-"""Dependency-free MCP JSON-RPC stdio subset: initialization, tools, ping, cancellation.
-
-No notifications are advertised as model wakeups. No network transport or sampling.
-"""
+"""Dependency-free MCP JSON-RPC stdio subset: initialize, tools, ping, cancellation."""
 from __future__ import annotations
 import asyncio
 import json
@@ -52,9 +49,7 @@ async def serve_mcp(home):
                 timeout=max(45,args.get('timeout_ms',0)/1000+10)
                 source=None
                 if spec['_op']=='scope_open':
-                    # Attach the trusted source snapshot from this Codex-spawned process;
-                    # the model never sees or fills these values.
-                    from .inheritance import scope_source_snapshot
+                    from .inheritance import scope_source_snapshot  # trusted values never pass through the model
                     source=scope_source_snapshot(home,dict(os.environ))
                 value=await request(home,spec['_op'],args,timeout=timeout,source=source)
                 if spec['_op']=='scope_open': bound_scopes[args['cwd']]=value['scope']
@@ -66,8 +61,7 @@ async def serve_mcp(home):
                 await output({'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':dumps({'error':e.as_dict()})}],'isError':True}})
             else: await error(rid,-32602,e.message)
         except asyncio.CancelledError:
-            # Cancelling the client wait never cancels Pi. The daemon owns admitted mutations.
-            return
+            return  # cancelling the client wait never cancels the daemon-owned mutation
         except Exception as e:
             print(f'MCP: {type(e).__name__}: {e}',file=sys.stderr)
             await error(rid,-32603,'Internal error; check the local daemon log')

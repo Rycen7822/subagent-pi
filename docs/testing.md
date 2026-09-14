@@ -21,6 +21,8 @@ bridge 主机测试（tests/test_bridge_host.py + tests/bridge_host.mjs）用 ji
 
 上述五项核心回归均做过红-绿验证：对 d7ff1e9（未修复实现）运行会失败，对修复后代码通过。
 
+回执 FD 所有权测试（test_runtime.ReceiptFdOwnership）在真实启动失败路径中，用 socketpair 在 `terminate` 清理窗口内抢占已释放的回执 FD 编号，断言失败路径不触碰新连接（修复前该 socket 被 `finally` 误关、写端 EBADF）；并覆盖超时/取消/transport 创建失败三条路径的“恰好关闭一次”。
+
 TypeScript 类型检查（一次性 `npm install && npm run setup`，仅开发期，固定 typescript 版本，运行时零 npm 依赖）：
 
 ```bash

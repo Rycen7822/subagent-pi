@@ -39,6 +39,8 @@ def read_bootstrap():
         receipt={'kind':'subagent-pi-bridge-receipt','v':1,
                  'agent':payload.get('agent',{}).get('id'),'generation':payload.get('agent',{}).get('generation'),
                  'state':'ready','servers':[{'name':s['name'],'status':'lazy','required':bool(s.get('required'))} for s in servers]}
+        if os.environ.get('PI_TEST_RECEIPT_STATUS')=='failed_required' and receipt['servers']:
+            receipt={**receipt,'state':'ready','servers':[{**s,'status':'failed','required':True} for s in receipt['servers']]}
     except Exception:
         print('subagent-pi-bridge ready servers=0 error=malformed',file=sys.stderr,flush=True)
         receipt={'kind':'subagent-pi-bridge-receipt','v':1,'agent':None,'generation':None,'state':'failed','servers':[]}

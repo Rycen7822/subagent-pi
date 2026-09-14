@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import sys
 import time
 from . import __version__, PROTOCOL_VERSION
@@ -93,7 +94,6 @@ class Worker:
             asyncio.create_task(self.rt.fail_worker(self,self.error))
     async def read_stderr(self):
         path = self.rt.home/'agents'/self.agent['id']/'stderr.log'
-        total = 0
         with path.open('ab') as f:
             total = f.tell()
             while True:
@@ -103,8 +103,7 @@ class Worker:
                     data = chunk[:512*1024-total]; f.write(data); f.flush(); total += len(data)
     async def watch_exit(self):
         code = await self.proc.wait()
-        # Pipe readers must consume a final agent_end before exit reconciliation.
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception):  # consume a final agent_end before reconciliation
             await asyncio.wait_for(asyncio.shield(self.tasks[0]),2)
         self.closed = True
         for future in list(self.pending.values()):
@@ -117,8 +116,7 @@ class Runtime:
         self.store = Store(home)
         self.config = load_config(home)
         self.workers = {}
-        # Bound scope env snapshots; secret values live here and nowhere else.
-        self.scope_env = {}
+        self.scope_env = {}  # bound snapshots; secret values live here and nowhere else
         self.agent_locks = defaultdict(asyncio.Lock)
         self.request_locks = defaultdict(asyncio.Lock)
         self.admission = asyncio.Lock()
@@ -128,20 +126,13 @@ class Runtime:
         self.background = set()
         self._restore()
 
-    # ---------- Codex inheritance (managed children only) ----------
-
     def _resolve_source(self, source_env):
         return resolve_codex_home(self.config['inheritance'], source_env)
 
     def _inheritance_plan(self, a, spec, generation):
-        """Rebuild managed-child inheritance from original sources at boot time.
-
-        Persisted launch argv is never touched; additions are recomputed for every
-        new process, so respawn never accumulates stale flags. Secrets are resolved
-        into the pipe payload only; diagnostics carry names, never values.
-        Project .agents resources resolve against this worker's effective cwd
-        (the spawn directory), not merely the scope root.
-        """
+        """Recompute managed-child inheritance from the original sources at boot.
+        The persisted launch argv is never touched; secrets resolve into the pipe
+        payload only, diagnostics carry names, never values."""
         inh = self.config['inheritance']
         empty = {'argv': [], 'payload': None, 'diagnostics': [], 'bridge': False, 'servers': []}
         if not inh.get('enabled'):
@@ -150,16 +141,13 @@ class Runtime:
         if not scope['inheritance']:
             return {**empty, 'reason': 'inheritance disabled for this scope'}
         source_env = self.scope_env.get(a['scope'])
-        # The scope binding (made when a trusted client opened the scope) is the
-        # stable source pointer; re-resolving only fills gaps for legacy scopes.
         if scope['codex_home']:
             codex_home, mode = Path(scope['codex_home']), scope['codex_source'] or 'scope_env'
         elif source_env and isinstance(source_env.get('CODEX_HOME'), str) and source_env['CODEX_HOME'].strip():
             codex_home, mode = self._resolve_source(source_env)
         elif scope['codex_source']:
-            # The scope HAD a source binding but the daemon restart wiped the
-            # in-memory/scope snapshot: never silently fall back to some other
-            # Codex home (e.g. the daemon user's ~/.codex). Demand a rebind.
+            # A restart wiped the snapshot: never fall back to another Codex home
+            # (e.g. the daemon user's ~/.codex); demand an explicit rebind.
             raise AgentError('inheritance_source_unbound',
                              'Scope lost its codex source binding after a daemon restart; the owning client must re-open the scope')
         else:
@@ -175,8 +163,6 @@ class Runtime:
         servers, mcp_diag = [], []
         if inh.get('mcp', True):
             servers, mcp_diag = parse_mcp_servers(codex_home, raw)
-            # A parse-level failure must not erase a required server: dispositions
-            # carry the reason and required failures abort the boot below.
             servers, env_diag = resolve_environment(servers, source_env or {})
             mcp_diag += env_diag
             servers, access_diag = policy_filter(servers, spec['access'])
@@ -196,8 +182,6 @@ class Runtime:
         payload = None
         if load_bridge:
             argv += ['--extension', str(bridge_path)]
-            # The bridge tool is merged into the full launch allowlist in
-            # boot_worker (a second --tools flag would wipe the existing one).
             internal = ('env_var_names', 'env_header_names', 'static_env', 'static_headers',
                         'disposition', 'reasons')
             payload = {'v': 1,
@@ -209,16 +193,11 @@ class Runtime:
 
     @staticmethod
     def _merge_bridge_tool(argv, tool='codex_mcp'):
-        """Merge the bridge tool into Pi's tool allowlist over the FULL launch argv.
-
-        Pi's CLI parser assigns on every --tools occurrence, so the last flag wins;
-        appending a second --tools would wipe the reader/writer builtin allowlist.
-        The merged list is serialized exactly once. Cases:
-        - existing --tools/-t: append the bridge tool to that single flag;
-        - --no-tools: keep "no builtin tools" but allow exactly the bridge tool;
-        - no tool flag at all (custom pi_command): leave argv untouched — Pi then
-          allows extension tools by default, and a bare --tools would strip builtins.
-        Called only when the bridge is loaded (plan['bridge']).
+        """Merge the bridge tool into Pi's single tool allowlist over the FULL argv.
+        Pi's CLI parser assigns on every --tools occurrence (last wins), so appending
+        a second flag would wipe the builtin reader/writer allowlist. With no tool
+        flag at all, argv is left untouched: Pi then allows extension tools by
+        default, and a bare --tools would strip builtins.
         """
         i = next((k for k, x in enumerate(argv) if x in ('--tools', '-t')), None)
         if i is not None and i + 1 < len(argv):
@@ -238,10 +217,10 @@ class Runtime:
             view = view[written:]
 
     async def _write_bootstrap(self, fd, agent_id, generation, data):
-        """Write the payload from a worker thread; the thread owns the fd and
-        closes it when the write finishes or breaks. A timeout abandons the
-        WAIT, never the write mid-close: closing an fd another thread may still
-        use risks writing into a reused descriptor."""
+        """Write the payload from a worker thread. The thread owns the fd and closes
+        it when the write finishes or breaks; a timeout abandons the wait, never the
+        write mid-close (closing an fd another thread still uses risks writing into
+        a reused descriptor)."""
         def _write_and_close():
             try:
                 self._write_all(fd, data)
@@ -253,8 +232,7 @@ class Runtime:
                     os.close(fd)
         try:
             status = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, _write_and_close), 30)
-            # Store writes happen on the event-loop thread (sqlite is single-thread bound).
-            if status == 'broken':
+            if status == 'broken':  # store writes stay on the event-loop thread (sqlite is single-thread bound)
                 self.store.event(agent_id, None, generation, 'bootstrap_write_failed', {'error': 'BrokenPipeError'})
         except asyncio.TimeoutError:
             self.store.event(agent_id, None, generation, 'bootstrap_write_timeout', {})
@@ -268,7 +246,7 @@ class Runtime:
         t.add_done_callback(done)
         return t
     def _restore(self):
-        # A new daemon cannot recover old pipes. Never claim a live orphan is reattached.
+        # A new daemon cannot recover old pipes; never claim a live orphan is reattached.
         for a in self.store.all('SELECT * FROM agents'):
             path = self.home/'agents'/a['id']/'owner.json'
             owner = {}
@@ -301,8 +279,7 @@ class Runtime:
         kind = e.get('type','unknown')
         w.last_activity = now()
         if kind == 'message_update':
-            # Keep text deltas out of SQLite hot path; message_end is canonical text.
-            return
+            return  # keep text deltas out of SQLite; message_end is canonical
         if kind in {'tool_execution_start','tool_execution_update','tool_execution_end'}:
             if kind == 'tool_execution_start': w.current_tool=e.get('toolName')
             if kind == 'tool_execution_end': w.current_tool=None
@@ -352,12 +329,9 @@ class Runtime:
 
     def _child_env(self, sid, spec):
         """Base environment for the guard/Pi child, built from the scope's bound
-        snapshot — never a copy of the daemon's own environment. Session B gets
-        B's PATH/HOME and credentials, not whoever started the daemon. Model
-        authentication keeps working via HOME-based auth files; env-based auth
-        requires explicitly configured names (inheritance.child_env). Profile
-        env values come from the current config, never from the persisted copy.
-        """
+        snapshot — never a copy of the daemon's environ. Env-based model auth
+        requires explicitly configured names (inheritance.child_env); profile env
+        values come from the current config, never from the persisted copy."""
         snapshot = self.scope_env.get(sid) or {}
         inh = self.config['inheritance']
         allowed = set(BASE_KEYS) | {k for k in inh.get('child_env', []) if isinstance(k, str)}
@@ -370,18 +344,29 @@ class Runtime:
         return env
 
     async def _read_receipt(self, fd, aid, generation, timeout):
-        """Read the bridge's structured receipt straight from the pipe (in-memory
-        stream, not the size-capped stderr.log) and parse it exactly."""
+        """Read and parse the bridge's structured receipt from the pipe (in-memory,
+        not the size-capped stderr.log). Ownership: the caller hands over the fd
+        before awaiting; this method closes it exactly once on every path (success,
+        malformed receipt, required-server failure, timeout, cancellation,
+        transport-creation failure). The caller must not close it again — a second
+        close during failure cleanup could hit an fd another connection reclaimed."""
         loop = asyncio.get_running_loop()
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
-        transport, _ = await loop.connect_read_pipe(lambda: protocol, os.fdopen(fd, 'rb', buffering=0))
+        pipe = os.fdopen(fd, 'rb', buffering=0)
+        transport = None
         try:
+            try:
+                transport, _ = await loop.connect_read_pipe(lambda: protocol, pipe)
+            except BaseException:
+                pipe.close()  # connect_read_pipe failed without adopting the pipe
+                raise
             line = await asyncio.wait_for(reader.readline(), timeout)
         except asyncio.TimeoutError:
-            transport.close()  # owns the fd after connect_read_pipe
             raise AgentError('bridge_unavailable', 'Managed MCP bridge did not report readiness in time; inspect the agent stderr log')
-        transport.close()
+        finally:
+            if transport is not None:
+                transport.close()  # owns the fd; idempotent
         if not line:
             raise AgentError('bridge_unavailable', 'Managed MCP bridge closed without a readiness receipt; inspect the agent stderr log')
         try:
@@ -402,24 +387,29 @@ class Runtime:
             raise AgentError('bridge_unavailable', 'Managed MCP bridge reported failure to start; inspect the agent stderr log')
         return receipt
 
+    def _assert_writer_exclusive(self, aid, cwd):
+        """Only one managed writer may own a cwd subtree at a time (a read label
+        strips mutation builtins; it is not OS confinement)."""
+        q="SELECT * FROM agents WHERE id!=? AND (state IN ('starting','running','needs_input','idle','orphaned','stopping') OR cleanup='unknown')"
+        for other in self.store.all(q,(aid,)):
+            if json.loads(other['launch']).get('access')!='write': continue
+            left,right=Path(cwd),Path(other['cwd'])
+            if left.is_relative_to(right) or right.is_relative_to(left):
+                raise AgentError('writer_conflict','Another managed writer owns an overlapping cwd; close it or use read access',agent_id=other['id'])
+
     async def boot_worker(self, a):
         aid=a['id']
         if len([w for w in self.workers.values() if not w.closed]) >= self.config['max_resident_agents']:
             raise AgentError('capacity_exceeded','Resident Pi limit reached; close an idle agent first')
         spec=json.loads(a['launch'])
         if spec.get('access')=='write':
-            for other in self.store.all("SELECT * FROM agents WHERE id!=? AND (state IN ('starting','running','needs_input','idle','orphaned','stopping') OR cleanup='unknown')",(aid,)):
-                if json.loads(other['launch']).get('access')!='write': continue
-                left,right=Path(a['cwd']),Path(other['cwd'])
-                if left.is_relative_to(right) or right.is_relative_to(left):
-                    raise AgentError('writer_conflict','Another managed writer owns overlapping cwd',agent_id=other['id'])
+            self._assert_writer_exclusive(aid,a['cwd'])
         directory=self.home/'agents'/aid
         private_dir(directory)
         session=Path(a['session_file'])
         if session.is_symlink(): raise AgentError('unsafe_session','Managed session path must not be a symlink')
         if a['generation'] and (not session.exists() or session.stat().st_size==0):
             raise AgentError('session_unavailable','Previous Pi session is missing or empty; create a new agent explicitly')
-        spec=json.loads(a['launch'])
         generation=a['generation']+1
         first_launch = a['generation']==0
         if first_launch:
@@ -427,15 +417,12 @@ class Runtime:
             argv=[*spec['argv'],'--session-dir',str(directory/'sessions')]
         else:
             argv=[*spec['argv'],'--session',str(session)]
-        # Inherited skills/extensions are rebuilt from the original sources on every
-        # boot; the persisted launch spec and argv stay untouched.
+        # Inherited skills/extensions are rebuilt from original sources on every boot;
+        # the persisted launch spec and argv stay untouched.
         plan=self._inheritance_plan(a,spec,generation)
         argv=[*argv,*plan['argv']]
-        # F01: Pi assigns on every --tools occurrence, so the bridge tool must be
-        # merged into the single allowlist over the FULL argv — never appended as
-        # a second flag, which would wipe the reader/writer builtin tools.
         if plan['bridge']:
-            argv=self._merge_bridge_tool(argv)
+            argv=self._merge_bridge_tool(argv)  # never a second --tools flag
         payload={**spec,'argv':argv,'generation':generation}
         atomic_json(directory/'launch.json',payload)
         if plan['diagnostics']:
@@ -453,14 +440,11 @@ class Runtime:
         try:
             self.store.agent_update(aid,state='starting',generation=generation,cleanup='pending')
             guard=Path(__file__).with_name('worker_guard.py')
-            # Structured child environment: the guard and Pi see the scope's own
-            # base env plus authorized names — not the daemon's full environ.
             guard_env=self._child_env(a['scope'],spec)
             pass_fds=()
             if bootstrap_r is not None:
                 guard_env['PI_AGENTS_BOOTSTRAP_FD']=str(bootstrap_r)
-                # The CHILD writes the receipt, so it gets the write end; the
-                # daemon keeps the read end and parses the JSON line itself.
+                # the child writes the receipt (write end), the daemon reads it (read end)
                 guard_env['PI_AGENTS_BRIDGE_RECEIPT_FD']=str(receipt_w)
                 pass_fds=(bootstrap_r,receipt_w)
             proc=await asyncio.create_subprocess_exec(sys.executable,str(guard),str(directory/'launch.json'),
@@ -492,12 +476,13 @@ class Runtime:
                     raise AgentError('unexpected_activity','Pi started a model turn without an explicit task')
                 if plan['payload'] is not None:
                     # get_state success does not prove the bridge loaded; require its
-                    # structured receipt for this exact agent generation. Required
-                    # servers must have initialized before any task is sent.
-                    await self._read_receipt(receipt_r,aid,generation,min(self.config['startup_timeout_seconds'],20))
-                    receipt_r=None
-                # Pin the actual model selected by Pi, so a later global default change
-                # does not silently alter a recovered agent's model.
+                    # structured receipt for this exact generation. Ownership transfers
+                    # before the await: _read_receipt closes the fd exactly once, so
+                    # failure cleanup below must not close it again.
+                    fd, receipt_r = receipt_r, None
+                    await self._read_receipt(fd,aid,generation,min(self.config['startup_timeout_seconds'],20))
+                # Pin the model Pi actually selected so a later global default
+                # change does not silently alter a recovered agent.
                 resolved_model=state.get('model')
                 if isinstance(resolved_model,dict) and resolved_model.get('id'):
                     if '--model' not in spec['argv']:
@@ -524,16 +509,11 @@ class Runtime:
                 with contextlib.suppress(OSError): os.close(receipt_w)
 
     def _bind_scope_source(self, sid, p, source):
-        """Bind a scope in two independent layers.
-
-        Layer 1 (ALWAYS): the worker base environment — PATH/HOME/etc. from the
-        opening client, plus explicitly authorized child_env names. Without it a
-        child cannot even find its interpreter; it must not depend on whether
-        Codex capability inheritance is enabled.
-        Layer 2 (only when the master switch is on): resolve and bind the Codex
-        source, so skills/MCP can be inherited. Secrets stay in memory only in
-        both layers.
-        """
+        """Bind a scope in two independent layers: layer 1 (always) the worker base
+        environment from the opening client plus authorized child_env names — a
+        child must find its interpreter whether or not Codex inheritance is on;
+        layer 2 (master switch on) the Codex source pointer. Secrets stay in
+        memory in both layers."""
         inh=self.config['inheritance']
         scope=self.store.scope(sid)
         env = source.get('env') if isinstance(source,dict) else None
@@ -549,13 +529,12 @@ class Runtime:
             if stored and home and Path(stored)!=Path(home) and explicit_home is None and p.get('inheritance') is None:
                 raise AgentError('inheritance_source_conflict',
                     f'Scope is bound to codex source {stored}; rebind explicitly with codex_home or inheritance parameters')
-        # A credential refresh must not silently flip the per-scope switch: keep
-        # the current state unless the client passes inheritance explicitly.
+        # A credential refresh must not silently flip the per-scope switch.
         enabled=bool(scope['inheritance'])
         if p.get('inheritance') is False: enabled=False
         elif p.get('inheritance') is True: enabled=True
-        # Layer-2 fields stay untouched while the master switch is off: re-enabling
-        # later must not find them clobbered by a disabled-era rebind.
+        # Layer-2 fields stay untouched while the master switch is off, so
+        # re-enabling later does not find them clobbered by a disabled-era rebind.
         self.store.execute('UPDATE scopes SET codex_home=?,codex_source=?,inheritance=? WHERE id=?',
             ((str(home) if home else scope['codex_home']) if master_enabled else scope['codex_home'],
              (mode if home else scope['codex_source']) if master_enabled else scope['codex_source'],
@@ -568,7 +547,7 @@ class Runtime:
                     names |= referenced_env_names(servers)
                 except AgentError:
                     pass
-            # Minimal per-scope snapshot: referenced names only; never persisted.
+            # Minimal per-scope snapshot: referenced names only, never persisted.
             self.scope_env[sid]={k:v for k,v in env.items() if k in names}
 
     def inheritance_doctor(self):
@@ -648,8 +627,7 @@ class Runtime:
                 state=await w.rpc('get_state')
                 if state.get('isStreaming') or state.get('pendingMessageCount',0)>0: return
             except AgentError:
-                # Closed process reconciliation handles this without asserting completion.
-                return
+                return  # closed-process reconciliation handles it; never assert completion
             self.store.finish(rid,'failed' if w.error else 'completed',w.last_text,w.error,w.usage)
             self.event(w,'run_terminal',{'state':'failed' if w.error else 'completed'})
             w.run_id=None; w.ui.clear(); w.current_tool=None
@@ -696,7 +674,7 @@ class Runtime:
         if not owned and group_members(pgid):
             self.store.agent_update(w.agent['id'],cleanup='unknown')
             return 'unknown'
-        # This live process was created by this daemon. Ownership is not inferred from an arbitrary PID.
+        # a live process created by this daemon; ownership is never inferred from a bare PID
         for sig,wait in ((signal.SIGTERM,1.5),(signal.SIGKILL,1.0)):
             members=group_members(pgid)
             if not members: break
@@ -713,7 +691,6 @@ class Runtime:
         w=self.require_worker(a)
         w.stopping=True
         self.store.agent_update(a['id'],state='stopping')
-        # Clear broker follow-ups and Pi queues before abort. Never allow queued work to restart an interrupted run.
         for q in self.store.all("SELECT id FROM runs WHERE agent_id=? AND state='queued'",(a['id'],)):
             self.store.finish(q['id'],'cancelled','','Cancelled by explicit interruption')
         try:
@@ -724,7 +701,7 @@ class Runtime:
             s=await w.rpc('get_state')
             if s.get('isStreaming') or s.get('pendingMessageCount',0):
                 raise AgentError('abort_unconfirmed','Pi still reports active or queued work')
-            cleanup='not_checked'  # RPC idle does not prove every detached shell descendant is gone.
+            cleanup='not_checked'  # RPC idle does not prove detached shell descendants are gone
             resident=True
         except AgentError:
             cleanup=await self.terminate(w); resident=False
@@ -734,7 +711,7 @@ class Runtime:
         w.run_id=None; w.ui.clear(); w.current_tool=None
         self.store.agent_update(a['id'],state='idle' if resident else 'dormant',current_run=None,cleanup=cleanup)
         self.store.bump(a['scope']); self.notify()
-        w.stopping=False if resident else True
+        w.stopping=not resident
         return {'agent_id':a['id'],'state':'idle' if resident else 'dormant','cleanup':cleanup,'process_retained':resident}
 
     async def reap_orphan(self,a):
@@ -797,7 +774,6 @@ class Runtime:
                 raise AgentError('agents_present','Close resident agents first or use daemon stop --force')
             self.shutdown_requested.set(); return {'shutdown':'requested'}
         if op=='doctor':
-            import shutil
             report={'version':__version__,'platform':sys.platform,'python':sys.version.split()[0],
                     'pi_executable':shutil.which(self.config['pi_command'][0]),'profiles':list(self.config['profiles']),
                     'resident_agents':sum(not w.closed for w in self.workers.values()),
@@ -817,8 +793,7 @@ class Runtime:
                 try: result=await self.mutate(op,p)
                 except AgentError as e:
                     self.store.request_end(sid,key,{'error':e.as_dict()}); raise
-                # Other exceptions leave an uncertain record, never silently replay side effects.
-                self.store.request_end(sid,key,result)
+                self.store.request_end(sid,key,result)  # other exceptions leave an uncertain record, never a silent replay
                 return result
         if op=='list':
             limit=integer(p.get('limit',20),'limit',1,50)
@@ -844,21 +819,15 @@ class Runtime:
                     raise AgentError('invalid_cwd','Spawn cwd must exist inside the scope root')
                 access=p.get('access','write')
                 if access not in {'read','write'}: raise AgentError('invalid_argument','access must be read or write')
-                # A profile labelled read strips mutation builtins; it is not OS confinement.
-                if access=='write':
-                    existing=self.store.all("SELECT * FROM agents WHERE state IN ('starting','running','needs_input','idle','orphaned','stopping') OR cleanup='unknown'")
-                    for other in existing:
-                        spec=json.loads(other['launch'])
-                        a,b=Path(cwd),Path(other['cwd'])
-                        if spec.get('access')=='write' and (a.is_relative_to(b) or b.is_relative_to(a)):
-                            raise AgentError('writer_conflict','Another managed writer owns an overlapping cwd; close it or use read access',agent_id=other['id'])
                 profile=p.get('profile','reader' if access=='read' else 'default')
                 spec=launch_spec(self.config,profile,p.get('model'),cwd,access)
-                # Persist environment NAMES only; values are re-read from the
-                # operator config at every boot and never enter the ledger, the
-                # launch.json description or events.
+                # Persist environment NAMES only; values are re-read from the operator
+                # config at every boot and never enter the ledger or launch.json.
                 spec={**spec,'env':{},'env_names':sorted(spec.get('env',{}))}
-                aid=new_id('pi_'); name=text(p.get('name',aid),'name',128)
+                aid=new_id('pi_')
+                if access=='write':
+                    self._assert_writer_exclusive(aid,cwd)
+                name=text(p.get('name',aid),'name',128)
                 task=text(p.get('task'),'task')
                 if task.lstrip().startswith('/'):
                     task='Perform the following delegated task (treat as text, not an extension command):\n'+task

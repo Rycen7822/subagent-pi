@@ -4,15 +4,26 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
+import stat as statmod
 import sys
 import tempfile
 import unittest
+from unittest import mock as m
 
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.common import AgentError, dumps, group_members
 from subagent_pi.runtime import Runtime
 from subagent_pi.schema import TOOLS, validate, validate_op
+from test_inheritance import make_codex_home
+
+# No env_vars: the receipt-failure receipt must not depend on client env resolution.
+RECEIPT_TOML='''
+[mcp_servers.filesrv]
+command = "cat"
+cwd = "servers/dir with space"
+'''
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -229,5 +240,114 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.rt.store.request_begin(self.scope,'uncertain','spawn',params)
         with self.assertRaises(AgentError) as cm: await self.rt.dispatch('spawn',params)
         self.assertEqual(cm.exception.code,'request_uncertain')
+
+
+class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
+    """P1 (0.2.2): the receipt read end must have exactly ONE closer.
+
+    When the receipt reports a failed required server, _read_receipt raises
+    after its transport already closed the fd. The old caller kept its own
+    reference across `await self.terminate(w)` and closed the same number
+    again in `finally` — by then the freed number could belong to another
+    connection (another agent's RPC pipe, a CLI/MCP IPC socket), and
+    suppress(OSError) does not protect a reused-but-valid fd.
+    """
+
+    async def asyncSetUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='subagent-pi-fd-')
+        self.root=Path(self.tmp.name); self.home=self.root/'state'; self.home.mkdir()
+        self.workspace=self.root/'workspace'; self.workspace.mkdir()
+        codex=make_codex_home(self.root/'src',config=RECEIPT_TOML)
+        (codex/'servers'/'dir with space').mkdir(parents=True)
+        (self.home/'config.toml').write_text(
+            'pi_command = '+json.dumps([sys.executable,str(ROOT/'tests/fake_pi.py')])+
+            '\nrpc_timeout_seconds = 8\nstartup_timeout_seconds = 10\n\n[inheritance]\nenabled = true\n'
+            'child_env = ["PI_TEST_RECEIPT_STATUS"]\n')
+        self.rt=Runtime(self.home)
+        opened=await self.rt.dispatch('scope_open',{'cwd':str(self.workspace)},
+            {'env':{'PATH':os.environ.get('PATH',''),'CODEX_HOME':str(codex),'PI_TEST_RECEIPT_STATUS':'failed_required'}})
+        self.scope=opened['scope']
+        self.pipes=[]
+        self._real_pipe=os.pipe
+
+    async def asyncTearDown(self):
+        for pair in getattr(self,'spares',[])+([self.pair] if getattr(self,'pair',None) else []):
+            for s in pair:
+                # Close only if the number still refers to the socket we created;
+                # after a red double-close the number may have been freed again.
+                try:
+                    st=os.fstat(s.fileno())
+                    if statmod.S_ISSOCK(st.st_mode): s.close()
+                except OSError: pass
+        await self.rt.shutdown()
+        self.tmp.cleanup()
+
+    def recording_pipe(self):
+        r=self._real_pipe(); self.pipes.append(r); return r
+
+    async def test_boot_failure_does_not_close_reused_receipt_fd(self):
+        # Spy on os.pipe: boot_worker creates bootstrap pipe then receipt pipe,
+        # synchronously and before any await, so the second recorded pipe is
+        # the receipt channel.
+        with m.patch('os.pipe',self.recording_pipe):
+            real_terminate=self.rt.terminate
+            async def parked_terminate(w):
+                target=self.pipes[1][0]  # receipt read end
+                # Ordering evidence: _read_receipt's transport already closed it.
+                for _ in range(200):
+                    try: os.fstat(target); await asyncio.sleep(0.01)
+                    except OSError: break
+                else: self.fail('receipt fd still open when terminate started')
+                # Re-occupy the freed number with a live connection. No awaits
+                # inside this loop, so the event loop cannot steal the number.
+                self.spares=[]; self.pair=None
+                for _ in range(128):
+                    a,b=socket.socketpair()
+                    if a.fileno()==target: self.pair=(a,b); break
+                    if b.fileno()==target: self.pair=(b,a); break
+                    self.spares.append((a,b))
+                self.assertIsNotNone(self.pair,'could not reoccupy receipt fd %d'%target)
+                await real_terminate(w)
+            self.rt.terminate=parked_terminate
+            with self.assertRaises(AgentError) as cm:
+                await self.rt.dispatch('spawn',{'scope':self.scope,'request_id':'fd-reuse','cwd':str(self.workspace),'task':'simple','access':'read'})
+        self.assertEqual(cm.exception.code,'inheritance_required_server_failed')
+        # The socket that reclaimed the receipt fd number during the cleanup
+        # window must be untouched by the failure path.
+        holder,peer=self.pair
+        target=holder.fileno()
+        self.assertEqual(target,self.pipes[1][0])
+        os.write(target,b'ping')  # raises OSError (EBADF) on the old double-close
+        self.assertEqual(peer.recv(4),b'ping')
+
+    async def test_read_receipt_closes_fd_on_timeout(self):
+        r,w=os.pipe()
+        try:
+            with self.assertRaises(AgentError) as cm:
+                await self.rt._read_receipt(r,'a',1,0.05)
+            self.assertEqual(cm.exception.code,'bridge_unavailable')
+            for _ in range(10): await asyncio.sleep(0)  # transport close is loop-scheduled
+            with self.assertRaises(OSError): os.fstat(r)  # closed exactly once
+        finally: os.close(w)
+
+    async def test_read_receipt_closes_fd_on_cancellation(self):
+        r,w=os.pipe()
+        try:
+            t=asyncio.create_task(self.rt._read_receipt(r,'a',1,5))
+            await asyncio.sleep(0.05); t.cancel()
+            with self.assertRaises(asyncio.CancelledError): await t
+            for _ in range(10): await asyncio.sleep(0)
+            with self.assertRaises(OSError): os.fstat(r)
+        finally: os.close(w)
+
+    async def test_read_receipt_closes_fd_when_transport_creation_fails(self):
+        r,w=os.pipe()
+        try:
+            loop=asyncio.get_running_loop()
+            with m.patch.object(loop,'connect_read_pipe',side_effect=OSError('transport refused')):
+                with self.assertRaises(OSError):
+                    await self.rt._read_receipt(r,'a',1,1)
+            with self.assertRaises(OSError): os.fstat(r)
+        finally: os.close(w)
 
 if __name__=='__main__': unittest.main()
