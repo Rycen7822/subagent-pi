@@ -9,7 +9,7 @@
  * payload.json = bootstrap payload (agent/source/mcp)
  * actions.json = [{action,server,tool,args,confirm,abortAfterMs}]
  */
-import { openSync, readFileSync, writeSync, closeSync, mkdtempSync } from 'node:fs';
+import { openSync, readFileSync, writeSync, mkdtempSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

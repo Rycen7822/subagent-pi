@@ -328,13 +328,12 @@ class StdioConnection extends McpConnection {
   }
 
   async initialize(): Promise<void> {
-    const result = await this.request("initialize", {
+    await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
       clientInfo: { name: "subagent-pi-bridge", version: "0.2.1" },
-    }, this.cfg.startup_timeout_sec) as { protocolVersion?: string };
+    }, this.cfg.startup_timeout_sec);
     await this.request("notifications/initialized", {}, this.cfg.startup_timeout_sec, { notification: true });
-    return;
   }
 
   async callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal): Promise<unknown> {
@@ -554,7 +553,6 @@ export default async function (pi: ExtensionAPI) {
     connections.clear();
   }
   pi.on("session_shutdown", () => closeAll());
-  pi.on("session_start", () => { /* connections open lazily per tool call */ });
 
   function describeResult(result: unknown): string {
     const r = result as { content?: { type: string; text?: string }[]; structuredContent?: unknown };

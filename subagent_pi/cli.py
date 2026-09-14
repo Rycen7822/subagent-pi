@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 from . import __version__
-from .common import AgentError, crop, dumps, new_id, state_home
+from .common import AgentError, dumps, new_id, state_home
 from .client import request
 
 DOC_ROOT=Path(__file__).resolve().parent.parent/'docs'
@@ -80,11 +80,8 @@ def split_codex_cwd(tail):
 
 def source_snapshot(home):
     """Trusted client-side env snapshot for scope binding; never model-visible."""
-    from .config import load_config
-    from .inheritance import capture_scope_env, resolve_codex_home
-    cfg=load_config(home)
-    codex_home,_=resolve_codex_home(cfg['inheritance'],{'CODEX_HOME':os.environ.get('CODEX_HOME')})
-    return {'env':capture_scope_env(codex_home,dict(os.environ))}
+    from .inheritance import scope_source_snapshot
+    return scope_source_snapshot(home, dict(os.environ))
 
 def guide(args):
     files={p.stem:p for p in DOC_ROOT.glob('*.md')}

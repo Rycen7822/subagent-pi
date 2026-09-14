@@ -15,7 +15,7 @@ import unittest
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.common import AgentError, dumps
-from subagent_pi.inheritance import (Diagnostic, capture_scope_env, collect_skills, parse_mcp_servers,
+from subagent_pi.inheritance import (capture_scope_env, collect_skills, parse_mcp_servers,
     policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from subagent_pi.runtime import Runtime
 from subagent_pi.store import Store
@@ -495,7 +495,6 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(x['name']=='localtest' for x in scope_report['mcp_servers']))
         await self.mutation_close(s['agent_id'])
     async def test_bootstrap_write_failure_recorded_without_payload(self):
-        import subagent_pi.runtime as rt_mod
         r,w=os.pipe()
         os.close(r)
         await self.rt._write_bootstrap(w,'pi_none',9,b'{"mcp":{"servers":[]}}')

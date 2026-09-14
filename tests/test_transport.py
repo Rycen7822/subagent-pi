@@ -12,7 +12,7 @@ import unittest
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.client import request
-from subagent_pi.common import AgentError, group_members, socket_path
+from subagent_pi.common import AgentError, socket_path
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

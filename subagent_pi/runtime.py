@@ -2,8 +2,6 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 import contextlib
-import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,7 +9,7 @@ import signal
 import sys
 import time
 from . import __version__, PROTOCOL_VERSION
-from .common import (ACTIVE, TERMINAL, MAX_FRAME, AgentError, atomic_json, bounded,
+from .common import (TERMINAL, MAX_FRAME, AgentError, atomic_json, bounded,
     crop, dumps, group_members, identifier, integer, live_identity, new_id, now,
     private_dir, process_identity, read_frame, text)
 from .config import load_config, launch_spec
@@ -186,6 +184,7 @@ class Runtime:
             argv += ['--skill', path]
         bridge_path = Path(__file__).resolve().parent.parent / 'extensions' / 'codex-mcp-bridge.ts'
         load_bridge = bool(inh.get('mcp', True) and usable and bridge_path.exists())
+        source = {'codex_home': str(codex_home), 'mode': mode}
         payload = None
         if load_bridge:
             argv += ['--extension', str(bridge_path)]
@@ -195,11 +194,10 @@ class Runtime:
                         'disposition', 'reasons')
             payload = {'v': 1,
                        'agent': {'id': a['id'], 'access': spec['access'], 'generation': generation},
-                       'source': {'codex_home': str(codex_home), 'mode': mode},
+                       'source': source,
                        'mcp': {'servers': [{k: v for k, v in s.items() if k not in internal} for s in usable]}}
         return {'argv': argv, 'payload': payload, 'diagnostics': diagnostics,
-                'bridge': load_bridge, 'servers': [s['name'] for s in usable],
-                'source': {'codex_home': str(codex_home), 'mode': mode}}
+                'bridge': load_bridge, 'servers': [s['name'] for s in usable], 'source': source}
 
     @staticmethod
     def _merge_bridge_tool(argv, tool='codex_mcp'):

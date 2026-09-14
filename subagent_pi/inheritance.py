@@ -6,7 +6,6 @@ Secrets (env values) are resolved only in the daemon process and only for the
 bound scope; diagnostics never contain values, only names and sources.
 """
 from __future__ import annotations
-import os
 from pathlib import Path
 import re
 import shutil
@@ -28,7 +27,6 @@ MCP_STDIO_KEYS = {'command', 'args', 'env', 'env_vars', 'cwd', 'startup_timeout_
 MCP_HTTP_KEYS = {'url', 'auth', 'bearer_token_env_var', 'http_headers', 'env_http_headers', 'http_headers_helper',
                  'startup_timeout_sec', 'tool_timeout_sec', 'enabled', 'required', 'enabled_tools',
                  'disabled_tools', 'default_tools_approval_mode', 'tools'}
-MCP_HARMLESS_KEYS = set()  # display-only keys we intentionally ignore; none identified in codex 0.154.0
 APPROVAL_MODES = {'auto', 'prompt', 'writes', 'approve'}
 
 
@@ -164,7 +162,7 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
             if real in by_real:
                 continue  # same real path already provided by project/profile source
             label = entry.name
-            if (entry / 'agents' / 'openai.yaml').is_file() or (entry / 'agents').is_dir():
+            if (entry / 'agents').is_dir():
                 diagnostics.append(Diagnostic('skills', label,
                                               'codex-specific policy metadata present (agents/); it is not interpreted or enforced by Pi'))
             if real in disabled or skill_md.resolve() in disabled:
@@ -192,21 +190,20 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
     return selected, diagnostics
 
 
-def _tool_policy(server: dict) -> tuple[dict, list[Diagnostic]]:
+def _tool_policy(server: dict, name: str) -> tuple[dict, list[Diagnostic]]:
     """Effective policy model for one server.
 
     Returns (policy, diagnostics); policy = {'default': 'auto'|'confirm',
-    'tools': {name: 'auto'|'confirm'}, 'denied': sorteddeny list}. For each tool
-    the effective mode is the per-tool approval_mode override, else the server
-    default, else 'prompt'. Values this bridge cannot enforce ('writes',
-    unknown strings) degrade to 'confirm' with a named diagnostic; a per-tool
-    'auto' can never lift a child-side mandatory confirmation (the child rule
-    is applied separately and wins). Tool config keys this plugin cannot honor
-    (for example output_token_limit) deny that tool outright instead of being
-    silently ignored.
+    'tools': {name: 'auto'|'confirm'}, 'denied': sorted deny list}. For each
+    tool the effective mode is the per-tool approval_mode override, else the
+    server default, else 'prompt'. Values this bridge cannot enforce
+    ('writes', unknown strings) degrade to 'confirm' with a named diagnostic;
+    a per-tool 'auto' can never lift a child-side mandatory confirmation (the
+    child rule is applied separately and wins). Tool config keys this plugin
+    cannot honor (for example output_token_limit) deny that tool outright
+    instead of being silently ignored.
     """
     diagnostics: list[Diagnostic] = []
-    name = server.get('name', '?')
     mode = server.get('default_tools_approval_mode', 'prompt')
     if mode not in APPROVAL_MODES:
         diagnostics.append(Diagnostic('mcp', name, f'unknown default_tools_approval_mode {mode!r}; using confirm'))
@@ -297,24 +294,7 @@ def _is_self_server(entry: dict, codex_home: Path) -> bool:
     return False
 
 
-def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Diagnostic]]:
-    """Convert [mcp_servers.*] TOML into normalized in-memory server configs.
-
-    Values are NOT resolved here (no environment access). Every declared server
-    keeps a disposition ('ok' | 'failed' | 'disabled') and, for failed ones, its
-    reasons — a failed required server must not silently vanish. Unknown keys
-    that affect execution or authorization mark the server failed with an
-    explicit reason; the rest of the config continues.
-    """
-    diagnostics: list[Diagnostic] = []
-    servers: list[dict] = []
-    table = raw.get('mcp_servers')
-    if table is None:
-        return [], diagnostics
-    if not isinstance(table, dict):
-        diagnostics.append(Diagnostic('mcp', 'mcp_servers', 'not a table; ignored'))
-        return [], diagnostics
-def _enabled_tools(server: dict, diagnostics: list[Diagnostic]) -> list[str] | None:
+def _enabled_tools(server: dict) -> list[str] | None:
     """Validate enabled_tools; an explicitly empty list allows no tools."""
     enabled = server.get('enabled_tools')
     if enabled is None:
@@ -363,14 +343,14 @@ def parse_mcp_servers(codex_home: Path, raw: dict) -> tuple[list[dict], list[Dia
         entry: dict = {'name': name, 'required': required, 'disposition': 'ok', 'reasons': []}
         is_http = 'url' in server
         allowed_keys = MCP_HTTP_KEYS if is_http else MCP_STDIO_KEYS
-        unknown = set(server) - allowed_keys - MCP_HARMLESS_KEYS
+        unknown = set(server) - allowed_keys
         if unknown:
             _failed(name, transport, required,
                     f'unsupported config keys affecting execution or auth: {sorted(unknown)}')
             continue
         try:
-            policy, pdiag = _tool_policy(server)
-            entry.update(allowed_tools=_enabled_tools(server, diagnostics),
+            policy, pdiag = _tool_policy(server, name)
+            entry.update(allowed_tools=_enabled_tools(server),
                          disabled_tools=policy['denied'],
                          approval_default=policy['default'],
                          tool_approval=policy['tools'])
@@ -535,15 +515,10 @@ def capture_scope_env(codex_home: Path | None, environ: dict,
     names = set(BASE_ENV_KEYS) | {n for n in extra_names if isinstance(n, str) and n.strip()}
     if codex_home is not None:
         try:
-            raw = read_codex_config(codex_home)
-            servers, _ = parse_mcp_servers(codex_home, raw)
+            servers, _ = parse_mcp_servers(codex_home, read_codex_config(codex_home))
         except AgentError:
             servers = []
-        for server in servers:
-            names.update(server.get('env_var_names', []))
-            names.update(server.get('env_header_names', {}).values())
-            if server.get('bearer_token_env_var'):
-                names.add(server['bearer_token_env_var'])
+        names |= referenced_env_names(servers)
     snapshot: dict[str, str] = {}
     for name in sorted(names):
         value = environ.get(name)
@@ -553,6 +528,8 @@ def capture_scope_env(codex_home: Path | None, environ: dict,
 
 
 def referenced_env_names(servers: list[dict]) -> set[str]:
+    """Env var NAMES a server list references (headers' values, bearer var, args).
+    Includes the base keys so callers can treat one set as the full allowlist."""
     names: set[str] = set(BASE_ENV_KEYS)
     for server in servers:
         names.update(server.get('env_var_names', []))
@@ -560,3 +537,15 @@ def referenced_env_names(servers: list[dict]) -> set[str]:
         if server.get('bearer_token_env_var'):
             names.add(server['bearer_token_env_var'])
     return names
+
+
+def scope_source_snapshot(home: Path, environ: dict) -> dict:
+    """Trusted client-side snapshot for scope binding: codex home resolution plus
+    the minimal env capture (base keys, referenced vars, authorized child-env
+    names). Called by the CLI launcher and the Codex-spawned MCP adapter; the
+    values live in daemon memory only and are never model-visible."""
+    from .config import load_config  # local import: config owns the state home layout
+    cfg = load_config(home)
+    codex_home, _ = resolve_codex_home(cfg['inheritance'], {'CODEX_HOME': environ.get('CODEX_HOME')})
+    return {'env': capture_scope_env(codex_home, environ,
+                                     extra_names=cfg['inheritance'].get('child_env', []))}

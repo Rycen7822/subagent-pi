@@ -54,11 +54,8 @@ async def serve_mcp(home):
                 if spec['_op']=='scope_open':
                     # Attach the trusted source snapshot from this Codex-spawned process;
                     # the model never sees or fills these values.
-                    from .inheritance import capture_scope_env, resolve_codex_home
-                    from .config import load_config
-                    cfg=load_config(home)
-                    codex_home,_=resolve_codex_home(cfg['inheritance'],{'CODEX_HOME':os.environ.get('CODEX_HOME')})
-                    source={'env':capture_scope_env(codex_home,dict(os.environ))}
+                    from .inheritance import scope_source_snapshot
+                    source=scope_source_snapshot(home,dict(os.environ))
                 value=await request(home,spec['_op'],args,timeout=timeout,source=source)
                 if spec['_op']=='scope_open': bound_scopes[args['cwd']]=value['scope']
                 result={'content':[{'type':'text','text':dumps(value)}],'isError':False}
