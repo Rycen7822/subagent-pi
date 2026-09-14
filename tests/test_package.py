@@ -8,6 +8,7 @@ import unittest
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.common import live_identity, crop
+from subagent_pi import __version__
 from unittest.mock import patch
 
 class PackageTests(unittest.TestCase):
@@ -28,7 +29,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(server['env']['PI_AGENTS_HOME'],str(home))
             version=subprocess.run([sys.executable,str(bins/'subagent-pi'),'--version'],capture_output=True,text=True)
             self.assertEqual(version.returncode,0,version.stderr)
-            self.assertEqual(version.stdout.strip(),'0.1.0')
+            self.assertEqual(version.stdout.strip(),__version__)
             self.assertFalse((plugin/'hooks').exists())
             r2=subprocess.run(cmd,capture_output=True,text=True,timeout=20)
             self.assertNotEqual(r2.returncode,0)

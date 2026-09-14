@@ -9,6 +9,12 @@ default_run_timeout_seconds = 1800
 max_wait_seconds = 600
 event_max_count_per_agent = 20000
 
+[inheritance]
+enabled = true
+skills = true
+mcp = true
+# codex_home = "/home/you/.codex"  # optional explicit trusted source
+
 [profiles.default]
 ambient_extensions = false
 ambient_skills = false

@@ -13,7 +13,9 @@ def tool(name,op,description,properties,required,read=False):
             'annotations':{'readOnlyHint':read,'destructiveHint':not read,'idempotentHint':read or 'request_id' in properties,'openWorldHint':not read},'_op':op}
 TOOLS=[
  tool('pi_context','scope_open','Open a Pi delegation scope in an explicit workspace, or resume a known scope. Reuse it for subsequent calls.',
-      {'cwd':{**S,'description':'Absolute current workspace directory, never the daemon directory.'},'scope':ID,'label':S},['cwd']),
+      {'cwd':{**S,'description':'Absolute current workspace directory, never the daemon directory.'},'scope':ID,'label':S,
+       'inheritance':{'type':'boolean','description':'Explicitly enable or disable Codex skill/MCP inheritance for this scope.'},
+       'codex_home':{**S,'description':'Explicit trusted Codex home directory; rebinds this scope as a management action.'}},['cwd']),
  tool('pi_spawn_agent','spawn','Start an asynchronous Pi agent. Returns an agent and run ID. No native Codex /agents integration.',
       {**SCOPE,**REQ,'cwd':S,'task':S,'name':S,'profile':S,'model':S,'access':{'type':'string','enum':['read','write'],'default':'write'},'timeout_seconds':{'type':'integer','minimum':1,'maximum':604800}},
       ['scope','request_id','cwd','task']),

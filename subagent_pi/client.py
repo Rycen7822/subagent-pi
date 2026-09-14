@@ -9,7 +9,7 @@ import time
 from .common import MAX_FRAME, AgentError, dumps, private_dir, read_frame, socket_path
 from . import PROTOCOL_VERSION
 
-async def request(home,op,params,timeout=45,autostart=True):
+async def request(home,op,params,timeout=45,autostart=True,source=None):
     sock=socket_path(home)
     async def connect(): return await asyncio.open_unix_connection(str(sock),limit=MAX_FRAME)
     try: reader,writer=await connect()
@@ -31,7 +31,9 @@ async def request(home,op,params,timeout=45,autostart=True):
                 if time.monotonic()>until: raise AgentError('daemon_start_failed',f'Cannot start daemon; inspect {log}')
                 await asyncio.sleep(.05)
     try:
-        writer.write((dumps({'v':PROTOCOL_VERSION,'op':op,'params':params})+'\n').encode()); await writer.drain()
+        frame={'v':PROTOCOL_VERSION,'op':op,'params':params}
+        if source is not None: frame['source']=source
+        writer.write((dumps(frame)+'\n').encode()); await writer.drain()
         response=await asyncio.wait_for(read_frame(reader),timeout)
         if not response: raise AgentError('connection_lost','No response; mutation may have committed. Retry the same request_id.')
         if not response.get('ok'): raise AgentError(**response.get('error',{'code':'protocol_error','message':'Invalid reply'}))

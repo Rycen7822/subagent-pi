@@ -35,7 +35,15 @@ async def serve(home: Path):
                 if req.get('v')!=PROTOCOL_VERSION: raise AgentError('version_mismatch','Client/daemon protocol versions differ; drain and restart the daemon')
                 op=req.get('op'); params=req.get('params',{})
                 validate_op(op,params)
-                job=asyncio.create_task(runtime.dispatch(op,params)); operations.add(job)
+                source=req.get('source')
+                if source is not None:
+                    # Trusted-adapter channel: bounded env snapshot, never logged or stored.
+                    if not isinstance(source,dict) or not isinstance(source.get('env'),dict):
+                        raise AgentError('invalid_request','source must be an object with an env object')
+                    env=source['env']
+                    if len(env)>64 or any(not isinstance(k,str) or len(k)>128 or not isinstance(v,str) or len(v)>16384 for k,v in env.items()):
+                        raise AgentError('invalid_request','source env snapshot exceeds bounds')
+                job=asyncio.create_task(runtime.dispatch(op,params,source)); operations.add(job)
                 job.add_done_callback(operations.discard)
                 if op=='wait':
                     disconnected=asyncio.create_task(reader.read(1))

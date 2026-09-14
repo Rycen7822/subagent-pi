@@ -19,6 +19,18 @@ event_max_count_per_agent = 20000
 
 `pi_command` 是 argv 数组，不经 shell。用于已有 Pi 可执行文件，也可以配置受信任的启动器。不要在这里写管道或命令拼接字符串。安装 `--pi` 仅在 config.toml 不存在时写入路径，不覆盖已有配置。
 
+## Codex 继承（受管子代理）
+
+```toml
+[inheritance]
+enabled = true   # 总开关（默认 true）
+skills = true    # 继承 <codex_home>/skills
+mcp = true       # 继承 config.toml 的 mcp_servers
+# codex_home = "/abs/path"  # 显式受信任来源；缺省按 显式设置 → CODEX_HOME → ~/.codex 解析
+```
+
+来源在 scope 绑定时确定并持久化（非秘密字段）；环境变量的**值**只保存在 daemon 内存中，重启后需所属客户端重新绑定。respawn 总是从原文件重建继承，不追加历史参数。诊断：`subagent-pi doctor --inheritance`。完整语义（冲突策略、只读子代理交集、审批模式、不支持的认证形式）见 `docs/inheritance.md`。
+
 ## Profiles
 
 ```toml

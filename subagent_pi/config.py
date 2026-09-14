@@ -10,6 +10,7 @@ DEFAULT = {
     'rpc_timeout_seconds': 20, 'startup_timeout_seconds': 30,
     'default_run_timeout_seconds': 1800, 'max_wait_seconds': 600,
     'event_max_count_per_agent': 20000,
+    'inheritance': {'enabled': True, 'skills': True, 'mcp': True, 'codex_home': None},
     'profiles': {
         'default': {'extensions': [], 'skills': [], 'ambient_extensions': False,
                     'ambient_skills': False, 'tools': ['read','bash','edit','write','grep','find','ls']},
@@ -30,10 +31,24 @@ def load_config(home: Path):
             if key == 'profiles':
                 for name, profile in value.items():
                     result['profiles'][name] = {**result['profiles'].get(name,result['profiles']['default']),**profile}
+            elif key == 'inheritance':
+                if not isinstance(value,dict): raise AgentError('invalid_config','inheritance must be a table')
+                unknown_inh = set(value) - set(DEFAULT['inheritance'])
+                if unknown_inh: raise AgentError('invalid_config',f'Unknown inheritance keys: {sorted(unknown_inh)}')
+                merged = dict(result['inheritance']); merged.update(value)
+                for flag in ('enabled','skills','mcp'):
+                    if not isinstance(merged[flag],bool): raise AgentError('invalid_config',f'inheritance.{flag} must be a TOML boolean')
+                home = merged.get('codex_home')
+                if home is not None:
+                    if not isinstance(home,str) or not home.strip(): raise AgentError('invalid_config','inheritance.codex_home must be a path string')
+                    resolved = Path(home).expanduser().resolve()
+                    if not resolved.is_dir(): raise AgentError('invalid_config',f'inheritance.codex_home does not exist: {resolved}')
+                    merged['codex_home'] = str(resolved)
+                result['inheritance'] = merged
             else: result[key] = value
     result.setdefault('pi_command', [os.environ.get('PI_AGENTS_PI', 'pi')])
     for k in DEFAULT:
-        if k == 'profiles': continue
+        if k in ('profiles','inheritance'): continue
         v = result[k]
         if isinstance(v,bool) or not isinstance(v,int) or not 1 <= v <= 10_000_000:
             raise AgentError('invalid_config', f'{k} must be a positive bounded integer')

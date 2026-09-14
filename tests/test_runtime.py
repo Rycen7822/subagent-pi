@@ -20,7 +20,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.root=Path(self.tmp.name); self.home=self.root/'state'; self.home.mkdir()
         self.workspace=self.root/'workspace'; self.workspace.mkdir()
         self.fake=ROOT/'tests/fake_pi.py'
-        (self.home/'config.toml').write_text('pi_command = '+json.dumps([sys.executable,str(self.fake)])+'\nrpc_timeout_seconds = 8\nstartup_timeout_seconds = 10\n')
+        (self.home/'config.toml').write_text('pi_command = '+json.dumps([sys.executable,str(self.fake)])+'\nrpc_timeout_seconds = 8\nstartup_timeout_seconds = 10\n[inheritance]\nenabled = false\n')
         self.rt=Runtime(self.home)
         self.scope=(await self.rt.dispatch('scope_open',{'cwd':str(self.workspace)}))['scope']
         self.n=0

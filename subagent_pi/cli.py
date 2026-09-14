@@ -47,7 +47,8 @@ def parser():
         if name=='ack': q.add_argument('--sha256',required=True)
         if name=='answer':
             q.add_argument('ui_request_id'); q.add_argument('--answer',required=True,help='Text, or JSON true/false for confirmation')
-    sub.add_parser('doctor')
+    d=sub.add_parser('doctor',help='Diagnostics; add --inheritance for source/skill/server names only')
+    d.add_argument('--inheritance',action='store_true',help='Include Codex inheritance diagnostics (names only, no values)')
     g=sub.add_parser('guide'); g.add_argument('topic',nargs='?',default='getting-started'); g.add_argument('--section'); g.add_argument('--offset',type=int,default=0); g.add_argument('--max-bytes',type=int,default=4096)
     sub.add_parser('schemas',help='Print the exact MCP tool definitions')
     c=sub.add_parser('call',help='Generic CLI/IPC API for scripts; accepts a JSON object'); c.add_argument('operation'); c.add_argument('--json',default='-',help='JSON text or - for stdin')
@@ -56,6 +57,29 @@ def parser():
 
 def read_input(path):
     return sys.stdin.read(65537) if path=='-' else Path(path).expanduser().read_text(encoding='utf-8')
+
+def split_codex_cwd(tail):
+    """Recognize Codex's -C/--cd (and --cd=DIR) before the -- separator.
+
+    Returns (cwd_or_None, remaining_args); unparseable forms stay in the tail
+    and are passed to codex untouched.
+    """
+    cwd=None; rest=[]; after_dd=False; i=0
+    while i<len(tail):
+        a=tail[i]
+        if not after_dd and a=='--': after_dd=True; rest.append(a); i+=1; continue
+        if not after_dd and a in ('-C','--cd') and i+1<len(tail): cwd=tail[i+1]; i+=2; continue
+        if not after_dd and a.startswith('--cd='): cwd=a[5:]; i+=1; continue
+        rest.append(a); i+=1
+    return cwd,rest
+
+def source_snapshot(home):
+    """Trusted client-side env snapshot for scope binding; never model-visible."""
+    from .config import load_config
+    from .inheritance import capture_scope_env, resolve_codex_home
+    cfg=load_config(home)
+    codex_home,_=resolve_codex_home(cfg['inheritance'],{'CODEX_HOME':os.environ.get('CODEX_HOME')})
+    return {'env':capture_scope_env(codex_home,dict(os.environ))}
 
 def guide(args):
     files={p.stem:p for p in DOC_ROOT.glob('*.md')}
@@ -89,8 +113,8 @@ async def execute(args):
         if args.action=='stop': return await request(home,'shutdown',{'force':args.force},autostart=False)
         return await request(home,'ping',{},autostart=args.action=='start')
     if cmd=='scope':
-        return await request(home,'scope_open',{'cwd':str(Path(args.cwd).expanduser().resolve()),'label':args.label,**({'scope':args.scope} if args.scope else {})}) if args.action=='open' else await request(home,'scope_list',{})
-    if cmd=='doctor': return await request(home,'doctor',{})
+        return await request(home,'scope_open',{'cwd':str(Path(args.cwd).expanduser().resolve()),'label':args.label,**({'scope':args.scope} if args.scope else {})},source=source_snapshot(home)) if args.action=='open' else await request(home,'scope_list',{})
+    if cmd=='doctor': return await request(home,'doctor',{'inheritance':getattr(args,'inheritance',False)})
     if cmd=='guide': return guide(args)
     if cmd=='schemas':
         from .schema import TOOLS
@@ -102,17 +126,24 @@ async def execute(args):
     if cmd=='codex':
         exe=shutil.which('codex')
         if not exe: raise AgentError('codex_not_found','codex was not found on PATH')
-        opened=await request(home,'scope_open',{'cwd':os.getcwd(),'label':'Codex CLI',**({'scope':os.environ['PI_AGENTS_SCOPE']} if os.environ.get('PI_AGENTS_SCOPE') else {})})
-        env=os.environ.copy(); env.update(PI_AGENTS_SCOPE=opened['scope'],PI_AGENTS_CWD=os.getcwd(),PI_AGENTS_HOME=str(home))
         tail=args.codex_args[1:] if args.codex_args[:1]==['--'] else args.codex_args
+        # Scope binding must follow Codex's actual working directory, not the
+        # launcher cwd, when the user passed -C/--cd.
+        found,rest=split_codex_cwd(tail)
+        cwd=os.getcwd()
+        if found is not None:
+            cwd=str(Path(found).expanduser().resolve())
+            if not Path(cwd).is_dir(): raise AgentError('invalid_cwd',f'codex -C/--cd directory does not exist: {cwd}')
+        opened=await request(home,'scope_open',{'cwd':cwd,'label':'Codex CLI',**({'scope':os.environ['PI_AGENTS_SCOPE']} if os.environ.get('PI_AGENTS_SCOPE') else {})},source=source_snapshot(home))
+        env=os.environ.copy(); env.update(PI_AGENTS_SCOPE=opened['scope'],PI_AGENTS_CWD=cwd,PI_AGENTS_HOME=str(home))
         print('Pi scope: '+opened['scope'],file=sys.stderr)
-        os.execvpe(exe,[exe,*tail],env)
+        os.execvpe(exe,[exe,*rest],env)
     data=vars(args).copy()
     for k in ('command','home'): data.pop(k,None)
     if 'cwd' in data: data['cwd']=str(Path(data['cwd']).expanduser().resolve())
     if not data.get('scope'):
         if cmd=='spawn':
-            data['scope']=(await request(home,'scope_open',{'cwd':data['cwd'],'label':'CLI spawn'}))['scope']
+            data['scope']=(await request(home,'scope_open',{'cwd':data['cwd'],'label':'CLI spawn'},source=source_snapshot(home)))['scope']
         else: raise AgentError('scope_required','Pass --scope or PI_AGENTS_SCOPE; use scope list to recover known scopes')
     if 'request_id' in data and not data['request_id']: data['request_id']=new_id('cli_')
     if data.get('task_file'): data['task']=read_input(data['task_file'])

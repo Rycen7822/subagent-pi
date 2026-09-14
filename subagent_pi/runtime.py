@@ -15,9 +15,15 @@ from .common import (ACTIVE, TERMINAL, MAX_FRAME, AgentError, atomic_json, bound
     crop, dumps, group_members, identifier, integer, live_identity, new_id, now,
     private_dir, process_identity, read_frame, text)
 from .config import load_config, launch_spec
+from .inheritance import (Diagnostic, collect_skills, parse_mcp_servers, policy_filter,
+    read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from .store import Store
 
+BASE_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME')
+
 RESULT_CAP = 1024 * 1024
+BOOTSTRAP_MAX = 4 * 1024 * 1024
+BRIDGE_MARKER = 'subagent-pi-bridge ready'
 
 def message_text(message):
     content = message.get('content',[])
@@ -114,6 +120,8 @@ class Runtime:
         self.store = Store(home)
         self.config = load_config(home)
         self.workers = {}
+        # Bound scope env snapshots; secret values live here and nowhere else.
+        self.scope_env = {}
         self.agent_locks = defaultdict(asyncio.Lock)
         self.request_locks = defaultdict(asyncio.Lock)
         self.admission = asyncio.Lock()
@@ -122,6 +130,116 @@ class Runtime:
         self.closing = False
         self.background = set()
         self._restore()
+
+    # ---------- Codex inheritance (managed children only) ----------
+
+    def _resolve_source(self, source_env):
+        return resolve_codex_home(self.config['inheritance'], source_env)
+
+    def _inheritance_plan(self, a, spec, generation):
+        """Rebuild managed-child inheritance from original sources at boot time.
+
+        Persisted launch argv is never touched; additions are recomputed for every
+        new process, so respawn never accumulates stale flags. Secrets are resolved
+        into the pipe payload only; diagnostics carry names, never values.
+        """
+        inh = self.config['inheritance']
+        empty = {'argv': [], 'payload': None, 'diagnostics': [], 'bridge': False, 'servers': []}
+        if not inh.get('enabled'):
+            return {**empty, 'reason': 'inheritance disabled by config'}
+        scope = self.store.scope(a['scope'])
+        if not scope['inheritance']:
+            return {**empty, 'reason': 'inheritance disabled for this scope'}
+        source_env = self.scope_env.get(a['scope'])
+        # The scope binding (made when a trusted client opened the scope) is the
+        # stable source pointer; re-resolving only fills gaps for legacy scopes.
+        if scope['codex_home']:
+            codex_home, mode = Path(scope['codex_home']), scope['codex_source'] or 'scope_env'
+        else:
+            codex_home, mode = self._resolve_source(source_env)
+        if codex_home is None:
+            diag = Diagnostic('source', 'codex_home', 'no codex source directory found').as_dict()
+            return {**empty, 'diagnostics': [diag], 'reason': 'no source'}
+        raw = read_codex_config(codex_home)
+        existing_skills = [spec['argv'][i + 1] for i, flag in enumerate(spec['argv']) if flag == '--skill']
+        skill_paths, skill_diag = [], []
+        if inh.get('skills', True):
+            skill_paths, skill_diag = collect_skills(codex_home, raw, scope['cwd'], existing_skills)
+        servers, mcp_diag = [], []
+        if inh.get('mcp', True):
+            servers, mcp_diag = parse_mcp_servers(codex_home, raw)
+            servers, env_diag = resolve_environment(servers, source_env or {})
+            mcp_diag += env_diag
+            servers, access_diag = policy_filter(servers, spec['access'])
+            mcp_diag += access_diag
+        diagnostics = [d.as_dict() for d in skill_diag + mcp_diag]
+        argv = []
+        for path in (p for p in skill_paths if p not in existing_skills):
+            argv += ['--skill', path]
+        bridge_path = Path(__file__).resolve().parent.parent / 'extensions' / 'codex-mcp-bridge.ts'
+        load_bridge = bool(inh.get('mcp', True) and servers and bridge_path.exists())
+        payload = None
+        if load_bridge:
+            argv += ['--extension', str(bridge_path)]
+            argv = self._enable_bridge_tool(list(argv))
+            payload = {'v': 1,
+                       'agent': {'id': a['id'], 'access': spec['access'], 'generation': generation},
+                       'source': {'codex_home': str(codex_home), 'mode': mode},
+                       'mcp': {'servers': servers}}
+        return {'argv': argv, 'payload': payload, 'diagnostics': diagnostics,
+                'bridge': load_bridge, 'servers': [s['name'] for s in servers],
+                'source': {'codex_home': str(codex_home), 'mode': mode}}
+
+    @staticmethod
+    def _enable_bridge_tool(argv, tool='codex_mcp'):
+        """Pi's --tools allowlist also gates extension tools; --no-tools disables them."""
+        if '--no-tools' in argv:
+            argv = [x for x in argv if x != '--no-tools']
+            if '--tools' not in argv:
+                argv += ['--tools', tool]
+        if '--tools' in argv:
+            i = argv.index('--tools')
+            names = argv[i + 1].split(',')
+            if tool not in names:
+                argv = [*argv[:i], '--tools', ','.join(names + [tool]), *argv[i + 2:]]
+        else:
+            argv += ['--tools', tool]
+        return argv
+
+    @staticmethod
+    def _write_all(fd, data):
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+
+    async def _write_bootstrap(self, fd, agent_id, generation, data):
+        try:
+            await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, self._write_all, fd, data), 30)
+        except Exception as exc:
+            # Child exited early or the pipe broke; never record payload contents.
+            self.store.event(agent_id, None, generation, 'bootstrap_write_failed', {'error': type(exc).__name__})
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    async def _wait_bridge_ready(self, directory, timeout, offset=0, expected=None):
+        path = directory / 'stderr.log'
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                size = path.stat().st_size
+                if size > offset:
+                    content = path.read_bytes()[offset:]
+                    if expected is not None:
+                        if expected.encode() in content:
+                            return True
+                    elif BRIDGE_MARKER.encode() in content:
+                        return True
+            except OSError:
+                pass
+            await asyncio.sleep(0.1)
+        return False
     def spawn_task(self,coro):
         t = asyncio.create_task(coro)
         self.background.add(t)
@@ -238,48 +356,148 @@ class Runtime:
             argv=[*spec['argv'],'--session-dir',str(directory/'sessions')]
         else:
             argv=[*spec['argv'],'--session',str(session)]
+        # Inherited skills/extensions are rebuilt from the original sources on every
+        # boot; the persisted launch spec and argv stay untouched.
+        plan=self._inheritance_plan(a,spec,generation)
+        argv=[*argv,*plan['argv']]
         payload={**spec,'argv':argv,'generation':generation}
         atomic_json(directory/'launch.json',payload)
-        self.store.agent_update(aid,state='starting',generation=generation,cleanup='pending')
-        guard=Path(__file__).with_name('worker_guard.py')
-        proc=await asyncio.create_subprocess_exec(sys.executable,str(guard),str(directory/'launch.json'),
-            stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,limit=MAX_FRAME,cwd=spec['cwd'])
-        identity=process_identity(proc.pid)
-        self.store.agent_update(aid,pid=proc.pid,identity=identity)
-        a=self.store.agent(a['scope'],aid)
-        w=Worker(self,a,proc); self.workers[aid]=w; w.start()
+        if plan['diagnostics']:
+            self.store.event(aid,None,generation,'inheritance_diagnostics',
+                bounded({'source':plan.get('source'),'servers':plan['servers'],'diagnostics':plan['diagnostics']},4096))
+        stderr_path=directory/'stderr.log'
+        stderr_offset=stderr_path.stat().st_size if stderr_path.exists() else 0
+        bootstrap_r=None; bootstrap_w=None
+        if plan['payload'] is not None:
+            body=dumps(plan['payload']).encode()
+            if len(body)>BOOTSTRAP_MAX:
+                raise AgentError('bootstrap_too_large','Inherited MCP configuration exceeds the private channel limit')
+            bootstrap_r,bootstrap_w=os.pipe()
+        handed_off=False
         try:
-            state=await w.rpc('get_state',timeout=self.config['startup_timeout_seconds'])
-            actual=state.get('sessionFile')
-            if not actual or not Path(actual).is_absolute():
-                raise AgentError('session_mismatch','Pi did not report an absolute persistent session path')
-            actual_path=Path(actual).resolve()
-            if first_launch:
-                if not actual_path.is_relative_to((directory/'sessions').resolve()):
-                    raise AgentError('session_mismatch','Pi session escaped its managed session directory')
-                self.store.agent_update(aid,session_file=str(actual_path))
-            elif actual_path!=session.resolve():
-                raise AgentError('session_mismatch','Pi did not select the managed session path')
-            if state.get('isStreaming'):
-                raise AgentError('unexpected_activity','Pi started a model turn without an explicit task')
-            # Pin the actual model selected by Pi, so a later global default change
-            # does not silently alter a recovered agent's model.
-            resolved_model=state.get('model')
-            if isinstance(resolved_model,dict) and resolved_model.get('id'):
-                if '--model' not in spec['argv']:
-                    spec['argv'] += ['--model',resolved_model['id']]
-                if '--provider' not in spec['argv'] and resolved_model.get('provider'):
-                    spec['argv'] += ['--provider',resolved_model['provider']]
-                spec['resolved_model']={'id':resolved_model['id'],'provider':resolved_model.get('provider')}
-                self.store.agent_update(aid,launch=dumps(spec))
-            self.store.agent_update(aid,state='idle',cleanup='not_checked')
-            self.event(w,'worker_ready',{'pi_session_id':state.get('sessionId'),'model':bounded(state.get('model'),1000)})
-            return w
-        except BaseException:
-            w.stopping=True
-            await self.terminate(w)
-            raise
+            self.store.agent_update(aid,state='starting',generation=generation,cleanup='pending')
+            guard=Path(__file__).with_name('worker_guard.py')
+            guard_env=dict(os.environ)
+            pass_fds=()
+            if bootstrap_r is not None:
+                guard_env['PI_AGENTS_BOOTSTRAP_FD']=str(bootstrap_r)
+                pass_fds=(bootstrap_r,)
+            proc=await asyncio.create_subprocess_exec(sys.executable,str(guard),str(directory/'launch.json'),
+                stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,limit=MAX_FRAME,cwd=spec['cwd'],env=guard_env,pass_fds=pass_fds)
+            identity=process_identity(proc.pid)
+            self.store.agent_update(aid,pid=proc.pid,identity=identity)
+            a=self.store.agent(a['scope'],aid)
+            w=Worker(self,a,proc); self.workers[aid]=w; w.start()
+            if bootstrap_r is not None:
+                os.close(bootstrap_r)  # daemon keeps only the write end
+                bootstrap_r=None
+                handed_off=True
+                self.spawn_task(self._write_bootstrap(bootstrap_w,aid,generation,body))
+            try:
+                state=await w.rpc('get_state',timeout=self.config['startup_timeout_seconds'])
+                actual=state.get('sessionFile')
+                if not actual or not Path(actual).is_absolute():
+                    raise AgentError('session_mismatch','Pi did not report an absolute persistent session path')
+                actual_path=Path(actual).resolve()
+                if first_launch:
+                    if not actual_path.is_relative_to((directory/'sessions').resolve()):
+                        raise AgentError('session_mismatch','Pi session escaped its managed session directory')
+                    self.store.agent_update(aid,session_file=str(actual_path))
+                elif actual_path!=session.resolve():
+                    raise AgentError('session_mismatch','Pi did not select the managed session path')
+                if state.get('isStreaming'):
+                    raise AgentError('unexpected_activity','Pi started a model turn without an explicit task')
+                if plan['payload'] is not None:
+                    # get_state success does not prove the bridge loaded; require its
+                    # non-secret stderr receipt for the exact configured server count.
+                    expected=f"{BRIDGE_MARKER} servers={len(plan['payload']['mcp']['servers'])}"
+                    ready=await self._wait_bridge_ready(directory,min(self.config['startup_timeout_seconds'],20),stderr_offset,expected)
+                    if not ready:
+                        raise AgentError('bridge_unavailable','Managed MCP bridge did not report ready for the configured server count; inspect the agent stderr log')
+                # Pin the actual model selected by Pi, so a later global default change
+                # does not silently alter a recovered agent's model.
+                resolved_model=state.get('model')
+                if isinstance(resolved_model,dict) and resolved_model.get('id'):
+                    if '--model' not in spec['argv']:
+                        spec['argv'] += ['--model',resolved_model['id']]
+                    if '--provider' not in spec['argv'] and resolved_model.get('provider'):
+                        spec['argv'] += ['--provider',resolved_model['provider']]
+                    spec['resolved_model']={'id':resolved_model['id'],'provider':resolved_model.get('provider')}
+                    self.store.agent_update(aid,launch=dumps(spec))
+                self.store.agent_update(aid,state='idle',cleanup='not_checked')
+                self.event(w,'worker_ready',{'pi_session_id':state.get('sessionId'),'model':bounded(state.get('model'),1000)})
+                return w
+            except BaseException:
+                w.stopping=True
+                await self.terminate(w)
+                raise
+        finally:
+            if bootstrap_r is not None:
+                with contextlib.suppress(OSError): os.close(bootstrap_r)
+            if not handed_off and bootstrap_w is not None:
+                with contextlib.suppress(OSError): os.close(bootstrap_w)
+
+    def _bind_scope_source(self, sid, p, source):
+        """Persist non-secret source fields; keep secret env values in memory only."""
+        inh=self.config['inheritance']
+        env = source.get('env') if isinstance(source,dict) else None
+        explicit_home = p.get('codex_home')
+        if explicit_home is not None:
+            explicit_home = str(Path(text(explicit_home,'codex_home',4096)).expanduser().resolve())
+            if not Path(explicit_home).is_dir(): raise AgentError('invalid_cwd','codex_home must be an existing directory')
+        home,mode = resolve_codex_home({**inh,'codex_home':explicit_home or inh.get('codex_home')},env)
+        scope=self.store.scope(sid)
+        stored=scope['codex_home']
+        if stored and home and Path(stored)!=Path(home) and explicit_home is None and p.get('inheritance') is None:
+            raise AgentError('inheritance_source_conflict',
+                f'Scope is bound to codex source {stored}; rebind explicitly with codex_home or inheritance parameters')
+        enabled=bool(inh.get('enabled',True))
+        if p.get('inheritance') is False: enabled=False
+        elif p.get('inheritance') is True: enabled=True
+        self.store.execute('UPDATE scopes SET codex_home=?,codex_source=?,inheritance=? WHERE id=?',
+            (str(home) if home else None, mode if home else None, 1 if enabled else 0, sid))
+        if env is not None:
+            names=set(BASE_KEYS)
+            if home is not None:
+                try:
+                    servers,_=parse_mcp_servers(home,read_codex_config(home))
+                    names=referenced_env_names(servers)
+                except AgentError:
+                    pass
+            # Minimal per-scope snapshot: referenced names only; never persisted.
+            self.scope_env[sid]={k:v for k,v in env.items() if k in names}
+
+    def inheritance_doctor(self):
+        inh=self.config['inheritance']
+        report={'config':{k:inh.get(k) for k in ('enabled','skills','mcp','codex_home')},'scopes':[],
+                'note':'Environment variable and header values are never shown; only names and sources.'}
+        for s in self.store.all('SELECT * FROM scopes ORDER BY created DESC LIMIT 100'):
+            entry={'scope':s['id'],'label':s['label'],'cwd':s['cwd'],
+                   'inheritance_enabled':bool(s['inheritance']) and bool(inh.get('enabled',True)),
+                   'codex_home':s['codex_home'],'source_mode':s['codex_source'],
+                   'bound_env_names':sorted(self.scope_env.get(s['id'],{}))}
+            if inh.get('enabled') and s['inheritance'] and s['codex_home']:
+                home=Path(s['codex_home'])
+                try:
+                    raw=read_codex_config(home)
+                    skills,skill_diag=collect_skills(home,raw,s['cwd'],[])
+                    servers,mcp_diag=parse_mcp_servers(home,raw)
+                    try:
+                        servers,env_diag=resolve_environment(servers,self.scope_env.get(s['id'],{}))
+                        mcp_diag+=env_diag
+                        servers,acc_diag=policy_filter(servers,'write')
+                        mcp_diag+=acc_diag
+                    except AgentError as exc:
+                        mcp_diag.append(Diagnostic('mcp','required',exc.message))
+                        servers=[]
+                    entry.update(inherited_skills=[{'path':path,'name':Path(path).name} for path in skills],
+                                 mcp_servers=[{'name':x['name'],'transport':x['transport']} for x in servers],
+                                 diagnostics=[d.as_dict() for d in skill_diag+mcp_diag])
+                except AgentError as exc:
+                    entry['error']=exc.as_dict()
+            report['scopes'].append(entry)
+        return report
 
     def require_worker(self,a):
         w=self.workers.get(a['id'])
@@ -452,7 +670,7 @@ class Runtime:
         count=self.store.one("SELECT COUNT(*) n FROM runs WHERE scope=? AND ack=0",(sid,))['n']
         return {'revision':self.store.scope(sid)['revision'],'runs':[self.brief_run(r) for r in rows], 'total':count,'omitted':max(0,count-len(rows))}
 
-    async def dispatch(self,op,p):
+    async def dispatch(self,op,p,source=None):
         if op=='ping': return {'version':__version__,'protocol':PROTOCOL_VERSION,'pid':os.getpid()}
         if op=='scope_list':
             return {'scopes':self.store.all('SELECT * FROM scopes ORDER BY created DESC LIMIT 100')}
@@ -468,6 +686,7 @@ class Runtime:
             else:
                 sid=new_id('scope_')
                 self.store.execute('INSERT INTO scopes(id,cwd,label,created) VALUES(?,?,?,?)',(sid,cwd,text(p.get('label','Codex Pi delegation'),'label',160),now()))
+            self._bind_scope_source(sid,p,source)
             return {'scope':sid,'cwd':cwd, 'outstanding':self.outstanding(sid)}
         if op=='shutdown':
             if not p.get('force') and any(not w.closed for w in self.workers.values()):
@@ -475,11 +694,13 @@ class Runtime:
             self.shutdown_requested.set(); return {'shutdown':'requested'}
         if op=='doctor':
             import shutil
-            return {'version':__version__,'platform':sys.platform,'python':sys.version.split()[0],
+            report={'version':__version__,'platform':sys.platform,'python':sys.version.split()[0],
                     'pi_executable':shutil.which(self.config['pi_command'][0]),'profiles':list(self.config['profiles']),
                     'resident_agents':sum(not w.closed for w in self.workers.values()),
                     'home':str(self.home),'hooks':False,'native_codex_agents_ui':False,
                     'warning':'Managed Pi runs with your OS-user permissions; no inherited Codex sandbox.'}
+            if p.get('inheritance'): report['inheritance']=self.inheritance_doctor()
+            return report
         sid=identifier(p.get('scope'),'scope'); self.store.scope(sid)
         mutations={'spawn','send','interrupt','close','respawn','ack','answer'}
         if op in mutations:

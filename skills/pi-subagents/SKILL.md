@@ -24,3 +24,5 @@ There are no automatic wakeups, hooks, or native Codex `/agents` integration.
 Read only the relevant section of `../../docs/lifecycle.md`, `recovery.md`,
 `configuration.md`, or `troubleshooting.md` when needed.
 Human CLI and installation examples are in `../../docs/getting-started.md`.
+Managed children may inherit Codex global skills/MCP (config `[inheritance]`);
+diagnostics: `subagent-pi doctor --inheritance`; details in `../../docs/inheritance.md`.

@@ -19,7 +19,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.tmp=tempfile.TemporaryDirectory(prefix='subagent-pi-ipc-')
         self.root=Path(self.tmp.name); self.home=self.root/'state'; self.home.mkdir()
         self.workspace=self.root/'workspace'; self.workspace.mkdir()
-        (self.home/'config.toml').write_text('pi_command = '+json.dumps([sys.executable,str(ROOT/'tests/fake_pi.py')])+'\nrpc_timeout_seconds=8\n')
+        (self.home/'config.toml').write_text('pi_command = '+json.dumps([sys.executable,str(ROOT/'tests/fake_pi.py')])+'\nrpc_timeout_seconds=8\n[inheritance]\nenabled = false\n')
         self.mcp=None; self.stderr_task=None; self.reqid=0
     async def asyncTearDown(self):
         if self.mcp and self.mcp.returncode is None:

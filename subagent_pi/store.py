@@ -16,7 +16,8 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript('''
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
-        CREATE TABLE IF NOT EXISTS scopes(id TEXT PRIMARY KEY,cwd TEXT NOT NULL,label TEXT NOT NULL,created REAL NOT NULL,revision INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS scopes(id TEXT PRIMARY KEY,cwd TEXT NOT NULL,label TEXT NOT NULL,created REAL NOT NULL,revision INTEGER NOT NULL DEFAULT 0,
+            codex_home TEXT,codex_source TEXT,inheritance INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS agents(id TEXT PRIMARY KEY,scope TEXT NOT NULL REFERENCES scopes(id),name TEXT NOT NULL,cwd TEXT NOT NULL,state TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 0,session_file TEXT NOT NULL,launch TEXT NOT NULL,created REAL NOT NULL,updated REAL NOT NULL,current_run TEXT,pid INTEGER,identity TEXT,cleanup TEXT NOT NULL DEFAULT 'verified',UNIQUE(scope,name));
         CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL REFERENCES agents(id),scope TEXT NOT NULL REFERENCES scopes(id),state TEXT NOT NULL,task TEXT NOT NULL,created REAL NOT NULL,started REAL,ended REAL,deadline REAL,result_path TEXT,result_sha TEXT,ack INTEGER NOT NULL DEFAULT 0,error TEXT,usage TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS requests(scope TEXT NOT NULL,key TEXT NOT NULL,digest TEXT NOT NULL,op TEXT NOT NULL,state TEXT NOT NULL,response TEXT,created REAL NOT NULL,PRIMARY KEY(scope,key));
@@ -28,8 +29,19 @@ class Store:
         CREATE INDEX IF NOT EXISTS receipts_run ON receipts(run_id,state);
         ''')
         v = self.one("SELECT value FROM meta WHERE key='schema'")
-        if v and v['value'] != '1': raise AgentError("version_mismatch", "Unsupported database schema")
-        self.db.execute("INSERT OR IGNORE INTO meta VALUES('schema','1')")
+        if v and v['value'] == '1':
+            # Transactional migration to schema 2: non-secret inheritance source columns.
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                self.db.execute('ALTER TABLE scopes ADD COLUMN codex_home TEXT')
+                self.db.execute('ALTER TABLE scopes ADD COLUMN codex_source TEXT')
+                self.db.execute('ALTER TABLE scopes ADD COLUMN inheritance INTEGER NOT NULL DEFAULT 1')
+                self.db.execute("UPDATE meta SET value='2' WHERE key='schema'")
+                self.db.execute('COMMIT')
+            except BaseException:
+                self.db.execute('ROLLBACK'); raise
+        elif v and v['value'] != '2': raise AgentError('version_mismatch', 'Unsupported database schema')
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES('schema','2')")
 
     def one(self, sql, args=()):
         r = self.db.execute(sql, args).fetchone()

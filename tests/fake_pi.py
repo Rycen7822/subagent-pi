@@ -14,6 +14,32 @@ p.add_argument('--hold-eof',action='store_true'); p.add_argument('--session'); p
 a,_=p.parse_known_args()
 path=Path(a.session) if a.session else Path(a.session_dir)/'test-session.jsonl'; current=None; queue=[]; ui={}; count=0
 
+def read_bootstrap():
+    """Emulate the real bridge: consume the anonymous pipe, emit the ready marker."""
+    raw=os.environ.get('PI_AGENTS_BOOTSTRAP_FD')
+    if not raw or not raw.isdigit(): return None
+    fd=int(raw); chunks=[]
+    while True:
+        try: data=os.read(fd,65536)
+        except OSError: break
+        if not data: break
+        chunks.append(data)
+    os.close(fd)
+    try:
+        payload=json.loads(b''.join(chunks))
+        servers=payload.get('mcp',{}).get('servers',[])
+        names=','.join(s['name'] for s in servers)
+        print(f'subagent-pi-bridge ready servers={len(servers)} names={names}',file=sys.stderr,flush=True)
+        for s in servers:
+            if 'FAKE_TEST_ECHO' in s.get('env',{}):
+                print(f'bridge-env {s["name"]}={s["env"]["FAKE_TEST_ECHO"]}',file=sys.stderr,flush=True)
+        return payload
+    except Exception:
+        print('subagent-pi-bridge ready servers=0 error=malformed',file=sys.stderr,flush=True)
+        return None
+
+BRIDGE=read_bootstrap()
+
 def emit(e):
     print(json.dumps(e,ensure_ascii=False),flush=True)
 
