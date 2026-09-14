@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  python-core:
+    name: Python core (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Package structure
+        run: |
+          python --version
+          python scripts/validate_package.py
+      - name: Offline unit tests (no Pi installed; Pi-dependent bridge tests skip here)
+        run: python -m unittest discover -s tests -v
+
+  integration:
+    name: Pi bridge & package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PI_VERSION: "0.85.1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.19.0"
+
+      - name: Install pinned Pi distribution (CLI only; no model calls)
+        run: |
+          npm install --global "@earendil-works/pi-coding-agent@${PI_VERSION}"
+          command -v pi
+          pi --version
+
+      - name: Repo dev dependencies and TypeScript typecheck
+        run: |
+          npm ci --ignore-scripts
+          npm run setup
+          npm run typecheck
+
+      - name: Preflight — Pi must be visible or bridge tests would skip
+        run: |
+          python - <<'PY'
+          import shutil
+          from pathlib import Path
+          pi = shutil.which("pi")
+          assert pi, "Pi is not installed; bridge tests would skip"
+          print("Pi:", Path(pi).resolve())
+          PY
+
+      - name: Package structure and full offline unit tests
+        run: |
+          python scripts/validate_package.py
+          python -m unittest discover -s tests -v
+
+      - name: Package, FILES.sha256 consistency and archive sanity
+        run: |
+          tmp="$(mktemp -d)"
+          python scripts/package.py --output "$tmp/subagent-pi.zip"
+          git diff --exit-code -- FILES.sha256
+          unzip -t "$tmp/subagent-pi.zip"
+          (
+            cd "$tmp"
+            sha256sum -c subagent-pi.zip.sha256
+          )
+          unzip -l "$tmp/subagent-pi.zip" | grep 'subagent-pi/plugin.json'
+          unzip -l "$tmp/subagent-pi.zip" | grep 'subagent-pi/extensions/codex-mcp-bridge.ts'
+          unzip -l "$tmp/subagent-pi.zip" | grep 'subagent-pi/.github/workflows/ci.yml'

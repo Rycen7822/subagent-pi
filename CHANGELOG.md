@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- GitHub Actions CI：python-core（3.11/3.14）与 integration（真实 Pi 0.85.1 + Node 22.19.0，bridge tests 真实执行 + ZIP/FILES.sha256 校验）；0 模型调用、0 secrets、`contents: read`。
+
 ## 0.2.7 — 2026-09-15
 
 Three MCP P1 fixes against review baseline 2c057b4 (0.2.6).

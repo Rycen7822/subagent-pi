@@ -53,6 +53,15 @@ python3 scripts/live_smoke.py --allow-model-call
 
 该测试需要现成 Pi 认证，可能产生费用。它只检查独立 Pi RPC 可以读临时 marker、返回结果、确认并关闭；不能证明任意扩展/provider 组合均兼容。
 
+## GitHub CI
+
+`.github/workflows/ci.yml` 在每次 main push 与 PR 上运行两个 job：
+
+- **python-core**（3.11 / 3.14）：package 结构校验 + 完整离线 unittest；未安装 Pi，Pi 依赖的 bridge tests 按现有门控 skip。
+- **integration**（Python 3.11 + Node 22.19.0）：安装固定 `@earendil-works/pi-coding-agent@0.85.1`，`npm ci --ignore-scripts && npm run setup && npm run typecheck`，preflight 确认 `pi` 可见（否则红），完整 unittest（bridge tests 真实执行），最后生成 source ZIP、校验 `FILES.sha256` 无 diff、`sha256sum -c` 与 archive 内容完整性。
+
+CI 默认 0 模型调用（不设置 `SUBAGENT_PI_LIVE_PI`）、0 外部业务 MCP、0 secrets、权限仅 `contents: read`；所有 `actions/*` 均 full commit SHA pin。升级 Pi/Node 需明确修改 workflow 中的 pin。
+
 ## 实际 Codex 验收
 
 安装插件、新建 Codex 会话，用 pi_context + reader 启动一个小任务；在其运行时 inspect 和 steer，再 wait/result/ack。另测中断后继续、关闭后恢复、MCP 重连后同 scope 查询。

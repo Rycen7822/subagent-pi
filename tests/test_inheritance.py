@@ -16,7 +16,7 @@ import unittest
 
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
-from subagent_pi.common import AgentError, dumps
+from subagent_pi.common import AgentError, dumps, socket_path
 from subagent_pi.inheritance import (CODEX_MCP_BASELINE, capture_scope_env, collect_skills, parse_mcp_servers,
     policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from subagent_pi.runtime import Runtime
@@ -761,7 +761,7 @@ class CodexLauncherProcess(unittest.TestCase):
                 self.assertEqual(proc3.returncode,0,proc3.stderr or proc3.stdout)
                 self.assertEqual(json.loads(proc3.stdout)['argv'],['exec'])
             finally:
-                subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True,text=True,timeout=30)
+                stop_daemon(cli,env)
         finally:
             tmp.cleanup()
 
@@ -817,6 +817,17 @@ class ScopeEnvIsolation(unittest.IsolatedAsyncioTestCase):
         wal=self.home/'registry.sqlite-wal'
         if wal.exists():
             self.assertNotIn(b'scope-secret-value',wal.read_bytes())
+
+def stop_daemon(cli, env, timeout=15.0):
+    """`daemon stop --force` returns when shutdown is *requested*, not when the
+    daemon process has exited; wait for the IPC socket (unlinked in the daemon's
+    final teardown) to disappear so late daemon writes cannot race
+    TemporaryDirectory.cleanup()."""
+    subprocess.run([sys.executable, cli, 'daemon', 'stop', '--force'], env=env, capture_output=True, timeout=30)
+    sock = socket_path(Path(env['PI_AGENTS_HOME']))
+    deadline = time.monotonic() + timeout
+    while sock.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 class EnvironmentBindingChain(unittest.TestCase):
     """P1-E end-to-end: a REAL CLI client -> autostarted daemon -> worker guard
@@ -886,7 +897,7 @@ class EnvironmentBindingChain(unittest.TestCase):
             return data,state,env,cli,tmp
         except Exception:
             if env is not None:
-                subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True,timeout=30)
+                stop_daemon(cli,env)
             tmp.cleanup()
             raise
 
@@ -908,7 +919,7 @@ class EnvironmentBindingChain(unittest.TestCase):
                 if p.is_file():
                     self.assertNotIn(b'real-secret-123',p.read_bytes(),p)
         finally:
-            subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True,timeout=30)
+            stop_daemon(cli,env)
             tmp_s.cleanup()
 
     def test_two_scopes_get_their_own_chain_env(self):
@@ -917,13 +928,13 @@ class EnvironmentBindingChain(unittest.TestCase):
         try:
             self.assertEqual(data_a['home_tag'],'A')
         finally:
-            subprocess.run([sys.executable,cli_a,'daemon','stop','--force'],env=env_a,capture_output=True,timeout=30)
+            stop_daemon(cli_a,env_a)
             tmp_a.cleanup()
         data_b,state_b,env_b,cli_b,tmp_b=self._scenario(cfg,None,'B')
         try:
             self.assertEqual(data_b['home_tag'],'B')   # not scope A's value
         finally:
-            subprocess.run([sys.executable,cli_b,'daemon','stop','--force'],env=env_b,capture_output=True,timeout=30)
+            stop_daemon(cli_b,env_b)
             tmp_b.cleanup()
 
     def test_reenabling_inheritance_restores_import(self):
@@ -950,7 +961,7 @@ class EnvironmentBindingChain(unittest.TestCase):
             self.assertNotIn('--extension',argv)  # master off: no import
             # Flip the master switch on and rebind: import comes back.
             (state/'config.toml').write_text('pi_command = '+fake_pi_command()+'\nstartup_timeout_seconds = 30\n\n[inheritance]\nenabled = true\nchild_env = ["PI_TEST_AUTH", "PI_TEST_PROBE_FILE", "PI_TEST_PROBE_CMD", "PI_TEST_HOME_TAG"]\n')
-            subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True,timeout=30)
+            stop_daemon(cli,env)  # fully exited before the next autostart races the same socket
             # The restart wiped the daemon's source memory: the owning client
             # must re-open the scope to rebind (no silent ~/.codex fallback).
             self._cli(cli,env,'scope','open','--cwd',str(ws),'--label','chain','--scope',scope_id)
@@ -964,7 +975,7 @@ class EnvironmentBindingChain(unittest.TestCase):
             self.assertIn('--skill',argv2)
             self.assertIn('alpha',' '.join(argv2))  # the codex skill path is referenced in place
         finally:
-            subprocess.run([sys.executable,cli,'daemon','stop','--force'],env=env,capture_output=True)
+            stop_daemon(cli,env)
             tmp.cleanup()
 
 if __name__=='__main__':
