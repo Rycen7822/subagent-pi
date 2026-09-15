@@ -84,7 +84,8 @@ class ShipManifest(unittest.TestCase):
             self.assertTrue(m.excluded(ROOT/stray,ROOT),f'{stray} would be shipped')
     def test_runtime_files_are_included(self):
         m=self.ship()
-        for needed in ['subagent_pi/runtime.py','bin/subagent-pi','extensions/codex-mcp-bridge.ts',
+        for needed in ['subagent_pi/runtime.py','subagent_pi/worker.py','subagent_pi/views.py',
+                       'subagent_pi/binding.py','bin/subagent-pi','extensions/codex-mcp-bridge.ts',
                        'plugin.json','docs/architecture.md','skills/pi-subagents/SKILL.md',
                        '.github/workflows/ci.yml','scripts/ship_manifest.py']:
             self.assertFalse(m.excluded(ROOT/needed,ROOT),f'{needed} would be missing')
@@ -98,4 +99,24 @@ class ShipManifest(unittest.TestCase):
         install=(ROOT/'scripts/install.py').read_text()
         self.assertIn('ship_files',package)
         self.assertIn('excluded',install)
+
+class RuntimeModuleBoundaries(unittest.TestCase):
+    """runtime.py orchestrates state; the process, binding and projection mechanics
+    live in worker/binding/views. Re-absorbing them is how the module became a god
+    object, so pin the direction of every dependency that matters."""
+    def test_runtime_does_not_import_process_mechanics(self):
+        src=(ROOT/'subagent_pi/runtime.py').read_text()
+        for forbidden in ('import signal','import fcntl','os.pipe(','create_subprocess_exec',
+                          'killpg','connect_read_pipe','atomic_json','run_in_executor'):
+            self.assertNotIn(forbidden,src,f'runtime.py re-acquired {forbidden!r}')
+    def test_no_module_imports_runtime_into_the_mechanics(self):
+        for module in ('worker','binding','views'):
+            src=(ROOT/f'subagent_pi/{module}.py').read_text()
+            self.assertNotIn('from .runtime',src,f'{module}.py must not depend on runtime.py')
+    def test_local_import_breaks_the_boot_cycle(self):
+        # worker.boot_worker imports binding lazily so binding can stay importable
+        # without a Runtime instance (and no module-level cycle appears).
+        src=(ROOT/'subagent_pi/worker.py').read_text()
+        self.assertIn('from .binding import child_env, inheritance_plan, merge_bridge_tool',src)
+
 if __name__=='__main__': unittest.main()

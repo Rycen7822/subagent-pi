@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "subagent-pi",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Persistent Pi coding subagents for Codex: bounded inspection, steering, interruption and recovery through MCP and CLI.",
   "license": "MIT",
   "keywords": ["pi", "subagent", "codex", "mcp"],

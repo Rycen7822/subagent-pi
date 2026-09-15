@@ -44,6 +44,12 @@ discovery 模式（`server/discover` → 404 证明可回退）与 legacy sessio
 - `test_package.ShipManifest`：ZIP 与安装目录共用的排除规则挡住 `.mypy_cache`/`.cursor`/`dist`/`*.local.md`/`CLAUDE.md` 等本地文件，同时保留运行时必需文件，并断言两条路径确实共用同一规则。
 - `test_inheritance.StoreMigration`：schema 1→当前、2→当前，以及拒绝更高版本。
 
+0.2.9 模块边界回归：
+
+- `test_package.RuntimeModuleBoundaries`：runtime.py 不得重新引入进程机制（signal/fcntl/os.pipe/create_subprocess_exec/killpg/connect_read_pipe/atomic_json/run_in_executor）；worker/binding/views 不得反向 import runtime；`boot_worker` 的局部 import 保持 binding 可脱离 Runtime 独立导入。
+- `test_runtime.ReconcileAndReapAgree`：同一 owner 记录在恢复路径与 `close` 路径必须得出同向结论（不可验证的一律拒绝，已验证死亡的都判 gone）。
+- `test_runtime.RestartOwnershipVerdict` 新增：未到达 fork 点（`cleanup='verified'` 且无 pid）的行必须判 dormant，不得永远悬空；`cleanup='pending'` 且无记录仍为 unknown。
+
 TypeScript 类型检查（一次性 `npm install && npm run setup`，仅开发期，固定 typescript 版本，运行时零 npm 依赖）：
 
 ```bash

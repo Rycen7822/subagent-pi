@@ -16,11 +16,13 @@ import unittest
 
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
+from subagent_pi.binding import merge_bridge_tool
 from subagent_pi.common import AgentError, dumps, socket_path
 from subagent_pi.inheritance import (CODEX_MCP_BASELINE, capture_scope_env, collect_skills, parse_mcp_servers,
     policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from subagent_pi.runtime import Runtime
 from subagent_pi.store import SCHEMA_VERSION, Store
+from subagent_pi.worker import write_bootstrap
 
 FAKE_PI=ROOT/'tests'/'fake_pi.py'
 BRIDGE=ROOT/'extensions'/'codex-mcp-bridge.ts'
@@ -572,7 +574,7 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
     async def test_bootstrap_write_failure_recorded_without_payload(self):
         r,w=os.pipe()
         os.close(r)
-        await self.rt._write_bootstrap(w,'pi_none',9,b'{"mcp":{"servers":[]}}')
+        await write_bootstrap(self.rt,w,'pi_none',9,b'{"mcp":{"servers":[]}}')
         row=self.rt.store.one("SELECT payload FROM events WHERE type='bootstrap_write_failed' ORDER BY seq DESC LIMIT 1")
         self.assertIsNotNone(row)
         self.assertEqual(json.loads(row['payload'])['error'],'BrokenPipeError')
@@ -733,35 +735,35 @@ class RealPiParserProbe(unittest.TestCase):
         return json.loads(out.stdout)
     def test_reader_tools_survive_bridge_merge(self):
         base=['pi','--mode','rpc','--no-extensions','--no-skills','--tools','read,grep,find,ls']
-        merged=Runtime._merge_bridge_tool([*base,'--extension','/bridge.ts'])
+        merged=merge_bridge_tool([*base,'--extension','/bridge.ts'])
         self.assertEqual(merged.count('--tools'),1)
         parsed=self.probe(merged)
         self.assertEqual(parsed['tools'],['read','grep','find','ls','codex_mcp'])
         self.assertFalse(parsed.get('noTools'))
     def test_no_tools_becomes_bridge_only(self):
-        merged=Runtime._merge_bridge_tool(['pi','--mode','rpc','--no-tools','--extension','/b.ts'])
+        merged=merge_bridge_tool(['pi','--mode','rpc','--no-tools','--extension','/b.ts'])
         self.assertNotIn('--no-tools',merged)
         self.assertEqual(merged.count('--tools'),1)
         parsed=self.probe(merged)
         self.assertEqual(parsed['tools'],['codex_mcp'])
     def test_no_tool_flags_left_untouched(self):
         argv=['pi','--mode','rpc','--extension','/b.ts']
-        self.assertEqual(Runtime._merge_bridge_tool(list(argv)),argv)  # bare --tools would strip builtins
+        self.assertEqual(merge_bridge_tool(list(argv)),argv)  # bare --tools would strip builtins
     def test_repeated_tool_flags_merge_into_one(self):
         # Pi's parser assigns on every --tools occurrence (last wins), so a second
         # flag would silently drop the bridge tool again.
-        merged=Runtime._merge_bridge_tool(['pi','--mode','rpc','--tools','read','--tools','ls'])
+        merged=merge_bridge_tool(['pi','--mode','rpc','--tools','read','--tools','ls'])
         self.assertEqual(merged.count('--tools'),1)
         parsed=self.probe(merged)
         self.assertEqual(parsed['tools'],['read','ls','codex_mcp'])
     def test_short_flag_and_duplicate_names(self):
-        merged=Runtime._merge_bridge_tool(['pi','-t','read,ls','--tools','ls','--verbose'])
+        merged=merge_bridge_tool(['pi','-t','read,ls','--tools','ls','--verbose'])
         self.assertEqual(merged.count('--tools')+merged.count('-t'),1)
         self.assertIn('--verbose',merged)   # unrelated flags survive in place
         parsed=self.probe(merged)
         self.assertEqual(parsed['tools'],['read','ls','codex_mcp'])
     def test_existing_bridge_tool_is_not_duplicated(self):
-        merged=Runtime._merge_bridge_tool(['pi','--tools','read,codex_mcp'])
+        merged=merge_bridge_tool(['pi','--tools','read,codex_mcp'])
         self.assertEqual(merged,['pi','--tools','read,codex_mcp'])
 
 class CodexLauncherProcess(unittest.TestCase):

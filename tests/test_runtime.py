@@ -15,7 +15,9 @@ from unittest import mock as m
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.common import AgentError, dumps, group_members, process_identity
+from subagent_pi import worker
 from subagent_pi.runtime import Runtime
+from subagent_pi.worker import read_receipt
 from subagent_pi.schema import TOOLS, validate, validate_op
 from subagent_pi.store import Store
 from test_inheritance import make_codex_home
@@ -247,9 +249,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
     """P1 (0.2.2): the receipt read end must have exactly ONE closer.
 
-    When the receipt reports a failed required server, _read_receipt raises
+    When the receipt reports a failed required server, read_receipt raises
     after its transport already closed the fd. The old caller kept its own
-    reference across `await self.terminate(w)` and closed the same number
+    reference across `await terminate(rt, w)` and closed the same number
     again in `finally` — by then the freed number could belong to another
     connection (another agent's RPC pipe, a CLI/MCP IPC socket), and
     suppress(OSError) does not protect a reused-but-valid fd.
@@ -292,10 +294,10 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
         # synchronously and before any await, so the second recorded pipe is
         # the receipt channel.
         with m.patch('os.pipe',self.recording_pipe):
-            real_terminate=self.rt.terminate
-            async def parked_terminate(w):
+            real_terminate=worker.terminate
+            async def parked_terminate(rt,w):
                 target=self.pipes[1][0]  # receipt read end
-                # Ordering evidence: _read_receipt's transport already closed it.
+                # Ordering evidence: read_receipt's transport already closed it.
                 for _ in range(200):
                     try: os.fstat(target); await asyncio.sleep(0.01)
                     except OSError: break
@@ -309,10 +311,10 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
                     if b.fileno()==target: self.pair=(b,a); break
                     self.spares.append((a,b))
                 self.assertIsNotNone(self.pair,'could not reoccupy receipt fd %d'%target)
-                await real_terminate(w)
-            self.rt.terminate=parked_terminate
-            with self.assertRaises(AgentError) as cm:
-                await self.rt.dispatch('spawn',{'scope':self.scope,'request_id':'fd-reuse','cwd':str(self.workspace),'task':'simple','access':'read'})
+                await real_terminate(rt,w)
+            with m.patch.object(worker,'terminate',parked_terminate):
+                with self.assertRaises(AgentError) as cm:
+                    await self.rt.dispatch('spawn',{'scope':self.scope,'request_id':'fd-reuse','cwd':str(self.workspace),'task':'simple','access':'read'})
         self.assertEqual(cm.exception.code,'inheritance_required_server_failed')
         # The socket that reclaimed the receipt fd number during the cleanup
         # window must be untouched by the failure path.
@@ -326,7 +328,7 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
         r,w=os.pipe()
         try:
             with self.assertRaises(AgentError) as cm:
-                await self.rt._read_receipt(r,'a',1,0.05)
+                await read_receipt(self.rt,r,'a',1,0.05)
             self.assertEqual(cm.exception.code,'bridge_unavailable')
             for _ in range(10): await asyncio.sleep(0)  # transport close is loop-scheduled
             with self.assertRaises(OSError): os.fstat(r)  # closed exactly once
@@ -335,7 +337,7 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
     async def test_read_receipt_closes_fd_on_cancellation(self):
         r,w=os.pipe()
         try:
-            t=asyncio.create_task(self.rt._read_receipt(r,'a',1,5))
+            t=asyncio.create_task(read_receipt(self.rt,r,'a',1,5))
             await asyncio.sleep(0.05); t.cancel()
             with self.assertRaises(asyncio.CancelledError): await t
             for _ in range(10): await asyncio.sleep(0)
@@ -348,7 +350,7 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
             loop=asyncio.get_running_loop()
             with m.patch.object(loop,'connect_read_pipe',side_effect=OSError('transport refused')):
                 with self.assertRaises(OSError):
-                    await self.rt._read_receipt(r,'a',1,1)
+                    await read_receipt(self.rt,r,'a',1,1)
             with self.assertRaises(OSError): os.fstat(r)
         finally: os.close(w)
 
@@ -398,6 +400,68 @@ class RestartOwnershipVerdict(unittest.TestCase):
         rt=Runtime(home)
         row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
         self.assertEqual(row['cleanup'],'unknown')
+        tmp.cleanup()
+
+    def test_never_launched_row_is_verified_not_a_phantom_orphan(self):
+        # cleanup='verified' means no child was ever marked pending: there is no
+        # owner record to expect, so the row must not stay unresolvable forever.
+        tmp,home=self.seed(pid=None,identity=None)
+        store=Store(home); store.agent_update('pi_seed',cleanup='verified'); store.close()
+        rt=Runtime(home)
+        row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
+        self.assertEqual((row['state'],row['cleanup']),('dormant','verified'))
+        tmp.cleanup()
+
+    def test_pending_launch_without_owner_record_stays_unknown(self):
+        # cleanup='pending' is set before the fork, so a missing record cannot
+        # prove the child never started.
+        tmp,home=self.seed(pid=None,identity=None)
+        store=Store(home); store.agent_update('pi_seed',cleanup='pending'); store.close()
+        rt=Runtime(home)
+        row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
+        self.assertEqual((row['state'],row['cleanup']),('orphaned','unknown'))
+        tmp.cleanup()
+
+class ReconcileAndReapAgree(unittest.TestCase):
+    """Crash reconciliation and orphan reaping must reach the same verdict on the
+    same owner record: a divergence would let `close` reap a session the restart
+    path called unknown, or leave a row unresolvable after a clean shutdown."""
+    def seed(self, owner, pid=None, identity=None, state='running', cleanup='pending'):
+        tmp=tempfile.TemporaryDirectory(prefix='owner-agree-')
+        home=Path(tmp.name)/'state'; home.mkdir()
+        ws=Path(tmp.name)/'ws'; ws.mkdir()
+        (home/'config.toml').write_text('[inheritance]\nenabled = false\n')
+        directory=home/'agents'/'pi_seed'; (directory/'sessions').mkdir(parents=True)
+        (directory/'session.jsonl').write_text('{}\n')
+        if owner is not None:
+            (directory/'owner.json').write_text(json.dumps(owner))
+        store=Store(home)
+        store.execute('INSERT INTO scopes(id,cwd,label,created) VALUES(?,?,?,?)',('s1',str(ws),'t',1.0))
+        store.execute('INSERT INTO agents(id,scope,name,cwd,state,session_file,launch,created,updated,pid,identity,cleanup) '
+                      'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            ('pi_seed','s1','pi_seed',str(ws),state,str(directory/'session.jsonl'),
+             json.dumps({'argv':['x'],'cwd':str(ws),'access':'read'}),1.0,1.0,pid,identity,cleanup))
+        store.close()
+        return tmp, home
+
+    def test_both_paths_refuse_an_unverifiable_owner(self):
+        tmp,home=self.seed({'guard_pid':4081,'guard_identity':'boot:stale','spawning':True})
+        rt=Runtime(home)
+        row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
+        self.assertEqual(row['cleanup'],'unknown')
+        with self.assertRaises(AgentError) as cm:
+            asyncio.run(worker.reap_orphan(rt,rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))))
+        self.assertEqual(cm.exception.code,'ownership_unknown')
+        tmp.cleanup()
+
+    def test_both_paths_clear_a_verified_gone_owner(self):
+        tmp,home=self.seed({'guard_pid':999999,'guard_identity':'boot:gone',
+                            'pi_pid':999998,'pi_identity':'boot:gone','spawning':False})
+        rt=Runtime(home)
+        row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
+        self.assertEqual((row['state'],row['cleanup']),('dormant','verified'))
+        verdict=asyncio.run(worker.reap_orphan(rt,rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))))
+        self.assertEqual(verdict,'verified')
         tmp.cleanup()
 
 if __name__=='__main__': unittest.main()

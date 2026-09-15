@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.9 — 2026-09-15
+
+Module-boundary refactor of the daemon runtime. No IPC/MCP behavior changes; the
+one behavioral change is the ownership verdict (below), which is now shared.
+
+- `runtime.py` no longer owns the process, binding and projection mechanics. It
+  was 1081 lines with six unrelated responsibilities; it is now a 450-line state
+  machine, and the extracted modules each own one seam:
+  - `worker.py` — `Worker` (the JSONL RPC channel), `boot_worker`,
+    `read_receipt`/`write_bootstrap`, `terminate` and `reap_orphan`.
+  - `binding.py` — `child_env`, `bind_scope_source`, `inheritance_plan`,
+    `merge_bridge_tool`, `doctor`.
+  - `views.py` — `brief_agent`/`brief_run`/`outstanding`/`inspect`/`result`/`wait`.
+  Dependencies run runtime → {worker, binding, views}; none of the three imports
+  runtime, so they stay testable without a live Runtime. A test pins that
+  direction so the split cannot silently erode.
+- The owner-record verdict is now one function (`worker.ownership`) returning
+  `gone`/`live`/`unknown`, used by crash reconciliation, orphan reaping and
+  terminate. Previously the restart path and `close` each re-derived it, so the
+  same ledger row could be `unknown` to one and reapable by the other.
+- `close`/reconcile no longer stall on a row that never reached the fork point:
+  an agent recorded as `cleanup='verified'` with no pid has no missing owner
+  record to explain, so it resolves to `dormant` instead of staying unresolvable.
+
 ## 0.2.8 — 2026-09-15
 
 Architecture review follow-up: four reproducible defects plus the structural

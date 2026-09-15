@@ -19,10 +19,15 @@ common.py：JSONL、UTF-8 边界、私有目录、原子写、Linux 进程身份
 store.py：SQLite WAL/FULL、请求幂等、结果事务、事件索引。
 config.py：用户配置、profile、确定化启动 argv。
 worker_guard.py：session writer 租约和双进程身份。
-runtime.py：agent/run 状态机、输入队列、结果和等待。
+runtime.py：agent/run 状态机与 op 路由，账本状态迁移的唯一所有者。
+worker.py：单个 Pi 子进程的 RPC 通道、启动交接 fd、回执读取与进程组归属（`ownership` 是 reaping/恢复/terminate 共用的唯一判定）。
+binding.py：scope 绑定、子进程环境、每次启动重建的 Codex 继承计划。
+views.py：brief/inspect/result/wait 的有界只读投影，不修改状态、不确认结果。
 daemon.py / client.py：本地 IPC、单实例锁、断线语义。
 schema.py：MCP 与 IPC 共用 schema 和校验。
 mcp.py / cli.py：两个薄入口，不各自维护任务状态。
+
+依赖方向固定为 runtime → {worker, binding, views} → {common, store, inheritance}；机制模块不反向引用 runtime，因此它们可脱离 Runtime 实例单独测试。
 
 ## 数据结构
 

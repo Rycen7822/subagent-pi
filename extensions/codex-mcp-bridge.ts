@@ -559,7 +559,7 @@ function assertDiscoverResult(result: unknown): void {
       `has no common version with this bridge (${MODERN_VERSION})`);
   }
 }
-const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.8" };
+const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.9" };
 const MODERN_META = {
   "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
   "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
