@@ -13,6 +13,8 @@ import tempfile
 
 SOURCE=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(SOURCE))
+sys.path.insert(0,str(SOURCE/'scripts'))
+from ship_manifest import excluded
 from subagent_pi import __version__
 from subagent_pi.common import atomic_json, atomic_write, state_home
 
@@ -35,12 +37,12 @@ def install(args):
     (destination/'plugins').mkdir(exist_ok=True)
     stage=Path(tempfile.mkdtemp(prefix='.subagent-pi-stage-',dir=destination))
     try:
-        # Same selection rules as scripts/package.py: never ship scratch dirs,
-        # dev tooling, user config, runtime databases, logs or old artifacts.
-        shutil.copytree(SOURCE,stage/'payload',ignore=shutil.ignore_patterns(
-            '__pycache__','*.pyc','.git','*.zip','.pytest_cache','.venv','.work','.pi',
-            '.codex','.claude','node_modules','*.sqlite','*.sqlite-wal','*.sqlite-shm',
-            'daemon.log','daemon.previous.log','.mypy_cache','.ruff_cache','*.egg-info'),dirs_exist_ok=False)
+        # Exact same ship-file rule as scripts/package.py: the installed plugin and
+        # the ZIP must never diverge on what is local, generated or private.
+        def ignore(directory,names):
+            base=Path(directory)
+            return {n for n in names if excluded(base/n,SOURCE)}
+        shutil.copytree(SOURCE,stage/'payload',ignore=ignore,dirs_exist_ok=False)
         entry=str(plugin/'bin/subagent-pi')
         # Resolve paths at install time. Do not depend on undocumented plugin-root substitutions or host cwd.
         server={'command':str(Path(sys.executable).resolve()),'args':[entry,'mcp'],'env':{'PI_AGENTS_HOME':str(home)}}

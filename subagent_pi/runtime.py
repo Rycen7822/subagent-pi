@@ -10,15 +10,16 @@ import shutil
 import sys
 import time
 from . import __version__, PROTOCOL_VERSION
-from .common import (TERMINAL, MAX_FRAME, AgentError, atomic_json, bounded,
+from .common import (TERMINAL, MAX_FRAME, AgentError, atomic_json, BASE_ENV_KEYS, bounded,
     crop, dumps, group_members, identifier, integer, live_identity, new_id, now,
-    private_dir, process_identity, read_frame, text)
+    private_dir, process_identity, read_frame, RESIDENT_AGENT_STATES, text)
 from .config import load_config, launch_spec
 from .inheritance import (CODEX_MCP_BASELINE, Diagnostic, collect_skills, parse_mcp_servers, policy_filter,
     read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from .store import Store
 
-BASE_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME')
+BASE_KEYS = BASE_ENV_KEYS
+RESIDENT_STATES = RESIDENT_AGENT_STATES
 
 RESULT_CAP = 1024 * 1024
 BOOTSTRAP_MAX = 4 * 1024 * 1024
@@ -45,7 +46,6 @@ class Worker:
         self.last_activity = now()
         self.events_written = 0
         self.tasks = []
-        self.lock_fd = None
         self.write_lock = asyncio.Lock()
     def start(self):
         self.tasks = [asyncio.create_task(self.read_stdout()),asyncio.create_task(self.read_stderr()),asyncio.create_task(self.watch_exit())]
@@ -195,16 +195,24 @@ class Runtime:
     def _merge_bridge_tool(argv, tool='codex_mcp'):
         """Merge the bridge tool into Pi's single tool allowlist over the FULL argv.
         Pi's CLI parser assigns on every --tools occurrence (last wins), so appending
-        a second flag would wipe the builtin reader/writer allowlist. With no tool
-        flag at all, argv is left untouched: Pi then allows extension tools by
-        default, and a bare --tools would strip builtins.
+        a second flag would wipe the builtin reader/writer allowlist, and merging only
+        the first flag would let a later one drop the bridge tool again. Every
+        occurrence is therefore merged into one flag. With no tool flag at all, argv
+        is left untouched: Pi then allows extension tools by default, and a bare
+        --tools would strip builtins.
         """
-        i = next((k for k, x in enumerate(argv) if x in ('--tools', '-t')), None)
-        if i is not None and i + 1 < len(argv):
-            names = [n for n in argv[i + 1].split(',') if n]
-            if tool not in names:
-                names.append(tool)
-            return [*argv[:i], '--tools', ','.join(names), *argv[i + 2:]]
+        flags = [k for k, x in enumerate(argv) if x in ('--tools', '-t')]
+        if flags:
+            names = []
+            consumed = set(flags)
+            for k in flags:
+                if k + 1 >= len(argv): continue
+                consumed.add(k + 1)
+                for name in argv[k + 1].split(','):
+                    if name and name not in names: names.append(name)
+            if tool not in names: names.append(tool)
+            rest = [x for k, x in enumerate(argv) if k not in consumed]
+            return [*rest, '--tools', ','.join(names)]
         if '--no-tools' in argv:
             return [x for x in argv if x != '--no-tools'] + ['--tools', tool]
         return argv
@@ -251,12 +259,19 @@ class Runtime:
             path = self.home/'agents'/a['id']/'owner.json'
             owner = {}
             try: owner = json.loads(path.read_text())
-            except FileNotFoundError: pass
-            except (ValueError,OSError): owner={'spawning':True}
-            states = [live_identity(owner.get(k+'_pid'),owner.get(k+'_identity')) for k in ('guard','pi')]
-            uncertain = any(v is not False for v in states) or bool(owner.get('spawning'))
-            if owner.get('guard_pid') and group_members(owner['guard_pid']): uncertain=True
-            if a['state'] in {'starting','running','needs_input','idle','stopping','orphaned'}:
+            except FileNotFoundError: owner = None
+            except (ValueError,OSError): owner = {'spawning':True}
+            # A missing owner record proves nothing about the old writer: the
+            # guard may have been killed before it wrote one. Only a positively
+            # dead leader with no surviving process group clears the agent.
+            if owner is None:
+                dead_leader = bool(a['pid']) and live_identity(a['pid'],a.get('identity')) is False
+                uncertain = not (dead_leader and not group_members(a['pid']))
+            else:
+                states = [live_identity(owner.get(k+'_pid'),owner.get(k+'_identity')) for k in ('guard','pi')]
+                uncertain = any(v is not False for v in states) or bool(owner.get('spawning'))
+                if owner.get('guard_pid') and group_members(owner['guard_pid']): uncertain=True
+            if a['state'] in RESIDENT_STATES:
                 self.store.agent_update(a['id'],state='orphaned' if uncertain else 'dormant',cleanup='unknown' if uncertain else 'verified')
             for r in self.store.all("SELECT * FROM runs WHERE agent_id=? AND state IN ('running','starting','needs_input','stopping','queued')",(a['id'],)):
                 self.store.finish(r['id'],'crashed' if r['state']!='queued' else 'cancelled','',
@@ -331,8 +346,10 @@ class Runtime:
         """Base environment for the guard/Pi child, built from the scope's bound
         snapshot — never a copy of the daemon's environ. Env-based model auth
         requires explicitly configured names (inheritance.child_env); profile env
-        values come from the current config, never from the persisted copy."""
-        snapshot = self.scope_env.get(sid) or {}
+        values come from the current config, never from the persisted copy.
+        A daemon restart drops the in-memory snapshot, so the non-secret base keys
+        reload from the ledger; other bound values stay gone until a rebind."""
+        snapshot = {**self._persisted_base_env(sid), **self.scope_env.get(sid, {})}
         inh = self.config['inheritance']
         allowed = set(BASE_KEYS) | {k for k in inh.get('child_env', []) if isinstance(k, str)}
         env = {k: v for k, v in snapshot.items() if k in allowed and isinstance(v, str)}
@@ -342,6 +359,25 @@ class Runtime:
             env.update({k: v for k, v in penv.items() if isinstance(k, str) and isinstance(v, str)})
         env['PI_AGENTS_MANAGED_CHILD'] = '1'
         return env
+
+    def _persisted_base_env(self, sid):
+        """Base keys (PATH/HOME/...) survive a restart because they are not
+        secrets; they are stored per scope so a respawned worker can still find
+        its interpreter. Everything else bound to the scope stays in memory."""
+        row = self.store.one('SELECT base_env FROM scopes WHERE id=?', (sid,))
+        if not row or not row['base_env']:
+            return {}
+        try:
+            value = json.loads(row['base_env'])
+        except ValueError:
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        return {k: v for k, v in value.items() if k in BASE_KEYS and isinstance(v, str)}
+
+    def _remember_base_env(self, sid, snapshot):
+        base = {k: v for k, v in snapshot.items() if k in BASE_KEYS and isinstance(v, str)}
+        self.store.execute('UPDATE scopes SET base_env=? WHERE id=?', (dumps(base) if base else None, sid))
 
     async def _read_receipt(self, fd, aid, generation, timeout):
         """Read and parse the bridge's structured receipt from the pipe (in-memory,
@@ -390,8 +426,9 @@ class Runtime:
     def _assert_writer_exclusive(self, aid, cwd):
         """Only one managed writer may own a cwd subtree at a time (a read label
         strips mutation builtins; it is not OS confinement)."""
-        q="SELECT * FROM agents WHERE id!=? AND (state IN ('starting','running','needs_input','idle','orphaned','stopping') OR cleanup='unknown')"
-        for other in self.store.all(q,(aid,)):
+        marks=','.join('?'*len(RESIDENT_STATES))
+        q=f"SELECT * FROM agents WHERE id!=? AND (state IN ({marks}) OR cleanup='unknown')"
+        for other in self.store.all(q,(aid,*RESIDENT_STATES)):
             if json.loads(other['launch']).get('access')!='write': continue
             left,right=Path(cwd),Path(other['cwd'])
             if left.is_relative_to(right) or right.is_relative_to(left):
@@ -547,8 +584,10 @@ class Runtime:
                     names |= referenced_env_names(servers)
                 except AgentError:
                     pass
-            # Minimal per-scope snapshot: referenced names only, never persisted.
+            # Minimal per-scope snapshot: referenced names only. Secrets stay in
+            # memory; only the non-secret base keys are persisted for restarts.
             self.scope_env[sid]={k:v for k,v in env.items() if k in names}
+            self._remember_base_env(sid, self.scope_env[sid])
 
     def inheritance_doctor(self):
         inh=self.config['inheritance']
@@ -944,15 +983,19 @@ class Runtime:
         result={'agent':self.brief_agent(a),'events':[],'next_cursor':after,'has_more':False,'receipts':receipts}
         earliest=self.store.one('SELECT MIN(seq) n FROM events WHERE agent_id=?',(a['id'],))['n']
         result['history_pruned']=bool(after and earliest and after<earliest-1)
+        # Grow the page one event at a time and measure the increment, so the byte
+        # budget costs one encode per event instead of re-encoding the whole page.
+        envelope=len(dumps({**result,'events':[]}).encode())
         for row in rows[:limit]:
             event={k:row[k] for k in ('seq','run_id','generation','type','created')}
             event['data']=json.loads(row['payload'])
-            candidate={**result,'events':result['events']+[event]}
-            if len(dumps(candidate).encode())>budget-100:
+            size=len(dumps(event).encode())+(1 if result['events'] else 0)  # + separator
+            if envelope+size>budget-100:
                 if not result['events']:
                     event['data']={'preview':crop(dumps(event['data']),max(80,budget//4)),'truncated':True}
                     result['events'].append(event); result['next_cursor']=row['seq']
                 result['has_more']=True; break
+            envelope+=size
             result['events'].append(event); result['next_cursor']=row['seq']
         if len(rows)>len(result['events']): result['has_more']=True
         if len(dumps(result).encode())>budget:

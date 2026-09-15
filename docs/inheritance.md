@@ -283,24 +283,29 @@ than pretending it did not run.
   (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `SHELL`, `USER`,
   `LOGNAME`, `CODEX_HOME`), exactly the variables the current codex config
   references, and explicitly configured `inheritance.child_env` names (for
-  model-auth env vars). It is never persisted, logged, or included in events.
+  model-auth env vars). Secret values are never persisted, logged, or included
+  in events. The base keys are the one exception: they are non-secret, so they
+  are stored per scope in the ledger (`scopes.base_env`) and reloaded after a
+  daemon restart — without that, a respawned worker would start with no `PATH`.
 - The guard and Pi worker do NOT inherit the daemon's environ: their base
   environment is built from the scope snapshot above, so session B never sees
-  session A's credentials. This base binding happens on EVERY scope bind,
+  session A's credentials. This base binding happens on EVERY worker boot,
   independent of the inheritance master switch — with inheritance disabled a
   worker still gets its own PATH/HOME (and never triggers any Codex source
-  access). The bridge gives each MCP stdio server only the
-  same base keys plus that server's declared `env` values.
+  access). The bridge gives each MCP stdio server only the base keys `PATH`,
+  `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR` plus that server's declared `env`
+  values — a deliberately narrower set than the worker's own.
 - Persistence stores non-secret source fields only (codex_home, mode, enabled
-  flag, variable NAMES in diagnostics, env NAMES in launch.json); profile env
-  VALUES are re-read from the operator config at every boot and never enter
-  the ledger, launch.json, requests or events.
-- After a daemon restart the scope's source path is still known, but parent
-  env values are gone: env-referencing servers are excluded with named
-  diagnostics, and required ones fail with
-  `inheritance_required_server_failed` until the owning client re-binds the
-  scope (next `pi_context` from Codex or `subagent-pi codex` re-captures it).
-  Values are never borrowed from another scope or from the daemon environment.
+  flag, variable NAMES in diagnostics, env NAMES in launch.json, base env
+  values); profile env VALUES are re-read from the operator config at every
+  boot and never enter the ledger, launch.json, requests or events.
+- After a daemon restart the scope's source path is still known and the base
+  keys reload from the ledger, but other parent env values are gone:
+  env-referencing servers are excluded with named diagnostics, and required
+  ones fail with `inheritance_required_server_failed` until the owning client
+  re-binds the scope (next `pi_context` from Codex or `subagent-pi codex`
+  re-captures it). Values are never borrowed from another scope or from the
+  daemon environment.
 - Diagnostics report variable/header names and sources, never values; URLs are
   redacted of query strings.
 - Third-party MCP servers may write their own files when they run; the

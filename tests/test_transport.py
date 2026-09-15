@@ -148,4 +148,52 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         result=await request(self.home,'wait',{'scope':sid,'run_ids':[revived['run_id']],'timeout_ms':4000})
         self.assertEqual(result['runs'][0]['state'],'completed')
 
+    async def test_base_env_survives_daemon_restart(self):
+        """The scope's non-secret base env must outlive the daemon, or a worker
+        booted on an existing scope starts with an empty environment (no PATH)."""
+        from subagent_pi.runtime import Runtime
+        env_file=self.root/'child-env.json'
+        pi_cmd='pi_command = '+json.dumps([sys.executable,str(ROOT/'tests/fake_pi.py')])
+        env_cfg=('PI_TEST_PROBE_FILE = '+json.dumps(str(env_file))+'\n'
+                 'PI_TEST_PROBE_CMD = "true"\n')
+        (self.home/'config.toml').write_text(
+            pi_cmd+'\nrpc_timeout_seconds=8\nstartup_timeout_seconds=15\n[inheritance]\nenabled = false\n'
+            '[profiles.default.env]\n'+env_cfg+'[profiles.reader.env]\n'+env_cfg)
+
+        rt=Runtime(self.home)
+        sid=(await rt.dispatch('scope_open',{'cwd':str(self.workspace)},
+             {'env':{'PATH':os.environ['PATH'],'HOME':os.environ['HOME']}}))['scope']
+        spawned=await rt.dispatch('spawn',{'scope':sid,'request_id':'env-1','cwd':str(self.workspace),
+                                           'task':'delay=0.1|warm','access':'read'})
+        first=json.loads(env_file.read_text())
+        self.assertTrue(first['path'],'baseline: first boot must have PATH')
+        self.assertEqual(first['rc'],0,'baseline: first boot could not run a PATH-discovered command')
+        await rt.dispatch('close',{'scope':sid,'agent_id':spawned['agent_id'],'request_id':'env-2'})
+        await rt.shutdown()
+
+        env_file.unlink()
+        rt2=Runtime(self.home)                 # fresh daemon over the same ledger
+        revived=await rt2.dispatch('respawn',{'scope':sid,'agent_id':spawned['agent_id'],'request_id':'env-3'})
+        await rt2.dispatch('close',{'scope':sid,'agent_id':spawned['agent_id'],'request_id':'env-4'})
+        await rt2.shutdown()
+        second=json.loads(env_file.read_text())
+        self.assertTrue(second['path'],'respawned worker lost PATH across a daemon restart')
+        self.assertEqual(second['rc'],0,'respawned worker could not run a PATH-discovered command')
+        self.assertEqual(revived['generation'],2)
+
+    async def test_restart_persists_base_env_but_never_secrets(self):
+        """The restart fallback stores base keys only; a bound secret stays in
+        memory and must not appear in the ledger."""
+        from subagent_pi.runtime import Runtime
+        (self.home/'config.toml').write_text('pi_command = '+json.dumps([sys.executable,str(ROOT/'tests/fake_pi.py')])+
+            '\nrpc_timeout_seconds=8\nstartup_timeout_seconds=15\n[inheritance]\nenabled = true\nskills = false\nmcp = false\n')
+        rt=Runtime(self.home)
+        sid=(await rt.dispatch('scope_open',{'cwd':str(self.workspace)},
+             {'env':{'PATH':'/bin','SECRET_CANARY':'sk-do-not-persist'}}))['scope']
+        stored=rt.store.scope(sid)['base_env']
+        self.assertIn('PATH',stored)
+        self.assertNotIn('SECRET_CANARY',stored)
+        self.assertNotIn(b'sk-do-not-persist',(self.home/'registry.sqlite').read_bytes())
+        await rt.shutdown()
+
 if __name__=='__main__': unittest.main()

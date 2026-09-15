@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import socket
 import stat as statmod
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,9 +14,10 @@ from unittest import mock as m
 
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
-from subagent_pi.common import AgentError, dumps, group_members
+from subagent_pi.common import AgentError, dumps, group_members, process_identity
 from subagent_pi.runtime import Runtime
 from subagent_pi.schema import TOOLS, validate, validate_op
+from subagent_pi.store import Store
 from test_inheritance import make_codex_home
 
 # No env_vars: the receipt-failure receipt must not depend on client env resolution.
@@ -349,5 +351,53 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
                     await self.rt._read_receipt(r,'a',1,1)
             with self.assertRaises(OSError): os.fstat(r)
         finally: os.close(w)
+
+class RestartOwnershipVerdict(unittest.TestCase):
+    """A ledger row whose owner record never landed must not be reported as a
+    verified cleanup while a live process may still hold the session."""
+    def seed(self, state='running', pid=None, identity=None, write_owner=False):
+        tmp=tempfile.TemporaryDirectory(prefix='restart-owner-')
+        home=Path(tmp.name)/'state'; home.mkdir()
+        ws=Path(tmp.name)/'ws'; ws.mkdir()
+        (home/'config.toml').write_text('[inheritance]\nenabled = false\n')
+        directory=home/'agents'/'pi_seed'; (directory/'sessions').mkdir(parents=True)
+        (directory/'session.jsonl').write_text('{}\n')
+        if write_owner:
+            (directory/'owner.json').write_text(json.dumps({'guard_pid':pid,'guard_identity':identity,'spawning':False}))
+        store=Store(home)
+        store.execute('INSERT INTO scopes(id,cwd,label,created) VALUES(?,?,?,?)',('s1',str(ws),'t',1.0))
+        store.execute('INSERT INTO agents(id,scope,name,cwd,state,session_file,launch,created,updated,pid,identity,cleanup) '
+                      'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            ('pi_seed','s1','pi_seed',str(ws),state,str(directory/'session.jsonl'),
+             json.dumps({'argv':['x'],'cwd':str(ws),'access':'read'}),1.0,1.0,pid,identity,'pending'))
+        store.close()
+        return tmp, home
+
+    def test_live_pid_without_owner_record_is_orphaned_not_verified(self):
+        alive=subprocess.Popen(['sleep','60'])
+        try:
+            tmp,home=self.seed(pid=alive.pid,identity=process_identity(alive.pid))
+            rt=Runtime(home)
+            row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
+            self.assertNotEqual(row['cleanup'],'verified',
+                'a live, unverifiable process was reported as a verified cleanup')
+            self.assertEqual(row['state'],'orphaned')
+        finally:
+            alive.kill(); alive.wait(); tmp.cleanup()
+
+    def test_dead_pid_without_owner_record_may_be_verified(self):
+        tmp,home=self.seed(pid=999999,identity='boot:gone')
+        rt=Runtime(home)
+        row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
+        self.assertEqual(row['cleanup'],'verified')
+        tmp.cleanup()
+
+    def test_unreadable_owner_record_is_never_verified(self):
+        tmp,home=self.seed(pid=999999,identity='boot:gone',write_owner=False)
+        (home/'agents'/'pi_seed'/'owner.json').write_text('{not json')
+        rt=Runtime(home)
+        row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
+        self.assertEqual(row['cleanup'],'unknown')
+        tmp.cleanup()
 
 if __name__=='__main__': unittest.main()

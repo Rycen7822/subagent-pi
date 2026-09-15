@@ -12,8 +12,15 @@ import time
 import uuid
 
 MAX_FRAME = 8 * 1024 * 1024
-ACTIVE = {"starting", "running", "needs_input", "stopping", "queued"}
+# Agent states in which a worker may still hold processes or work behind it; the
+# workspace exclusion and crash reconciliation both use exactly this set.
+RESIDENT_AGENT_STATES = ('starting', 'running', 'needs_input', 'idle', 'stopping', 'orphaned')
 TERMINAL = {"completed", "failed", "interrupted", "crashed", "cancelled", "timed_out"}
+# Canonical base environment for a managed worker: enough to find an interpreter,
+# a home and a locale, and nothing that carries credentials. The scope snapshot
+# captures these plus CODEX_HOME (a source pointer the daemon resolves itself,
+# which is why it is not forwarded to the child).
+BASE_ENV_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME')
 
 class AgentError(Exception):
     def __init__(self, code: str, message: str, **details):

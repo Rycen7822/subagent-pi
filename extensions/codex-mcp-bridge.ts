@@ -36,6 +36,7 @@ interface ServerCfg {
   disabled_tools: string[];
   approval_default: "auto" | "confirm";
   tool_approval: Record<string, "auto" | "confirm">;
+  // Read children confirm every call; the parent may only ever tighten this.
   confirm_all?: boolean;
 }
 interface ToolMeta {
@@ -558,7 +559,7 @@ function assertDiscoverResult(result: unknown): void {
       `has no common version with this bridge (${MODERN_VERSION})`);
   }
 }
-const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.7" };
+const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.8" };
 const MODERN_META = {
   "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
   "io.modelcontextprotocol/clientInfo": CLIENT_INFO,
@@ -919,7 +920,12 @@ export default async function (pi: ExtensionAPI) {
   }
 
   function needsConfirmation(cfg: ServerCfg, meta: ToolMeta): boolean {
-    return access === "read" || (cfg.tool_approval[meta.name] ?? cfg.approval_default) !== "auto";  // the child rule wins over parent-side auto
+    // The child rule always wins over parent-side auto: a read child confirms
+    // everything, and an explicit confirm_all (a server with no parent-side
+    // allowlist) confirms everything even in a write child.
+    if (access === "read") return true;
+    if (cfg.confirm_all === true) return true;
+    return (cfg.tool_approval[meta.name] ?? cfg.approval_default) !== "auto";
   }
 
   async function ensureConnection(cfg: ServerCfg, signal?: AbortSignal): Promise<McpConnection> {

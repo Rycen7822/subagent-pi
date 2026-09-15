@@ -20,7 +20,7 @@ from subagent_pi.common import AgentError, dumps, socket_path
 from subagent_pi.inheritance import (CODEX_MCP_BASELINE, capture_scope_env, collect_skills, parse_mcp_servers,
     policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from subagent_pi.runtime import Runtime
-from subagent_pi.store import Store
+from subagent_pi.store import SCHEMA_VERSION, Store
 
 FAKE_PI=ROOT/'tests'/'fake_pi.py'
 BRIDGE=ROOT/'extensions'/'codex-mcp-bridge.ts'
@@ -589,10 +589,35 @@ class StoreMigration(unittest.TestCase):
         '''); db.commit(); db.close()
         store=Store(base)
         cols={r['name'] for r in store.all("PRAGMA table_info(scopes)")}
-        self.assertIn('codex_home',cols); self.assertIn('inheritance',cols)
-        self.assertEqual(store.one("SELECT value FROM meta WHERE key='schema'")['value'],'2')
+        self.assertIn('codex_home',cols); self.assertIn('inheritance',cols); self.assertIn('base_env',cols)
+        self.assertEqual(store.one("SELECT value FROM meta WHERE key='schema'")['value'],str(SCHEMA_VERSION))
         self.assertEqual(store.scope('scope_x')['inheritance'],1)
         store.close(); tmp.cleanup()
+    def test_v2_database_upgrades_to_current(self):
+        # A ledger written by 0.2.7 (schema 2) must reach the current version too.
+        tmp=tempfile.TemporaryDirectory(prefix='inh-mig2-'); base=Path(tmp.name)
+        db=sqlite3.connect(base/'registry.sqlite')
+        db.executescript('''
+        CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
+        CREATE TABLE scopes(id TEXT PRIMARY KEY,cwd TEXT NOT NULL,label TEXT NOT NULL,created REAL NOT NULL,revision INTEGER NOT NULL DEFAULT 0,
+            codex_home TEXT,codex_source TEXT,inheritance INTEGER NOT NULL DEFAULT 1);
+        INSERT INTO meta VALUES('schema','2');
+        INSERT INTO scopes(id,cwd,label,created,codex_source) VALUES('scope_y','/tmp','v2',1,'scope_env');
+        '''); db.commit(); db.close()
+        store=Store(base)
+        cols={r['name'] for r in store.all("PRAGMA table_info(scopes)")}
+        self.assertIn('base_env',cols)
+        self.assertEqual(store.one("SELECT value FROM meta WHERE key='schema'")['value'],str(SCHEMA_VERSION))
+        self.assertEqual(store.scope('scope_y')['codex_source'],'scope_env')  # data preserved
+        store.close(); tmp.cleanup()
+    def test_future_schema_is_refused(self):
+        tmp=tempfile.TemporaryDirectory(prefix='inh-mig3-'); base=Path(tmp.name)
+        db=sqlite3.connect(base/'registry.sqlite')
+        db.executescript("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT); INSERT INTO meta VALUES('schema','999');")
+        db.commit(); db.close()
+        with self.assertRaises(AgentError) as cm: Store(base)
+        self.assertEqual(cm.exception.code,'version_mismatch')
+        tmp.cleanup()
 
 class RealPiBridge(unittest.IsolatedAsyncioTestCase):
     """Real Pi process + real TS bridge. NOT in the default suite.
@@ -722,6 +747,22 @@ class RealPiParserProbe(unittest.TestCase):
     def test_no_tool_flags_left_untouched(self):
         argv=['pi','--mode','rpc','--extension','/b.ts']
         self.assertEqual(Runtime._merge_bridge_tool(list(argv)),argv)  # bare --tools would strip builtins
+    def test_repeated_tool_flags_merge_into_one(self):
+        # Pi's parser assigns on every --tools occurrence (last wins), so a second
+        # flag would silently drop the bridge tool again.
+        merged=Runtime._merge_bridge_tool(['pi','--mode','rpc','--tools','read','--tools','ls'])
+        self.assertEqual(merged.count('--tools'),1)
+        parsed=self.probe(merged)
+        self.assertEqual(parsed['tools'],['read','ls','codex_mcp'])
+    def test_short_flag_and_duplicate_names(self):
+        merged=Runtime._merge_bridge_tool(['pi','-t','read,ls','--tools','ls','--verbose'])
+        self.assertEqual(merged.count('--tools')+merged.count('-t'),1)
+        self.assertIn('--verbose',merged)   # unrelated flags survive in place
+        parsed=self.probe(merged)
+        self.assertEqual(parsed['tools'],['read','ls','codex_mcp'])
+    def test_existing_bridge_tool_is_not_duplicated(self):
+        merged=Runtime._merge_bridge_tool(['pi','--tools','read,codex_mcp'])
+        self.assertEqual(merged,['pi','--tools','read,codex_mcp'])
 
 class CodexLauncherProcess(unittest.TestCase):
     """F02 layer-3: a real launcher subprocess must forward Codex's arguments

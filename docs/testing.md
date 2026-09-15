@@ -35,6 +35,15 @@ discovery 模式（`server/discover` → 404 证明可回退）与 legacy sessio
 
 回执 FD 所有权测试（test_runtime.ReceiptFdOwnership）在真实启动失败路径中，用 socketpair 在 `terminate` 清理窗口内抢占已释放的回执 FD 编号，断言失败路径不触碰新连接（修复前该 socket 被 `finally` 误关、写端 EBADF）；并覆盖超时/取消/transport 创建失败三条路径的“恰好关闭一次”。
 
+0.2.8 架构回归（均为先红后绿）：
+
+- `test_transport.test_base_env_survives_daemon_restart`：真实 daemon 起停一次后在同一 scope 上 respawn；经 fake Pi 的 `PI_TEST_PROBE_FILE` 证据通道断言重启后的 worker 仍有 PATH/HOME 并能通过 PATH 找到命令（rc=0）。修复前该处为空 PATH。
+- `test_transport.test_restart_persists_base_env_but_never_secrets`：断言落盘的只有基础键，绑定到 scope 的 secret 不出现在 `scopes.base_env` 与账本字节中。
+- `test_runtime.RestartOwnershipVerdict`：owner.json 缺失时，存活 pid 不得判为 verified、已死 pid 可 verified；owner.json 不可读一律 unknown。修复前存活进程被写成 verified。
+- `test_package.ClientTimeoutBudget`：启动类操作的客户端等待必须覆盖 daemon 启动预算，且不随运行时限 timeout_seconds 膨胀。
+- `test_package.ShipManifest`：ZIP 与安装目录共用的排除规则挡住 `.mypy_cache`/`.cursor`/`dist`/`*.local.md`/`CLAUDE.md` 等本地文件，同时保留运行时必需文件，并断言两条路径确实共用同一规则。
+- `test_inheritance.StoreMigration`：schema 1→当前、2→当前，以及拒绝更高版本。
+
 TypeScript 类型检查（一次性 `npm install && npm run setup`，仅开发期，固定 typescript 版本，运行时零 npm 依赖）：
 
 ```bash

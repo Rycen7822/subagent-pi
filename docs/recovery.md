@@ -22,6 +22,8 @@ CLI 未指定 --request-id 会自行生成并返回 ID；需要可靠跨进程�
 
 新 daemon 不能重新附着旧匿名 stdin/stdout。它检查 owner.json、guard/Pi PID、Linux boot ID 与启动 tick。运行中 run 标为 crashed，queued run 标为 cancelled；这不是断言旧进程已经停止。
 
+owner.json 缺失时不视为"没有进程"：guard 可能在被 daemon 杀死前尚未写入该记录。只有当账本中记录的前导进程可证明已死、且其进程组无存活成员时，agent 才标为 dormant/verified；否则一律按 orphaned/unknown 保守处理，需先 close 验证身份。这与 close 的判据一致——同一行不会出现"重启说已清理、close 说无法证明"的分歧。
+
 旧进程仍可确认活动时 agent 标为 orphaned。先用 close 验证身份并清理其进程组，再 respawn。没有活动旧进程且 session 可用时可以直接恢复。无法证明所有者状态时拒绝猜测。
 
 ```bash

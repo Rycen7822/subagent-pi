@@ -9,6 +9,34 @@ import time
 from .common import MAX_FRAME, AgentError, dumps, private_dir, read_frame, socket_path
 from . import PROTOCOL_VERSION
 
+BASE_TIMEOUT = 45
+# Booting or reaping a worker can legitimately outlast BASE_TIMEOUT: spawn and
+# respawn wait for the Pi handshake plus the bridge readiness receipt, and close
+# reaps a process group with TERM then KILL. The daemon budgets those stages from
+# startup_timeout_seconds, so the client must scale with it instead of reporting a
+# committed mutation as a failure while the daemon is still working.
+BOOT_OPS = frozenset({'spawn','respawn','close','interrupt'})
+
+def boot_budget(home):
+    """Daemon worst case for a boot/reap call: handshake + receipt (capped at 20s)
+    + rpc + terminate reap, with headroom for a slow interpreter start."""
+    startup = 30
+    if home is not None:
+        try:
+            from .config import load_config
+            startup = load_config(home)['startup_timeout_seconds']
+        except Exception:
+            pass
+    return 2 * startup + 30
+
+def call_timeout(op, params, home=None):
+    """Client-side wait for one IPC call, derived from the daemon's own budget.
+    For boot ops the run deadline (timeout_ms) is irrelevant: the call returns as
+    soon as the worker is up, regardless of how long the task may then run."""
+    if op in BOOT_OPS:
+        return max(BASE_TIMEOUT, boot_budget(home))
+    return max(BASE_TIMEOUT, (params.get('timeout_ms') or 0)/1000 + 10)
+
 async def request(home,op,params,timeout=45,autostart=True,source=None):
     sock=socket_path(home)
     async def connect(): return await asyncio.open_unix_connection(str(sock),limit=MAX_FRAME)

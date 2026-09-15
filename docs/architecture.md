@@ -28,6 +28,8 @@ mcp.py / cli.py：两个薄入口，不各自维护任务状态。
 
 scopes、agents、runs、requests、receipts、events 是独立表。执行终态不等于 ack。agent generation 用于过滤旧实例事件。操作 request_id 在 scope 内唯一，参数不同不能重用。
 
+账本 schema 版本由 `store.py` 的 `MIGRATIONS` 注册表按序号递进升级（当前 3）；比当前版本更新的数据库直接拒绝启动，不猜测、不降级。scopes.base_env 只保存非密级的基础环境键（PATH/HOME 等），使 worker 在 daemon 重启后仍能启动；其余绑定值只存在于内存。
+
 最终结果文件先原子写+fsync，再提交 terminal 数据库记录。后台事件是有界规范化投影，不反复保存 streaming partial 的不断增长全文。原始 Pi session 由 Pi 自己管理，不自行修改其消息树。
 
 ## 服务端状态与主模型记忆

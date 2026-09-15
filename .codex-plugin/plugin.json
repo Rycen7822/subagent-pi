@@ -1,6 +1,6 @@
 {
   "name": "subagent-pi",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Persistent Pi coding subagents through MCP and CLI.",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json"

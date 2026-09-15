@@ -8,7 +8,7 @@ import shutil
 import sys
 from . import __version__
 from .common import AgentError, dumps, new_id, state_home
-from .client import request
+from .client import call_timeout, request
 
 DOC_ROOT=Path(__file__).resolve().parent.parent/'docs'
 
@@ -118,7 +118,7 @@ async def execute(args):
     if cmd=='call':
         raw=sys.stdin.read() if args.json=='-' else args.json
         payload=json.loads(raw)
-        return await request(home,args.operation,payload,timeout=max(45,payload.get('timeout_ms',0)/1000+10))
+        return await request(home,args.operation,payload,timeout=call_timeout(args.operation,payload,home))
     if cmd=='codex':
         exe=shutil.which('codex')
         if not exe: raise AgentError('codex_not_found','codex was not found on PATH')
@@ -150,7 +150,7 @@ async def execute(args):
     if cmd=='wait' and not data['run_ids']: data.pop('run_ids')
     data={k:v for k,v in data.items() if v is not None}
     op={'steer':'send','follow-up':'send','resume':'respawn'}.get(cmd,cmd)
-    result=await request(home,op,data,timeout=max(45,data.get('timeout_ms',0)/1000+10))
+    result=await request(home,op,data,timeout=call_timeout(op,data,home))
     if 'request_id' in data: result={**result,'request_id':data['request_id']}
     return result
 

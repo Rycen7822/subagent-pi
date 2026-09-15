@@ -7,8 +7,28 @@ import unittest
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.common import live_identity, crop
+from subagent_pi.client import call_timeout, boot_budget
 from subagent_pi import __version__
 from unittest.mock import patch
+
+class ClientTimeoutBudget(unittest.TestCase):
+    """A slow-but-healthy boot must not be reported as a failed mutation: the
+    client wait has to cover the daemon's own boot budget."""
+    def test_boot_ops_cover_daemon_boot_budget(self):
+        budget=boot_budget(None)                       # startup_timeout_seconds default 30
+        self.assertGreaterEqual(call_timeout('spawn',{},None),budget)
+        self.assertGreaterEqual(call_timeout('respawn',{},None),budget)
+        self.assertGreaterEqual(call_timeout('close',{},None),budget)
+        self.assertGreater(budget,45)                  # the old flat 45s was the bug
+    def test_boot_timeout_ignores_run_deadline(self):
+        # timeout_seconds is the RUN deadline, not a boot budget: a one-week run
+        # must not make the spawn call itself wait a week.
+        self.assertEqual(call_timeout('spawn',{'timeout_ms':604800000},None),
+                         call_timeout('spawn',{},None))
+    def test_wait_scales_with_its_own_timeout(self):
+        self.assertGreater(call_timeout('wait',{'timeout_ms':120000},None),
+                           call_timeout('wait',{'timeout_ms':25000},None))
+        self.assertEqual(call_timeout('list',{},None),45)
 
 class PackageTests(unittest.TestCase):
     def test_manifest_structure_and_no_hooks(self):
@@ -47,4 +67,35 @@ class PackageTests(unittest.TestCase):
         self.assertLessEqual(len(content.splitlines()),35)
         self.assertIn('../../docs/',content)
         self.assertNotIn('spawn_agent schema',content)
+
+class ShipManifest(unittest.TestCase):
+    """The ZIP and the installed plugin must ship exactly one file set; local
+    caches, drafts and private notes must not reach either."""
+    def ship(self):
+        sys.path.insert(0,str(ROOT/'scripts'))
+        import ship_manifest
+        return ship_manifest
+    def test_local_and_generated_files_are_excluded(self):
+        m=self.ship()
+        strays=['.mypy_cache/cache.json','.ruff_cache/x.json','.cursor/notes/secret.md',
+                'dist/junk.txt','x.egg-info/PKG-INFO','CLAUDE.md','scratch.local.md',
+                'daemon.log','.work/note.md','subagent_pi/__pycache__/x.pyc','build/out.bin']
+        for stray in strays:
+            self.assertTrue(m.excluded(ROOT/stray,ROOT),f'{stray} would be shipped')
+    def test_runtime_files_are_included(self):
+        m=self.ship()
+        for needed in ['subagent_pi/runtime.py','bin/subagent-pi','extensions/codex-mcp-bridge.ts',
+                       'plugin.json','docs/architecture.md','skills/pi-subagents/SKILL.md',
+                       '.github/workflows/ci.yml','scripts/ship_manifest.py']:
+            self.assertFalse(m.excluded(ROOT/needed,ROOT),f'{needed} would be missing')
+    def test_selection_is_deterministic_and_unique(self):
+        m=self.ship()
+        files=m.ship_files(ROOT)
+        self.assertEqual(files,sorted(files))
+        self.assertEqual(len(files),len(set(files)))
+    def test_package_and_install_share_one_rule(self):
+        package=(ROOT/'scripts/package.py').read_text()
+        install=(ROOT/'scripts/install.py').read_text()
+        self.assertIn('ship_files',package)
+        self.assertIn('excluded',install)
 if __name__=='__main__': unittest.main()

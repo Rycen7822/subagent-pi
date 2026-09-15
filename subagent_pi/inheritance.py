@@ -7,13 +7,15 @@ import re
 import shutil
 import tomllib
 
-from .common import AgentError
+from .common import AgentError, BASE_ENV_KEYS
 
 MAX_MANAGED_SKILLS = 64
 MAX_MCP_SERVERS = 32
 MAX_ENV_VARS = 64
 MAX_ENV_VALUE = 16384
-BASE_ENV_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME', 'CODEX_HOME')
+# The snapshot additionally captures CODEX_HOME: it is a source pointer the daemon
+# resolves itself, so it is bound for the scope but never forwarded to a child.
+SNAPSHOT_ENV_KEYS = BASE_ENV_KEYS + ('CODEX_HOME',)
 MANAGEMENT_SKILL_NAMES = {'pi-subagents'}
 # Compatibility classification for every current Codex RawMcpServerConfig field.
 # Single source of truth: a field missing from this table fails closed, so a new
@@ -553,7 +555,7 @@ def capture_scope_env(codex_home: Path | None, environ: dict,
                       extra_names: list[str] | tuple[str, ...] = ()) -> dict:
     """Client-side snapshot: base keys + vars the config references + authorized
     child-env names, bounded in count and size."""
-    names = set(BASE_ENV_KEYS) | {n for n in extra_names if isinstance(n, str) and n.strip()}
+    names = set(SNAPSHOT_ENV_KEYS) | {n for n in extra_names if isinstance(n, str) and n.strip()}
     if codex_home is not None:
         try:
             servers, _ = parse_mcp_servers(codex_home, read_codex_config(codex_home))
@@ -571,7 +573,7 @@ def capture_scope_env(codex_home: Path | None, environ: dict,
 def referenced_env_names(servers: list[dict]) -> set[str]:
     """Env var NAMES a server list references, including base keys, so callers can
     treat one set as the full allowlist."""
-    names: set[str] = set(BASE_ENV_KEYS)
+    names: set[str] = set(SNAPSHOT_ENV_KEYS)
     for server in servers:
         names.update(server.get('env_var_names', []))
         names.update((server.get('env_header_names') or {}).values())

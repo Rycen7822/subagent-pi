@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from . import __version__
-from .client import request
+from .client import call_timeout, request
 from .common import MAX_FRAME, AgentError, dumps
 from .schema import TOOLS, BY_NAME, validate
 
@@ -46,7 +46,7 @@ async def serve_mcp(home):
                 if spec['_op']=='scope_open' and not args.get('scope'):
                     existing=os.environ.get('PI_AGENTS_SCOPE') or bound_scopes.get(args.get('cwd'))
                     if existing: args['scope']=existing
-                timeout=max(45,args.get('timeout_ms',0)/1000+10)
+                timeout=call_timeout(spec['_op'],args,home)
                 source=None
                 if spec['_op']=='scope_open':
                     from .inheritance import scope_source_snapshot  # trusted values never pass through the model

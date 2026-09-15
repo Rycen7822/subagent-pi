@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.2.8 — 2026-09-15
+
+Architecture review follow-up: four reproducible defects plus the structural
+cleanups they pointed at. No behavior is weakened — every safety check keeps or
+tightens its previous guarantee.
+
+- Restart no longer boots a worker without a base environment. The scope's
+  non-secret base keys (`PATH`, `HOME`, ...) are persisted per scope
+  (`scopes.base_env`, schema 3) and reloaded at every worker boot, so a
+  `respawn` after a daemon restart can still find its interpreter. Secrets are
+  still never persisted: only base keys are stored, and the regression test
+  asserts a bound secret never reaches the ledger. Previously the in-memory
+  snapshot died with the daemon and the respawned worker started with an empty
+  environment — while `docs/inheritance.md` claimed the base binding happens on
+  every bind.
+- Crash reconciliation no longer reports an unverifiable process as verified.
+  When `owner.json` is missing (the guard was killed before writing it) the old
+  code read "no record" as "nothing running" and marked a live orphan
+  `cleanup='verified'`; it now requires a provably dead leader with no surviving
+  process group, matching what `close` already demanded of the same row.
+- Boot IPC calls got a client budget derived from the daemon's own worst case
+  (`startup_timeout_seconds`, ~90s by default) instead of a flat 45s, so a
+  slow-but-healthy `spawn`/`respawn`/`close` is no longer reported as a failed
+  mutation after it already committed. `spawn`'s `timeout_seconds` is the run
+  deadline and deliberately does not inflate this wait.
+- The ZIP and the installed plugin now share one file-selection rule
+  (`scripts/ship_manifest.py`). Previously `package.py` shipped dot-caches,
+  editor dirs and drafts into the ZIP and `FILES.sha256`, and `install.py` had a
+  different list for the same intent.
+- Fix: `_merge_bridge_tool` merged only the FIRST `--tools` flag, so a config
+  with two occurrences lost `codex_mcp` again under Pi's last-wins parsing. All
+  occurrences now merge into one flag.
+- Fix: the TypeScript `confirm_all` policy field was declared but never read;
+  a write child would not confirm an allowlist-less server's calls. It is now
+  enforced in `needsConfirmation` (read children still confirm everything).
+- Ledger migrations are a version registry (`store.py:MIGRATIONS`) instead of a
+  hand-written `if v == '1'` branch, with tests for 1->current, 2->current and
+  refusal of a future version.
+- Cleanups: one canonical base-env list (`common.BASE_ENV_KEYS`) instead of three
+  divergent copies, a shared resident-state tuple for restart/writer checks,
+  `inspect`'s byte budget measured incrementally instead of re-encoding the whole
+  page per event, and removal of the unused `ACTIVE` set and `Worker.lock_fd`.
+- `validate_package.py` now fails when `pyproject.toml` or the bridge
+  `clientInfo` version drifts from `__version__`.
+
 ## Unreleased
 
 - GitHub Actions CI：python-core（3.11/3.14）与 integration（真实 Pi 0.85.1 + Node 22.19.0，bridge tests 真实执行 + ZIP/FILES.sha256 校验）；0 模型调用、0 secrets、`contents: read`。

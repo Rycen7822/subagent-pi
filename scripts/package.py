@@ -7,14 +7,14 @@ import sys
 import zipfile
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
+sys.path.insert(0,str(ROOT/'scripts'))
+from ship_manifest import ship_files
 from subagent_pi import __version__
 
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--output',type=Path,default=ROOT.parent/f'subagent-pi-{__version__}.zip')
 a=p.parse_args()
-files=[f for f in sorted(ROOT.rglob('*')) if f.is_file() and not any(part in {'__pycache__','.git','.pytest_cache','.venv','.work','.pi','.codex','.claude','node_modules'} for part in f.parts)
-       and f.suffix not in {'.pyc','.zip','.sqlite','.sqlite-wal','.sqlite-shm'} and f.name!='FILES.sha256'
-       and f.name not in {'daemon.log','daemon.previous.log'}]
+files=ship_files(ROOT)
 checks=''.join(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+str(f.relative_to(ROOT))+'\n' for f in files)
 (ROOT/'FILES.sha256').write_text(checks)
 files.append(ROOT/'FILES.sha256')
