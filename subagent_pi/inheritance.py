@@ -50,6 +50,11 @@ MCP_FIELD_COMPAT = {
 TOOL_FIELD_COMPAT = {'approval_mode': 'mapped', 'output_token_limit': 'mapped'}
 MCP_STDIO_KEYS = {f for f, (_, _, t) in MCP_FIELD_COMPAT.items() if 'stdio' in t}
 MCP_HTTP_KEYS = {f for f, (_, _, t) in MCP_FIELD_COMPAT.items() if 'http' in t}
+# Bookkeeping that never belongs to a child-side server config: the credential
+# references resolve_environment turns into values, and the disposition trail
+# parse_mcp_servers/policy_filter keep for diagnostics and policy decisions.
+SERVER_RESOLVED_KEYS = ('env_var_names', 'env_header_names', 'static_env', 'static_headers')
+SERVER_POLICY_KEYS = ('disposition', 'reasons')
 MAX_RESULT_TEXT_BYTES = 256 * 1024
 APPROVAL_MODES = {'auto', 'prompt', 'writes', 'approve'}
 
@@ -71,20 +76,20 @@ class Diagnostic:
         return {'scope': self.scope, 'name': self.name, 'reason': self.reason}
 
 
-def resolve_codex_home(config, source_env: dict | None) -> tuple[Path | None, str]:
+def resolve_codex_home(inh: dict, source_env: dict | None) -> tuple[Path | None, str]:
     """Explicit trusted setting -> scope-bound CODEX_HOME -> ~/.codex.
     A configured source that does not exist is an error, never a silent fallback:
     only an UNSET source falls back, and only the user default may be absent."""
-    inh = config.get('inheritance', config) if isinstance(config, dict) else {}
-    explicit = inh.get('codex_home') if isinstance(inh, dict) else None
+    explicit = inh.get('codex_home')
     if explicit:
         home = Path(explicit).expanduser()
         if not home.is_dir():
             raise AgentError('inheritance_source_unreadable',
                              f'inheritance.codex_home does not exist: {home}')
         return home, 'explicit'
-    if isinstance(source_env, dict) and isinstance(source_env.get('CODEX_HOME'), str) and source_env['CODEX_HOME'].strip():
-        home = Path(source_env['CODEX_HOME']).expanduser()
+    bound = (source_env or {}).get('CODEX_HOME')
+    if isinstance(bound, str) and bound.strip():
+        home = Path(bound).expanduser()
         if not home.is_dir():
             raise AgentError('inheritance_source_unreadable',
                              f'CODEX_HOME from the scope source does not exist: {home}')
@@ -117,6 +122,13 @@ def _skill_name(skill_md: Path) -> str | None:
         return None
     m = re.search(r'^name:\s*["\']?([^"\'\n]+?)["\']?\s*$', match.group(1), re.MULTILINE)
     return m.group(1).strip() if m else None
+
+
+def pi_skill_name(skill_md: Path) -> str:
+    """The name Pi registers for a SKILL.md: frontmatter `name`, else the parent
+    directory name (dist/core/skills.js). Used to line inherited paths up with
+    Pi's own skill registry; Pi itself stays the authority on collisions."""
+    return _skill_name(skill_md) or skill_md.parent.name
 
 
 def _disabled_skill_paths(codex_home: Path, raw: dict) -> set[Path]:
@@ -407,7 +419,6 @@ def parse_mcp_servers(codex_home: Path, raw: dict, protocol_mode: str = 'auto') 
             diagnostics.extend(ttdiag)
             if is_http:
                 entry['protocol_mode'] = protocol_mode if protocol_mode in ('auto', 'legacy_2025_06_18', 'modern_2026_07_28') else 'auto'
-            if is_http:
                 entry['transport'] = 'http'
                 url = server['url']
                 if not isinstance(url, str) or not url.startswith(('http://', 'https://')):
@@ -491,7 +502,7 @@ def resolve_environment(servers: list[dict], env_snapshot: dict) -> tuple[list[d
         if server.get('disposition') != 'ok':
             continue
         problems: list[str] = []
-        out = {k: v for k, v in server.items() if k not in ('env_var_names', 'env_header_names', 'static_env', 'static_headers')}
+        out = {k: v for k, v in server.items() if k not in SERVER_RESOLVED_KEYS}
         out['env'] = dict(server.get('static_env', {}))
         if server['transport'] == 'stdio':
             for var in server.get('env_var_names', []):

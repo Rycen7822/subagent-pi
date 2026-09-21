@@ -18,7 +18,23 @@ doctor 不调用模型，只检查本地程序路径、配置和运行时信息�
 
 ## 自定义模型不可用
 
-默认禁用所有 ambient extensions，避免无关工具和递归子代理。如果 provider 由扩展注册，创建显式 profile 并添加那一个扩展；不要直接打开全部个人插件。认证、代理、模型支持仍由 Pi 负责。
+受管子代理默认加载 Pi 自身的 ambient extensions（可用 profile 的 `ambient_extensions = false` 显式关闭）。如果 provider 由某个扩展注册，先确认该扩展在普通 `pi` 里可用，再在 profile 里加 `extensions = [...]`；无关插件太多时可以按 profile 关掉 ambient extensions。认证、代理、模型支持仍由 Pi 负责。
+
+## builtin 工具面没有生效
+
+只有限制 builtin 的 profile（例如 `reader`）才需要 `extensions/managed-surface.ts`，并且必须验证后才算生效：
+
+- `invalid_config: Restricting built-in tools requires .../extensions/managed-surface.ts`：安装里缺少该扩展，请恢复它或让 profile 允许全部 builtin。
+- `tool_surface_unavailable`：子 Pi 从未报告工具面（扩展没加载或没运行）。看 `agents/AGENT_ID/stderr.log` 里有没有 `subagent-pi-surface applied ...`。
+- `tool_surface_unapplied`：扩展报告的结果与 profile 不一致（行内含 `builtins=`/`expected=`）。这通常意味着 Pi 版本变化使工具来源标记改变，或另一个扩展在同一会话里改动了激活集合。
+
+这两种错误都会让本次 spawn 失败（不会启动一个未经确认的受管子代理）；子进程已按正常失败路径清理。用 `--tools`/`--exclude-tools` 按名字过滤会误伤扩展注册的同名工具，因此本插件不使用它们。
+
+因此，限制 builtin 的 profile 需要 `pi_command` 指向真正能加载扩展的 Pi：把 `pi_command` 指向一个不加载扩展的替身/包装器时，受管子代理会以 `tool_surface_unavailable` 失败。不使用限制时（允许全部 builtin + `access=write`）不需要该扩展，也不会被验证。
+
+## 子代理用了错误的 Pi 配置目录
+
+子 Pi 使用**打开 scope 的客户端**的 `PI_CODING_AGENT_DIR`（与 `HOME` 同类的非秘密路径），经 scope 快照传到 daemon 与 worker；daemon 重启后按 scope 记录恢复，未设置时用 Pi 默认的 `$HOME/.pi/agent`。因此：确认启动 CLI/MCP 的那个进程里该变量指向预期的目录；如果希望固定为某个目录，可在 profile 里显式设置 `[profiles.x.env] PI_CODING_AGENT_DIR = "..."`（优先于环境）。它只影响 Pi 的配置目录定位，不复制任何凭据。
 
 ## 启动失败或没有响应
 

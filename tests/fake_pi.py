@@ -1,19 +1,44 @@
 #!/usr/bin/env python3
-"""Deterministic Pi RPC simulator. No models, credentials, network or repository edits."""
+"""Deterministic Pi RPC simulator. No models, credentials, network or repository edits.
+
+It also stands in for Pi's own skill loader (get_commands returns the registry
+built by skill_registry() from PI_TEST_AMBIENT_SKILL_DIRS plus --skill paths) and
+for the shipped managed-surface extension: with PI_AGENTS_CHILD_BUILTINS set it
+writes the same `subagent-pi-surface applied ...` stderr report the daemon gates
+a restricted launch on. PI_TEST_SURFACE='missing'|'mismatch'|'malformed' breaks
+that report so the daemon-side verification can be tested without real Pi."""
 from __future__ import annotations
 import argparse
 import asyncio
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 
 p=argparse.ArgumentParser(add_help=False)
 p.add_argument('--hold-eof',action='store_true'); p.add_argument('--session'); p.add_argument('--session-dir'); p.add_argument('--mode'); p.add_argument('--no-clear',action='store_true'); p.add_argument('--ignore-abort',action='store_true')
+p.add_argument('--skill',action='append'); p.add_argument('--extension',action='append'); p.add_argument('--exclude-tools'); p.add_argument('--no-extensions',action='store_true'); p.add_argument('--no-skills',action='store_true')
 a,_=p.parse_known_args()
 path=Path(a.session) if a.session else Path(a.session_dir)/'test-session.jsonl'; current=None; queue=[]; ui={}; count=0
+
+def surface_report():
+    """Stand-in for extensions/managed-surface.ts: report the built-in surface the
+    child applied, in the same line format (ok/builtins read back from the live
+    registry in real Pi)."""
+    plan=os.environ.get('PI_AGENTS_CHILD_BUILTINS')
+    if plan is None: return
+    allowed=sorted(n for n in (x.strip() for x in plan.split(',')) if n)
+    mode=os.environ.get('PI_TEST_SURFACE','ok')
+    if mode=='missing': return
+    if mode=='malformed':
+        print('subagent-pi-surface applied',file=sys.stderr,flush=True); return
+    applied=allowed if mode!='mismatch' else [n for n in allowed if n!='read']
+    print('subagent-pi-surface applied ok=%s allowed=%s builtins=%s expected=%s unidentified=' % (
+        'true' if applied==allowed else 'false',','.join(allowed),','.join(applied),','.join(allowed)),
+        file=sys.stderr,flush=True)
 
 def read_bootstrap():
     """Emulate the real bridge: consume the pipe, emit the ready marker and the
@@ -54,6 +79,41 @@ def read_bootstrap():
     return payload
 
 BRIDGE=read_bootstrap()
+
+def skill_entry(skill_md: Path):
+    """Pi's rule (dist/core/skills.js): frontmatter `name`, else the parent dir
+    name; a skill without a non-empty description is not loaded at all."""
+    try: head=skill_md.read_text(encoding='utf-8',errors='replace')[:4096]
+    except OSError: return None
+    m=re.match(r'\ufeff?---\s*\n(.*?)\n---',head,re.DOTALL)
+    front=m.group(1) if m else ''
+    desc=re.search(r'^description:\s*(.+?)\s*$',front,re.MULTILINE)
+    if not desc or not desc.group(1).strip().strip('"\''): return None
+    hit=re.search(r'^name:\s*["\']?([^"\'\n]+?)["\']?\s*$',front,re.MULTILINE)
+    return hit.group(1).strip() if hit else skill_md.parent.name
+
+def skill_registry():
+    """Pi's loader order, verified against Pi 0.85.1: skills discovered from the
+    user's own Pi configuration register BEFORE CLI --skill paths, and a name
+    collision keeps the first registration. A Codex skill that duplicates a Pi
+    skill is therefore dropped by Pi itself.
+    PI_TEST_AMBIENT_SKILL_DIRS (os.pathsep separated) stands in for Pi's own
+    discovery: it is empty by default, so tests never read a real ~/.pi tree."""
+    registry={}
+    def add(skill_md: Path):
+        if not skill_md.is_file(): return
+        name=skill_entry(skill_md)
+        if name: registry.setdefault(name,str(skill_md.resolve()))
+    for root in (os.environ.get('PI_TEST_AMBIENT_SKILL_DIRS','') or '').split(os.pathsep):
+        if not root: continue
+        try: entries=sorted(Path(root).iterdir())
+        except OSError: continue
+        for entry in entries: add(entry/'SKILL.md' if entry.is_dir() else entry)
+    for raw in a.skill or []:
+        entry=Path(raw); add(entry/'SKILL.md' if entry.is_dir() else entry)
+    return registry
+
+SKILLS=skill_registry()
 
 def emit(e):
     print(json.dumps(e,ensure_ascii=False),flush=True)
@@ -106,6 +166,7 @@ async def run(task):
 
 async def main():
     global current
+    surface_report()
     reader=asyncio.StreamReader(); transport,_=await asyncio.get_running_loop().connect_read_pipe(lambda:asyncio.StreamReaderProtocol(reader),sys.stdin.buffer)
     while line:=await reader.readline():
         r=json.loads(line); kind=r['type']
@@ -130,8 +191,11 @@ async def main():
                                'has_auth':'PI_TEST_AUTH' in os.environ,
                                'has_daemon_only':'PI_TEST_DAEMON_ONLY' in os.environ,
                                'home_tag':os.environ.get('PI_TEST_HOME_TAG',''),
+                               'coding_agent_dir':os.environ.get('PI_CODING_AGENT_DIR',''),
                                'cwd':os.getcwd()},f)
-            response(r,data={'sessionFile':str(path),'sessionId':'fake-session','isStreaming':bool(current and not current.done()),'pendingMessageCount':len(queue),'model':{'id':'fake','provider':'test'},'env_probe':{k:v for k,v in sorted(os.environ.items()) if k.startswith('PI_TEST_') and len(v)<=256},'path_probe':None if 'PI_TEST_PROBE_CMD' not in os.environ else {'rc':0}})
+            response(r,data={'sessionFile':str(path),'sessionId':'fake-session','isStreaming':bool(current and not current.done()),'pendingMessageCount':len(queue),'model':{'id':'fake','provider':'test'},'env_probe':{**{k:v for k,v in sorted(os.environ.items()) if k.startswith('PI_TEST_') and len(v)<=256},
+                           # Non-secret location, asserted by the agent-dir binding tests:
+                           **({'PI_CODING_AGENT_DIR':os.environ['PI_CODING_AGENT_DIR']} if os.environ.get('PI_CODING_AGENT_DIR') else {})},'path_probe':None if 'PI_TEST_PROBE_CMD' not in os.environ else {'rc':0}})
         elif kind=='prompt':
             if current and not current.done(): response(r,False,error='Already streaming')
             else: response(r); current=asyncio.create_task(run(r['message']))
@@ -142,6 +206,9 @@ async def main():
         elif kind=='abort':
             if not a.ignore_abort and current and not current.done(): current.cancel(); await current
             response(r)
+        elif kind=='get_commands':
+            response(r,data={'commands':[{'name':'skill:'+n,'source':'skill','sourceInfo':{'path':p}}
+                                         for n,p in sorted(SKILLS.items())]})
         elif kind=='extension_ui_response':
             f=ui.get(r['id'])
             if f and not f.done(): f.set_result(r.get('confirmed',False))

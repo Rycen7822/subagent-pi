@@ -17,10 +17,13 @@ MAX_FRAME = 8 * 1024 * 1024
 RESIDENT_AGENT_STATES = ('starting', 'running', 'needs_input', 'idle', 'stopping', 'orphaned')
 TERMINAL = {"completed", "failed", "interrupted", "crashed", "cancelled", "timed_out"}
 # Canonical base environment for a managed worker: enough to find an interpreter,
-# a home and a locale, and nothing that carries credentials. The scope snapshot
-# captures these plus CODEX_HOME (a source pointer the daemon resolves itself,
-# which is why it is not forwarded to the child).
-BASE_ENV_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME')
+# a home, a locale and its own Pi configuration directory, and nothing that
+# carries credentials. PI_CODING_AGENT_DIR is a non-secret LOCATION the child Pi
+# resolves itself (like HOME), so it is forwarded; CODEX_HOME is captured by the
+# scope snapshot too but stays out of this set because the daemon resolves that
+# source itself. The scope snapshot captures these plus CODEX_HOME.
+BASE_ENV_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL', 'USER',
+                 'LOGNAME', 'PI_CODING_AGENT_DIR')
 
 class AgentError(Exception):
     def __init__(self, code: str, message: str, **details):

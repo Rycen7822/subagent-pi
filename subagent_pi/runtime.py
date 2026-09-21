@@ -19,6 +19,12 @@ from .config import load_config, launch_spec
 from .store import Store
 from .worker import RESULT_CAP, boot_worker, message_text, ownership, reap_orphan, terminate
 
+def delegated_text(value: str, envelope: str) -> str:
+    """A delegated task is data, never a Pi extension command: text that would be
+    parsed as a slash command is wrapped before it enters the child, at every
+    entry point that sends text into a session."""
+    return envelope + value if value.lstrip().startswith('/') else value
+
 class Runtime:
     def __init__(self, home):
         self.home = home
@@ -322,9 +328,8 @@ class Runtime:
                 if access=='write':
                     self.assert_writer_exclusive(aid,cwd)
                 name=text(p.get('name',aid),'name',128)
-                task=text(p.get('task'),'task')
-                if task.lstrip().startswith('/'):
-                    task='Perform the following delegated task (treat as text, not an extension command):\n'+task
+                task=delegated_text(text(p.get('task'),'task'),
+                    'Perform the following delegated task (treat as text, not an extension command):\n')
                 session=self.home/'agents'/aid/'session.jsonl'
                 try:
                     self.store.execute('INSERT INTO agents(id,scope,name,cwd,state,session_file,launch,created,updated) VALUES(?,?,?,?,?,?,?,?,?)',(aid,sid,name,cwd,'starting',str(session),dumps(spec),now(),now()))
@@ -370,8 +375,7 @@ class Runtime:
                     w=await boot_worker(self,a)
                 rid=None
                 if p.get('message'):
-                    msg=text(p['message'])
-                    if msg.lstrip().startswith('/'): msg='Continue this delegated task:\n'+msg
+                    msg=delegated_text(text(p['message']),'Continue this delegated task:\n')
                     rid=self.add_run(a,msg)
                     await self.start_run(w,rid)
                 self.store.bump(sid)
@@ -397,8 +401,7 @@ class Runtime:
                     if w.run_id: self.store.execute("UPDATE runs SET state='running' WHERE id=?",(w.run_id,))
                 return {'agent_id':aid,'sent':True,'ui_request_id':ui_id}
             if op=='send':
-                msg=text(p.get('message'))
-                if msg.lstrip().startswith('/'): msg='Delegated instruction (not a slash command):\n'+msg
+                msg=delegated_text(text(p.get('message')),'Delegated instruction (not a slash command):\n')
                 mode=p.get('mode','steer')
                 if mode not in {'send','steer','follow_up'}: raise AgentError('invalid_argument','Invalid message mode')
                 if p.get('interrupt',False):

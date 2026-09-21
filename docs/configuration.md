@@ -35,8 +35,8 @@ mcp = true       # 继承 config.toml 的 mcp_servers
 
 ```toml
 [profiles.default]
-ambient_extensions = false
-ambient_skills = false
+ambient_extensions = true   # 默认；false 则隔离 Pi 自身的 extensions
+ambient_skills = true       # 默认；false 则隔离 Pi 自身的 skills
 extensions = []
 skills = []
 tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
@@ -47,23 +47,29 @@ tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
 
 默认不硬编码任何模型。首先使用 spawn 显式 model，其次 profile model，最后由 Pi 自行选择；启动完成后保存 Pi 报告的 provider/model ID，后续恢复继续使用。它不会固定 API 服务端模型权重，也不会锁定可执行文件的全部依赖字节。
 
-`reader` 默认只有 read/grep/find/ls。`access=read` 会剥离其他 builtin 并拒绝任何扩展加载，以免扩展重新引入写工具；这是工具面约束，不是 OS 沙箱。
+受管子代理默认就是一个正常 Pi 会话：Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes、settings 与上下文文件全部照常加载，然后才在其上继承 Codex 的 skills 与 MCP。Pi 用来定位自己配置目录的 `PI_CODING_AGENT_DIR` 会随 scope 绑定（与 `HOME` 同类的非秘密路径）：CLI/MCP 客户端进程里的取值经 scope 快照传到子进程，daemon 重启后仍按记录恢复；未设置时保持 Pi 默认（`$HOME/.pi/agent`），profile 的 `[profiles.x.env] PI_CODING_AGENT_DIR` 仍然优先。`ambient_extensions` / `ambient_skills` 默认 `true`，是**显式退出开关**（设为 `false` 会重新加上 `--no-extensions` / `--no-skills`）。
+
+`tools` 决定子代理的 **builtin** 工具面，由随插件发布的 `extensions/managed-surface.ts` 在 session_start 按 Pi 报告的来源（`sourceInfo.path = "<builtin:NAME>"`）精确激活/停用：profile 列出的 builtin 生效，未列出的 builtin（包括本插件还不认识的）停用。刻意不使用 `--tools` **也不用** `--exclude-tools`：两者都按**工具名**过滤同一份注册表，会连带剔除 Pi 扩展注册的同名工具（例如扩展用自己的 `bash` 覆盖 builtin）。只有真正限制 builtin 的 profile 才会加载该扩展；扩展文件缺失时该 profile 直接拒绝启动，而不是放出无约束的子代理。扩展/自定义工具保持 Pi 自身判定，本插件不增删。
+
+限制 builtin 的 profile 不会只凭 argv 就宣称生效：扩展会在改动后回读 Pi 的实时注册表并把结果写到 stderr（`subagent-pi-surface applied ...`），daemon 记录为 `tool_surface` 事件，并在缺失或与期望不符时让本次启动失败（`tool_surface_unavailable` / `tool_surface_unapplied`）。
+
+`access=read` 的含义：builtin 限制为 read/grep/find/ls（默认 reader profile），继承的 MCP 只暴露 readOnly 工具且每次调用确认，写者互斥规则不变。但它**不再**声称"只具备只读工具"、也不再拒绝加载扩展：Pi 自己的 extensions/skills/settings 按用户配置原样生效，扩展就是会在子进程里运行的代码，其工具与能力不受本插件约束。这些限制是受管工具面策略，不是 OS 沙箱。
 
 需要自定义 provider 扩展时，配置一个明确 profile：
 
 ```toml
 [profiles.custom]
 extensions = ["/absolute/path/provider.ts"]
-ambient_extensions = false
-ambient_skills = false
+ambient_extensions = true    # 默认；false 则关闭 Pi 自身 extensions 发现
+ambient_skills = true        # 默认；false 则关闭 Pi 自身 skills 发现
 skills = []
 tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
 model = "provider/model-id"
 ```
 
-该 profile 使用 access=write；如果它只是 provider 扩展仍希望严格只读，本版不尝试证明扩展没有其他能力，因此仍保守拒绝 read+extension。
+该 profile 使用 access=write；read profile 现在同样可以加载扩展，只是工具面按上面的规则受限，不再有 read+extension 的硬拒绝。
 
-可以明确启用 ambient extensions/skills，但这会加载个人/项目侧代码和行为；它可能启动额外 MCP、改变 provider、进行递归委托。无扩展的默认 profile 不暴露 subagent 工具。`PI_AGENTS_MANAGED_CHILD=1` 只是协作标志，不是恶意子进程的权限屏障。
+加载 ambient extensions/skills 意味着个人/项目侧代码和行为会进入子进程；它可能启动额外 MCP、改变 provider、进行递归委托。需要隔离时把 `ambient_extensions`/`ambient_skills` 设为 `false`。`PI_AGENTS_MANAGED_CHILD=1` 只是协作标志，不是恶意子进程的权限屏障。
 
 profile 支持 `[profiles.NAME.env]` 的字符串环境覆盖。它们会进入当前用户私有的 launch snapshot；不要把凭据写进版本控制。常规继承的环境凭据不复制进数据库。
 

@@ -16,8 +16,10 @@ mcp = true
 # codex_home = "/home/you/.codex"  # optional explicit trusted source
 
 [profiles.default]
-ambient_extensions = false
-ambient_skills = false
+# Pi's own configuration loads by default; set these to false to isolate the
+# child from your global/project extensions and skills.
+ambient_extensions = true
+ambient_skills = true
 extensions = []
 skills = []
 tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
@@ -26,16 +28,19 @@ tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
 # thinking = "medium"
 
 [profiles.reader]
-ambient_extensions = false
-ambient_skills = false
+ambient_extensions = true
+ambient_skills = true
 extensions = []
 skills = []
+# Allowed built-ins for this child. Applied (and read back) inside Pi by the
+# shipped extensions/managed-surface.ts: extension/custom tools are untouched,
+# and the launch fails if the surface report is missing or does not match.
 tools = ["read", "grep", "find", "ls"]
 
 # Optional explicitly selected provider extension. It runs trusted code.
 # [profiles.custom-provider]
-# ambient_extensions = false
-# ambient_skills = false
+# ambient_extensions = true
+# ambient_skills = true
 # extensions = ["/home/you/.pi/agent/extensions/provider.ts"]
 # skills = []
 # tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]

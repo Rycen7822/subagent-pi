@@ -6,7 +6,9 @@
 
 这是完整源码版 `0.2.9`，针对 **Linux / WSL2，Python 3.11+**。运行时只用 Python 标准库，无 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不是 Codex 内建 collaboration runtime，不进入原生 `/agents`，也不承诺无 hooks 的自动唤醒。
 
-受管子代理可以按需继承你的 Codex 全局 skills（`~/.codex/skills`）与 MCP（`~/.codex/config.toml` 的 `mcp_servers`）：只读原文件、原位引用、内存中传递，不落盘、不迁移；普通 `pi` 不受影响。详见 `docs/inheritance.md`。
+受管子代理首先是一个正常 Pi 会话：Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes、settings 与上下文照常加载（`ambient_extensions`/`ambient_skills` 默认 `true`，可显式关掉）；Pi 的配置目录沿用打开 scope 的客户端进程里的 `PI_CODING_AGENT_DIR`（未设置即 Pi 默认 `$HOME/.pi/agent`，跨 daemon 重启保持）。在此之上按需继承你的 Codex 全局 skills（`~/.codex/skills`）与 MCP（`~/.codex/config.toml` 的 `mcp_servers`）：只读原文件、原位引用、内存中传递，不落盘、不迁移；普通 `pi` 不受影响。
+
+同名 skills 由 Pi 自己在加载边界裁决：Pi 已加载的同名 skill 保留，Codex 版本不会被注册；每次 boot 都会把结果记进 `inheritance_skills` 事件（跳过的 Codex 路径 + 保留的 Pi 路径）。MCP 不按 server 名去重，因为 Pi 没有 MCP 体系、也不提供 server 注册表（只保证 `(server, tool)` 寻址：不同 server 的同名工具互不冲突）。`access=read` 只约束本插件控制的 builtin 与 MCP 暴露面，不声称"只具备只读工具"、也不是 OS 沙箱。详见 `docs/inheritance.md`。
 
 ## 安装
 
@@ -77,7 +79,7 @@ subagent-pi close AGENT_ID --scope SCOPE_ID
 
 ## 重要边界
 
-- **Pi worker 不继承 Codex 的沙箱或逐工具批准机制。** 它使用当前 OS 用户和 Pi 自身权限。默认禁用 ambient extensions/skills；reader 只提供 read/grep/find/ls，但不是 OS 安全隔离。
+- **Pi worker 不继承 Codex 的沙箱或逐工具批准机制。** 它使用当前 OS 用户和 Pi 自身权限。受管子代理默认加载 Pi 自身 extensions/skills（可用 profile 的 `ambient_extensions`/`ambient_skills` 显式关闭）；`access=read` 只把本插件控制的 builtin 限制为 read/grep/find/ls（由 `extensions/managed-surface.ts` 按 Pi 报告的来源应用、并回读验证后才算生效；扩展注册的同名工具不受影响）并收窄继承 MCP 的暴露面，Pi 自己的扩展、其工具与代码不受约束，因此这不是 OS 安全隔离。
 - 没有 hooks、原生 mailbox 或定时提示；父模型须通过 wait/list/result 收取任务。daemon 的持久状态不会因 MCP 断开丢失，但不会凭空唤醒 Codex。
 - MCP 进程退出不终止 Pi。**daemon 崩溃后不能重新接回旧 stdin/stdout**；先确认并关闭遗留进程，再显式恢复。
 - soft abort 的 `cleanup=not_checked` 表示只确认 Pi 空闲，未证明所有 shell 后代停止。close 会验证受管理进程组，但主动脱离该组的后代不受绝对保证。

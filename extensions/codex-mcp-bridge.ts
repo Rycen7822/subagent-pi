@@ -266,16 +266,17 @@ abstract class McpConnection {
     do {
       const result = await this.request("tools/list", cursor ? { cursor } : {}, cfg.startup_timeout_sec, { signal }) as
         { tools?: unknown[]; nextCursor?: unknown };
-      if (typeof result?.nextCursor === "string" && result.nextCursor) {
-        if (seenCursors.has(result.nextCursor)) { this.catalogTruncated = true; break; } // server cursor loop guard
-        seenCursors.add(result.nextCursor);
+      const next = typeof result?.nextCursor === "string" && result.nextCursor ? result.nextCursor : undefined;
+      if (next) {
+        if (seenCursors.has(next)) { this.catalogTruncated = true; break; } // server cursor loop guard
+        seenCursors.add(next);
       }
       for (const tool of result?.tools ?? []) {
         if (collected.length >= MAX_TOOLS) { this.catalogTruncated = true; break; }
         const meta = toToolMeta(tool, this.mirrorHeaders);
         if (meta) collected.push(meta);
       }
-      cursor = typeof result?.nextCursor === "string" && result.nextCursor ? result.nextCursor : undefined;
+      cursor = next;
       pages += 1;
     } while (cursor && pages < MAX_PAGES && collected.length < MAX_TOOLS);
     if (cursor && pages >= MAX_PAGES) this.catalogTruncated = true;
@@ -741,7 +742,8 @@ class HttpConnection extends McpConnection {
 
   async initialize(): Promise<void> {
     const requested = this.cfg.protocol_mode ?? "auto";
-    if (this.cfg.transport === "stdio" || requested === "legacy_2025_06_18") {
+    // stdio never reaches this class: an HttpConnection only runs for transport http
+    if (requested === "legacy_2025_06_18") {
       this.mode = "legacy";
     } else if (requested === "modern_2026_07_28") {
       this.mode = "modern";
@@ -906,17 +908,12 @@ export default async function (pi: ExtensionAPI) {
 
   function toolVisible(cfg: ServerCfg, meta: ToolMeta): boolean {
     if (isDenied(cfg, meta.name)) return false;
-    if (access === "read") {
-      // P1-B: the parent's enabled_tools is NOT child authorization. A read child
-      // sees only explicitly readOnly tools; an explicit allowlist can only SHRINK
-      // the surface (empty = nothing). readOnlyHint is a self-report affecting the
-      // managed tool surface only, not a sandbox claim.
-      if (meta.readOnly !== true) return false;
-      if (cfg.allowed_tools !== null && !cfg.allowed_tools.includes(meta.name)) return false;
-      return true;
-    }
+    // The parent's enabled_tools is a declaration, not child authorization: an
+    // explicit allowlist can only SHRINK the surface (empty = nothing).
     if (cfg.allowed_tools !== null && !cfg.allowed_tools.includes(meta.name)) return false;
-    return true;
+    // P1-B: in a read child only explicitly readOnly tools are visible at all.
+    // readOnlyHint is a self-report affecting the managed tool surface only.
+    return access !== "read" || meta.readOnly === true;
   }
 
   function needsConfirmation(cfg: ServerCfg, meta: ToolMeta): boolean {
@@ -926,6 +923,16 @@ export default async function (pi: ExtensionAPI) {
     if (access === "read") return true;
     if (cfg.confirm_all === true) return true;
     return (cfg.tool_approval[meta.name] ?? cfg.approval_default) !== "auto";
+  }
+
+  /** A tool with an invalid x-mcp-header annotation cannot be called: the plan is
+   * what mirrors declared arguments into headers, so guessing would send a
+   * different request than the schema declares. */
+  function callableHeaderPlan(serverName: string, toolName: string, meta: ToolMeta): HeaderPlanEntry[] | undefined {
+    if (!meta.headerPlan.ok) {
+      throw new Error(`Tool ${serverName}.${toolName} declares an invalid x-mcp-header annotation (${meta.headerPlan.reason}) and is not callable`);
+    }
+    return meta.headerPlan.entries;
   }
 
   async function ensureConnection(cfg: ServerCfg, signal?: AbortSignal): Promise<McpConnection> {
@@ -1046,9 +1053,7 @@ export default async function (pi: ExtensionAPI) {
       if (!toolMeta.inputSchema) {
         throw new Error(`Tool ${serverName}.${toolName} has no usable inputSchema (missing or larger than ${MAX_SCHEMA_BYTES} bytes)`);
       }
-      if (!toolMeta.headerPlan.ok) {
-        throw new Error(`Tool ${serverName}.${toolName} declares an invalid x-mcp-header annotation (${toolMeta.headerPlan.reason}) and is not callable`);
-      }
+      callableHeaderPlan(serverName, toolName, toolMeta);
       const report = { server: serverName, tool: toolMeta.name, description: toolMeta.description, inputSchema: toolMeta.inputSchema };
       return { content: [{ type: "text", text: JSON.stringify(report) }], details: report };
     }
@@ -1056,9 +1061,7 @@ export default async function (pi: ExtensionAPI) {
     if (!toolVisible(cfg, toolMeta)) {
       throw new Error(`Tool ${serverName}.${toolName} is not available to this managed child (access=${access}; only explicitly read-only tools are exposed)`);
     }
-    if (!toolMeta.headerPlan.ok) {
-      throw new Error(`Tool ${serverName}.${toolName} declares an invalid x-mcp-header annotation (${toolMeta.headerPlan.reason}) and is not callable`);
-    }
+    const headerPlan = callableHeaderPlan(serverName, toolName, toolMeta);
     if (needsConfirmation(cfg, toolMeta)) {
       const argsPreview = JSON.stringify(params.args ?? {}).slice(0, 500);
       const ok = await ctx.ui.confirm(
@@ -1071,7 +1074,7 @@ export default async function (pi: ExtensionAPI) {
     }
     if (signal?.aborted) throw new CancelledError(false);
     try {
-      const result = await conn.callTool(toolName, params.args ?? {}, cfg.tool_timeout_sec, signal, toolMeta.headerPlan.ok ? toolMeta.headerPlan.entries : undefined) as { isError?: boolean } | undefined;
+      const result = await conn.callTool(toolName, params.args ?? {}, cfg.tool_timeout_sec, signal, headerPlan) as { isError?: boolean } | undefined;
       let text = describeResult(result);
       // output_token_limit: enforced here at the serialization boundary with a
       // conservative 4 bytes/token budget; it can only TIGHTEN the default cap.

@@ -2,9 +2,11 @@
 channel, secret canaries, and no-new-runtime-files guarantees. All offline."""
 from __future__ import annotations
 import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import tomllib
 import sqlite3
@@ -13,19 +15,37 @@ import sys
 import time
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
-from subagent_pi.binding import merge_bridge_tool
 from subagent_pi.common import AgentError, dumps, socket_path
+from subagent_pi.config import PI_BUILTIN_TOOLS, load_config, launch_spec
 from subagent_pi.inheritance import (CODEX_MCP_BASELINE, capture_scope_env, collect_skills, parse_mcp_servers,
-    policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
+    pi_skill_name, policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
 from subagent_pi.runtime import Runtime
 from subagent_pi.store import SCHEMA_VERSION, Store
 from subagent_pi.worker import write_bootstrap
 
-FAKE_PI=ROOT/'tests'/'fake_pi.py'
+def parse_surface(text: str) -> dict:
+    """Latest structured evidence line the shipped managed-surface extension
+    writes to stderr: `subagent-pi-surface applied ok=... allowed=... builtins=...
+    unknown=...`. Tests read the extension's own read-back of the live registry
+    instead of trusting argv."""
+    line=None
+    for candidate in text.splitlines():
+        if candidate.startswith('subagent-pi-surface applied'): line=candidate
+    if line is None: raise AssertionError('no subagent-pi-surface evidence in child stderr:\n'+text[-2000:])
+    fields={}
+    for part in line.split()[2:]:
+        key,_,value=part.partition('=')
+        fields[key]=value
+    return fields
+
+
 BRIDGE=ROOT/'extensions'/'codex-mcp-bridge.ts'
+SURFACE=ROOT/'extensions'/'managed-surface.ts'
+FAKE_PI=ROOT/'tests'/'fake_pi.py'
 
 def make_skill(base: Path, name: str, body='Body.', front_name=None):
     d=base/name
@@ -416,7 +436,8 @@ approval_mode = "banana"
         self.assertEqual(snap['ANTHROPIC_API_KEY'],'sk-test')  # authorized child-env name is captured for model auth
         self.assertNotIn('UNRELATED_SECRET',snap)
         servers,_=self.parse(STDIO_TOML+'[mcp_servers.w2]\nurl="https://e.example"\nbearer_token_env_var="BT"\n')
-        self.assertEqual(set(referenced_env_names(servers)),{'PATH','HOME','LANG','LC_ALL','TERM','TMPDIR','SHELL','USER','LOGNAME','CODEX_HOME','TOKEN_VAR','BT'})
+        self.assertEqual(set(referenced_env_names(servers)),{'PATH','HOME','LANG','LC_ALL','TERM','TMPDIR','SHELL','USER','LOGNAME',
+            'PI_CODING_AGENT_DIR','CODEX_HOME','TOKEN_VAR','BT'})
 
 class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -431,7 +452,7 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
             'for line in sys.stdin:\n'
             '    r=json.loads(line)\n'
             '    if "id" in r: print(json.dumps({"id":r["id"],"result":{"tools":[]}}),flush=True)\n')
-        config=STDIO_TOML.replace('command = "python3"','command = "python3"')
+        config=STDIO_TOML
         config+='\n[mcp_servers.localtest]\ncommand = "python3"\nargs = ["server.py"]\nenv_vars = ["SECRET_CANARY"]\n'
         config+=f'\n[mcp_servers.localtest.env]\nFAKE_TEST_ECHO = "echo-ok"\n'
         (self.codex/'config.toml').write_text(config)
@@ -491,7 +512,11 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(self.codex/'skills'/'alpha'),skill_paths)
         self.assertIn(str(self.workspace/'.agents'/'skills'/'projskill'),skill_paths)
         self.assertIn(str(BRIDGE),argv)
-        self.assertIn('codex_mcp',' '.join(argv))  # bridge tool enabled in --tools
+        # No --tools: that allowlist would drop the tools Pi's own extensions register.
+        self.assertNotIn('--tools',argv)
+        self.assertNotIn('--no-tools',argv)
+        self.assertNotIn('--no-extensions',argv)
+        self.assertNotIn('--no-skills',argv)
         stderr=(self.home/'agents'/s['agent_id']/'stderr.log').read_text()
         self.assertIn('subagent-pi-bridge ready servers=1 names=localtest',stderr)
         self.assertIn('bridge-env localtest=echo-ok',stderr)
@@ -504,6 +529,122 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         await self.mutation_close(s['agent_id'])
     async def mutation_close(self,aid):
         return await self.rt.dispatch('close',{'scope':self.scope,'agent_id':aid,'request_id':self.key()})
+    def add_ambient_profile(self, *names, tools=('read','grep','find','ls')):
+        """A profile whose child Pi brings its OWN skills, like a real Pi user
+        configuration. PI_TEST_AMBIENT_SKILL_DIRS is how the fake Pi stands in for
+        Pi's own discovery (the real-Pi test covers the real loader)."""
+        skills_dir=self.root/'pi-agent'/'skills'
+        for name in names: make_skill(skills_dir,name)
+        self.rt.config['profiles']['ambient']={'tools':list(tools),
+            'env':{'PI_TEST_AMBIENT_SKILL_DIRS':str(skills_dir)}}
+        return skills_dir
+    def events_of(self, aid, kind):
+        return [json.loads(r['payload']) for r in self.rt.store.all(
+            "SELECT payload FROM events WHERE agent_id=? AND type=? ORDER BY rowid",(aid,kind))]
+    async def test_pi_skill_owns_a_duplicate_name_and_the_boot_records_it(self):
+        ambient=self.add_ambient_profile('alpha')  # same declared name as the codex skill
+        s=await self.spawn(profile='ambient'); aid=s['agent_id']
+        # Pi resolves the collision itself: its own skill is registered, the
+        # inherited path was passed but never entered the registry. The record
+        # below is what the child reported through get_commands, not a guess.
+        record=self.events_of(aid,'inheritance_skills')[-1]
+        entry=[i for i in record['inherited'] if i['name']=='alpha'][0]
+        self.assertEqual(entry['state'],'skipped')
+        self.assertEqual(entry['kept'],str((ambient/'alpha'/'SKILL.md').resolve()))
+        self.assertEqual([i for i in record['inherited'] if i['path'].endswith('projskill')][0]['state'],'loaded')
+        self.assertIn({'name':'alpha','path':str((ambient/'alpha'/'SKILL.md').resolve())},record['pi_skills'])
+        await self.mutation_close(aid)
+    async def test_unique_inherited_skills_load_next_to_pi_skills(self):
+        ambient=self.add_ambient_profile('pi-only')
+        s=await self.spawn(profile='ambient'); aid=s['agent_id']
+        record=self.events_of(aid,'inheritance_skills')[-1]
+        states={i['path']:i['state'] for i in record['inherited']}
+        self.assertEqual(states[str(self.codex/'skills'/'alpha')],'loaded')
+        self.assertEqual(states[str(self.workspace/'.agents'/'skills'/'projskill')],'loaded')
+        self.assertIn({'name':'pi-only','path':str((ambient/'pi-only'/'SKILL.md').resolve())},record['pi_skills'])
+        await self.mutation_close(aid)
+    async def test_unloadable_inherited_skill_is_reported_not_invented(self):
+        # A skill Pi refuses to load (no description) is neither "loaded" nor a
+        # name collision: the record says not_loaded instead of guessing.
+        (self.codex/'skills'/'alpha'/'SKILL.md').write_text('---\nname: alpha\n---\n\nonly a body\n')
+        s=await self.spawn(); aid=s['agent_id']
+        record=self.events_of(aid,'inheritance_skills')[-1]
+        entry=[i for i in record['inherited'] if i['name']=='alpha'][0]
+        self.assertEqual(entry['state'],'not_loaded')
+        await self.mutation_close(aid)
+    async def test_launch_argv_leaves_pi_configuration_alone(self):
+        s=await self.spawn(); aid=s['agent_id']
+        argv=json.loads((self.home/'agents'/aid/'launch.json').read_text())['argv']
+        for flag in ('--no-extensions','--no-skills','--tools','--no-tools','--exclude-tools'): self.assertNotIn(flag,argv)
+        self.assertIn(str(SURFACE),argv)
+        await self.mutation_close(aid)
+    def restricted_profile(self, **env):
+        """A reader-shaped profile whose extra env controls the fake Pi's surface
+        report (the fake stands in for extensions/managed-surface.ts)."""
+        self.rt.config['profiles']['restricted']={'tools':['read','grep','find','ls'],'env':dict(env)}
+        return 'restricted'
+    async def test_restricted_launch_records_the_verified_builtin_surface(self):
+        s=await self.spawn(profile=self.restricted_profile()); aid=s['agent_id']
+        report=self.events_of(aid,'tool_surface')[-1]
+        self.assertTrue(report['ok'])
+        self.assertEqual(report['allowed'],'find,grep,ls,read')
+        self.assertEqual(report['builtins'],'find,grep,ls,read')   # applied == allowed, read back
+        self.assertEqual(report['expected'],report['builtins'])
+        await self.mutation_close(aid)
+    async def test_full_builtin_profile_needs_no_surface_report(self):
+        # No restriction means no plan and no claim to verify: a missing report
+        # cannot fail a profile that allows every built-in tool. (write access:
+        # read access narrows the built-in list, which is a restriction again.)
+        from subagent_pi.config import PI_BUILTIN_TOOLS
+        self.rt.config['profiles']['allbuiltins']={'tools':list(PI_BUILTIN_TOOLS),'env':{'PI_TEST_SURFACE':'missing'}}
+        s=await self.spawn(profile='allbuiltins',access='write'); aid=s['agent_id']
+        self.assertEqual(self.events_of(aid,'tool_surface'),[])
+        await self.mutation_close(aid)
+    async def test_missing_surface_report_fails_the_launch(self):
+        import subagent_pi.worker as worker_module
+        original=worker_module.SURFACE_TIMEOUT_SECONDS
+        worker_module.SURFACE_TIMEOUT_SECONDS=0.5
+        self.addCleanup(setattr,worker_module,'SURFACE_TIMEOUT_SECONDS',original)
+        with self.assertRaises(AgentError) as cm:
+            await self.spawn(profile=self.restricted_profile(PI_TEST_SURFACE='missing'))
+        self.assertEqual(cm.exception.code,'tool_surface_unavailable')
+        aid=cm.exception.details['agent_id']
+        report=self.events_of(aid,'tool_surface')[-1]
+        self.assertFalse(report['ok']); self.assertEqual(report['reason'],'no-report')
+        self.assertEqual(self.rt.store.agent(self.scope,aid)['state'],'crashed')
+        self.assertTrue(all(w.closed for w in self.rt.workers.values()))  # no unverified worker survives
+    async def test_mismatched_surface_report_fails_the_launch(self):
+        with self.assertRaises(AgentError) as cm:
+            await self.spawn(profile=self.restricted_profile(PI_TEST_SURFACE='mismatch'))
+        self.assertEqual(cm.exception.code,'tool_surface_unapplied')
+        aid=cm.exception.details['agent_id']
+        report=self.events_of(aid,'tool_surface')[-1]
+        self.assertFalse(report['ok'])
+        self.assertEqual(report['builtins'],'find,grep,ls')   # the child's real state, not the wish
+        self.assertEqual(report['expected'],'find,grep,ls,read')
+        self.assertTrue(all(w.closed for w in self.rt.workers.values()))
+    async def test_malformed_surface_report_fails_the_launch(self):
+        with self.assertRaises(AgentError) as cm:
+            await self.spawn(profile=self.restricted_profile(PI_TEST_SURFACE='malformed'))
+        self.assertEqual(cm.exception.code,'tool_surface_unapplied')
+        self.assertEqual(self.events_of(cm.exception.details['agent_id'],'tool_surface')[-1]['ok'],False)
+    async def test_profile_opt_out_keeps_the_disable_flags(self):
+        self.rt.config['profiles']['isolated']={'tools':['read'],'ambient_extensions':False,'ambient_skills':False}
+        s=await self.spawn(profile='isolated'); aid=s['agent_id']
+        argv=json.loads((self.home/'agents'/aid/'launch.json').read_text())['argv']
+        self.assertIn('--no-extensions',argv); self.assertIn('--no-skills',argv)
+        await self.mutation_close(aid)
+    async def test_read_profile_may_load_extensions(self):
+        # The old read+extension rejection is gone: Pi's own configuration loads
+        # in every profile, so a read child's limits are its builtin allowlist,
+        # the MCP exposure policy and writer exclusivity - never a read-only
+        # claim about the extensions Pi loads.
+        ext=self.root/'custom-ext.ts'; ext.write_text('export default () => {}\n')
+        self.rt.config['profiles']['reader-ext']={'tools':['read','grep','find','ls'],'extensions':[str(ext)]}
+        s=await self.spawn(profile='reader-ext'); aid=s['agent_id']
+        argv=json.loads((self.home/'agents'/aid/'launch.json').read_text())['argv']
+        self.assertIn(str(ext),argv)  # profile extension loads in a read child
+        await self.mutation_close(aid)
     async def test_canary_never_reaches_disk(self):
         s=await self.spawn()
         await asyncio.sleep(0.2)
@@ -539,7 +680,8 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.count('--model'),1)
         self.assertEqual(third.count('--model'),1)
         self.assertLessEqual(third.count('--skill'),second.count('--skill'))
-        self.assertIn('codex_mcp',' '.join(third))
+        self.assertIn(str(BRIDGE),third)
+        self.assertEqual(third.count('--extension'),2)  # surface + bridge, never accumulating
         await self.mutation_close(aid)
     async def test_disabled_inheritance_leaves_original_path(self):
         # Per-scope management switch: an explicit scope_open with inheritance=false.
@@ -549,7 +691,8 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
             'cwd':str(self.workspace),'task':'simple','access':'read'})
         launch=json.loads((self.home/'agents'/s['agent_id']/'launch.json').read_text())
         self.assertNotIn('--skill',launch['argv'])
-        self.assertNotIn('--extension',launch['argv'])
+        self.assertNotIn(str(BRIDGE),launch['argv'])  # no inherited bridge
+        self.assertIn(str(SURFACE),launch['argv'])      # profile tool surface stays
         await self.rt.dispatch('close',{'scope':self.scope,'agent_id':s['agent_id'],'request_id':self.key()})
     async def test_source_conflict_requires_explicit_rebind(self):
         other=make_codex_home(self.root/'other')
@@ -671,6 +814,201 @@ class RealPiBridge(unittest.IsolatedAsyncioTestCase):
         self.assertIn('--extension',' '.join(json.loads((self.home/'agents'/aid/'launch.json').read_text())['argv']))
         await self.rt.dispatch('close',{'scope':self.scope,'agent_id':aid,'request_id':'live-close'})
 
+class RealPiSkillBoundary(unittest.IsolatedAsyncioTestCase):
+    """Real Pi loader, real skill files, real tool registry, real get_commands.
+    NOT in the default suite (SUBAGENT_PI_LIVE_PI=1) and no model call: start_run
+    is stubbed.
+
+    Covers the boundaries the fake Pi can only simulate: Pi's own discovery loads
+    the skill directory the CLIENT bound, Pi resolves a skill name collision in
+    its own favour, an ambient extension that shadows a built-in tool name keeps
+    working, and the daemon's built-in surface plan is verified against Pi's live
+    registry (which an independent probe extension reports).
+    """
+    async def asyncSetUp(self):
+        if os.environ.get('SUBAGENT_PI_LIVE_PI')!='1':
+            raise unittest.SkipTest('set SUBAGENT_PI_LIVE_PI=1 to run the real-Pi check; default suite never launches Pi')
+        if not shutil.which('pi'): self.skipTest('pi executable not available')
+        self.tmp=tempfile.TemporaryDirectory(prefix='inh-live-skills-')
+        self.root=Path(self.tmp.name); self.home=self.root/'state'; self.home.mkdir()
+        self.workspace=self.root/'workspace'; self.workspace.mkdir()
+        self.temp_home=self.root/'home'; self.temp_home.mkdir()
+        # The agent config directory comes from the CLIENT environment; the
+        # default location under this HOME holds a skill that must NOT appear.
+        self.agent_dir=self.root/'pi-agent'
+        make_skill(self.agent_dir/'skills','dup',body='Pi version of the duplicate.')
+        make_skill(self.agent_dir/'skills','pi-only')
+        make_skill(self.temp_home/'.pi'/'agent'/'skills','fallback-only')
+        self.codex=make_codex_home(self.root/'src')
+        make_skill(self.codex/'skills','dup',body='Codex version of the duplicate.')
+        make_skill(self.codex/'skills','codex-only')
+        make_skill(self.workspace/'.agents'/'skills','projskill')
+        (self.root/'srv.py').write_text(
+            'import sys,json\n'
+            'for line in sys.stdin:\n'
+            '    r=json.loads(line)\n'
+            '    if "id" in r and r.get("method")=="tools/list":\n'
+            '        print(json.dumps({"jsonrpc":"2.0","id":r["id"],"result":{"tools":[{"name":"echo","description":"t"}]}}),flush=True)\n'
+            '    elif "id" in r:\n'
+            '        print(json.dumps({"jsonrpc":"2.0","id":r["id"],"result":{}}),flush=True)\n')
+        (self.codex/'config.toml').write_text(
+            '[mcp_servers.echosrv]\ncommand = "python3"\nargs = ["%s"]\n' % (self.root/'srv.py'))
+        (self.home/'config.toml').write_text(
+            'pi_command = ["pi"]\nrpc_timeout_seconds = 15\nstartup_timeout_seconds = 40\n'
+            '\n[profiles.reader.env]\n'
+            'PI_OFFLINE = "1"\nPI_SKIP_VERSION_CHECK = "1"\nPI_TELEMETRY = "0"\n')
+        self.rt=Runtime(self.home); self.closed=False
+        self.client_env={'CODEX_HOME':str(self.codex),'PATH':os.environ['PATH'],
+                         'HOME':str(self.temp_home),'PI_CODING_AGENT_DIR':str(self.agent_dir)}
+        r=await self.rt.dispatch('scope_open',{'cwd':str(self.workspace)},source={'env':self.client_env})
+        self.scope=r['scope']
+        async def _no_prompt(w,rid): return None
+        self.rt.start_run=_no_prompt
+    async def asyncTearDown(self):
+        if not self.closed: await self.rt.shutdown()
+        self.tmp.cleanup()
+    def spawn(self,rid):
+        return self.rt.dispatch('spawn',{'scope':self.scope,'request_id':rid,
+            'cwd':str(self.workspace),'task':'simple','access':'read'})
+    def stderr_of(self,aid):
+        path=self.home/'agents'/aid/'stderr.log'
+        deadline=time.monotonic()+20
+        while time.monotonic()<deadline:
+            text=path.read_text(errors='replace') if path.exists() else ''
+            if 'subagent-pi-surface applied' in text and 'PROBE_TOOLS ' in text: return text
+            time.sleep(0.1)
+        return path.read_text(errors='replace') if path.exists() else ''
+    def write_probe_extension(self, override=()):
+        """An ambient Pi extension in the bound agent directory. It registers
+        tools that shadow built-in names (when asked) and reports Pi's live
+        registry, so tests compare ordinary Pi with a managed child instead of
+        trusting the plugin's own evidence line."""
+        path=self.agent_dir/'extensions'/'probe.ts'; path.parent.mkdir(parents=True,exist_ok=True)
+        registered=''.join(
+            "  pi.registerTool({name: %r, label: %r, description: 'override', parameters: {type:'object',properties:{}}, "
+            "async execute(){return {content:[{type:'text',text:'override'}]}}});\n" % (name,name) for name in override)
+        path.write_text(
+            "export default function (pi) {\n"
+            + registered +
+            "  pi.on('session_start', function () {\n"          # synchronous: Pi does not run extension timers in this mode
+            "    try { process.stderr.write('PROBE_TOOLS '+JSON.stringify({"
+            "active: pi.getActiveTools(), all: pi.getAllTools().map(function (t) { return {name: t.name, path: t.sourceInfo && t.sourceInfo.path}; })})+'\\n'); }\n"
+            "    catch (e) { process.stderr.write('PROBE_TOOLS_ERR '+String(e)+'\\n'); }\n"
+            "  });\n"
+            "}\n")
+        return path
+    def plain_pi_probe(self, timeout=25.0, cwd=None):
+        """Ordinary Pi session (no daemon, no managed plan) with the same agent
+        directory: the baseline that proves an overriding extension works at all."""
+        env={'PATH':os.environ['PATH'],'HOME':str(self.temp_home),'PI_CODING_AGENT_DIR':str(self.agent_dir),
+             'PI_OFFLINE':'1','PI_SKIP_VERSION_CHECK':'1','PI_TELEMETRY':'0'}
+        proc=subprocess.Popen(['pi','--mode','rpc'],cwd=str(cwd or self.workspace),env=env,
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        try:
+            proc.stdin.write(json.dumps({'id':'probe','type':'get_state'})+'\n'); proc.stdin.flush()
+            deadline=time.monotonic()+timeout; line=None
+            while time.monotonic()<deadline:
+                ready,_,_=select.select([proc.stderr],[],[],0.5)
+                if not ready: continue
+                line=proc.stderr.readline()
+                if not line: break
+                if line.startswith('PROBE_TOOLS '): break
+            if not line or not line.startswith('PROBE_TOOLS '):
+                raise AssertionError('ordinary Pi never reported PROBE_TOOLS')
+            return json.loads(line[len('PROBE_TOOLS '):])
+        finally:
+            proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired): proc.communicate(timeout=10)
+            if proc.poll() is None: proc.kill(); proc.communicate()
+    def active_tools(self, probe):
+        return set(probe['active'])
+    def tool_path(self, probe, name):
+        for entry in probe['all']:
+            if entry['name']==name: return entry.get('path')
+        return None
+    async def test_client_bound_directory_wins_over_the_default_home_directory(self):
+        s=await self.spawn('live-agentdir-1'); aid=s['agent_id']
+        record=[json.loads(e['payload']) for e in self.rt.store.all(
+            "SELECT payload FROM events WHERE agent_id=? AND type='inheritance_skills'",(aid,))][-1]
+        names={p['name']:p['path'] for p in record['pi_skills']}
+        self.assertIn('pi-only',names)          # the directory the client bound was opened
+        self.assertIn('dup',names)
+        for path in names.values():
+            self.assertTrue(path.startswith(str(self.agent_dir)),path)
+        self.assertNotIn('fallback-only',names)  # HOME/.pi/agent was not the directory Pi used
+        dup=[i for i in record['inherited'] if i['name']=='dup'][0]
+        self.assertEqual(dup['state'],'skipped')
+        self.assertEqual(dup['kept'],str((self.agent_dir/'skills'/'dup'/'SKILL.md').resolve()))
+        loaded={i['name']:i['state'] for i in record['inherited']}
+        self.assertEqual(loaded['codex-only'],'loaded')
+        self.assertEqual(loaded['projskill'],'loaded')
+        self.closed=True; await self.rt.dispatch('close',{'scope':self.scope,'agent_id':aid,'request_id':'live-agentdir-close-1'})
+    async def test_extension_tool_shadowing_a_builtin_survives_in_both_pis(self):
+        probe_ext=self.write_probe_extension(override=('bash',))
+        baseline=self.plain_pi_probe()
+        self.assertIn('bash',self.active_tools(baseline))
+        self.assertEqual(self.tool_path(baseline,'bash'),str(probe_ext))  # the override really wins in ordinary Pi
+        s=await self.spawn('live-override-2'); aid=s['agent_id']
+        stderr=self.stderr_of(aid)
+        probe=json.loads(stderr.split('PROBE_TOOLS ',1)[1].splitlines()[0])
+        self.assertEqual(self.tool_path(probe,'bash'),str(probe_ext))
+        self.assertIn('bash',self.active_tools(probe))                    # ... and the managed child keeps it
+        for name in ('edit','write'):                                     # real built-ins stay restricted
+            self.assertEqual(self.tool_path(probe,name),f'<builtin:{name}>')
+            self.assertNotIn(name,self.active_tools(probe))
+        evidence=parse_surface(stderr)
+        self.assertEqual(evidence['ok'],'true')
+        self.assertEqual(sorted(evidence['builtins'].split(',')),['find','grep','ls','read'])
+        self.assertEqual(self.active_tools(probe),
+                         set(evidence['builtins'].split(',')) | {'bash','codex_mcp'})
+        self.closed=True; await self.rt.dispatch('close',{'scope':self.scope,'agent_id':aid,'request_id':'live-override-close-2'})
+    async def test_reader_without_an_override_restricts_every_write_builtin(self):
+        self.write_probe_extension()
+        s=await self.spawn('live-surface-3'); aid=s['agent_id']
+        stderr=self.stderr_of(aid)
+        probe=json.loads(stderr.split('PROBE_TOOLS ',1)[1].splitlines()[0])
+        for name in ('bash','edit','write','powershell'):
+            self.assertEqual(self.tool_path(probe,name),f'<builtin:{name}>')  # registered by Pi ...
+            self.assertNotIn(name,self.active_tools(probe))                   # ... but not usable
+        for name in ('read','grep','find','ls'): self.assertIn(name,self.active_tools(probe))
+        self.assertIn('codex_mcp',self.active_tools(probe))                   # Pi's own extension tool kept
+        evidence=parse_surface(stderr)
+        self.assertEqual(evidence['ok'],'true')
+        self.assertEqual(sorted(evidence['builtins'].split(',')),['find','grep','ls','read'])
+        self.assertIn('subagent-pi-bridge ready servers=1',stderr)
+        self.closed=True; await self.rt.dispatch('close',{'scope':self.scope,'agent_id':aid,'request_id':'live-surface-close-3'})
+
+class BuiltinSurfacePlan(unittest.TestCase):
+    """A profile that restricts the built-in surface depends on the shipped
+    activator: the launch spec must refuse to start without it (instead of
+    launching a child whose built-ins were never bounded), and it must never ask
+    Pi to filter tools by name."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='inh-surface-')
+        self.addCleanup(self.tmp.cleanup)
+        self.home=Path(self.tmp.name)/'state'; self.home.mkdir()
+    def config(self, **profiles):
+        config=load_config(self.home); config['pi_command']=[sys.executable]
+        config['profiles'].update(profiles)
+        return config
+    def test_restricting_profile_without_the_extension_is_refused(self):
+        gone=Path(self.tmp.name)/'gone.ts'
+        with mock.patch('subagent_pi.config.surface_extension_path',return_value=gone):
+            with self.assertRaises(AgentError) as cm:
+                launch_spec(self.config(),'reader','test/model',str(ROOT),'read')
+            self.assertEqual(cm.exception.code,'invalid_config')
+            self.assertIn(str(gone),cm.exception.message)
+            # A profile that allows every built-in restricts nothing and still starts.
+            spec=launch_spec(self.config(allbuiltins={'tools':list(PI_BUILTIN_TOOLS)}),
+                             'allbuiltins','test/model',str(ROOT),'write')
+            self.assertFalse(spec['surface'])
+    def test_restricting_profile_carries_the_surface_plan_and_no_name_filters(self):
+        spec=launch_spec(self.config(),'reader','test/model',str(ROOT),'read')
+        self.assertTrue(spec['surface'])
+        self.assertEqual(spec['builtins'],['read','grep','find','ls'])
+        self.assertIn(str(SURFACE),spec['argv'])
+        for flag in ('--tools','--no-tools','--exclude-tools'): self.assertNotIn(flag,spec['argv'])
+
 class CliCodexParsing(unittest.TestCase):
     def test_cd_forms_and_separator(self):
         from subagent_pi.cli import split_codex_cwd
@@ -713,58 +1051,105 @@ class BootstrapStress(unittest.IsolatedAsyncioTestCase):
             tmp.cleanup()
 
 class RealPiParserProbe(unittest.TestCase):
-    """F01 layer-3: the FINAL merged argv must parse in Pi's real CLI parser with
-    exactly one --tools flag containing the original builtins plus codex_mcp.
+    """F01 layer-3: the argv the daemon actually launches must parse in Pi's real
+    CLI parser as a bounded built-in surface that leaves extension tools alone.
     Static parse only: no Pi process, no model call. Skipped without pi."""
     def pi_args_js(self):
         exe=shutil.which('pi')
         if not exe: return None
         real=Path(exe).resolve()
-        candidate=real.parents[1]/'lib'/'node_modules'/'@earendil-works'/'pi-coding-agent'/'dist'/'cli'/'args.js' if 'node_modules' not in real.parts else None
-        # Resolve robustly: walk up from the resolved executable to find dist/cli/args.js.
         for parent in [real.parent,*real.parents]:
             guess=parent/'dist'/'cli'/'args.js'
             if guess.is_file(): return guess
         return None
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='parser-probe-')
+        self.addCleanup(self.tmp.cleanup)
+        self.config_home=Path(self.tmp.name)/'config'
+        self.config_home.mkdir()
+    def config(self):
+        config=load_config(self.config_home)
+        config['pi_command']=[sys.executable]  # executable lookup only; Pi is probed via node
+        return config
+    def spec(self, profile, access, tools=None):
+        config=self.config()
+        if tools is not None: config['profiles'][profile]['tools']=tools
+        return launch_spec(config,profile,'test/model',str(ROOT),access)
     def probe(self,argv):
         js=self.pi_args_js()
         if js is None: self.skipTest('pi dist/cli/args.js not found')
-        script="const {parseArgs}=require(process.argv[1]);const r=parseArgs(process.argv.slice(2));console.log(JSON.stringify({tools:r.tools,noTools:r.noTools}))"
-        out=subprocess.run(['node','-e',script,str(js),*argv],capture_output=True,text=True,timeout=30)
+        script=("const {parseArgs}=require(process.argv[1]);const r=parseArgs(process.argv.slice(2));"
+                "console.log(JSON.stringify({tools:r.tools,noTools:r.noTools,noExtensions:r.noExtensions,"
+                "noSkills:r.noSkills,excludeTools:r.excludeTools,extensions:r.extensions,skills:r.skills}))")
+        out=subprocess.run(['node','-e',script,str(js),*argv[1:]],capture_output=True,text=True,timeout=30)
         self.assertEqual(out.returncode,0,out.stderr)
         return json.loads(out.stdout)
-    def test_reader_tools_survive_bridge_merge(self):
-        base=['pi','--mode','rpc','--no-extensions','--no-skills','--tools','read,grep,find,ls']
-        merged=merge_bridge_tool([*base,'--extension','/bridge.ts'])
-        self.assertEqual(merged.count('--tools'),1)
-        parsed=self.probe(merged)
-        self.assertEqual(parsed['tools'],['read','grep','find','ls','codex_mcp'])
-        self.assertFalse(parsed.get('noTools'))
-    def test_no_tools_becomes_bridge_only(self):
-        merged=merge_bridge_tool(['pi','--mode','rpc','--no-tools','--extension','/b.ts'])
-        self.assertNotIn('--no-tools',merged)
-        self.assertEqual(merged.count('--tools'),1)
-        parsed=self.probe(merged)
-        self.assertEqual(parsed['tools'],['codex_mcp'])
-    def test_no_tool_flags_left_untouched(self):
-        argv=['pi','--mode','rpc','--extension','/b.ts']
-        self.assertEqual(merge_bridge_tool(list(argv)),argv)  # bare --tools would strip builtins
-    def test_repeated_tool_flags_merge_into_one(self):
-        # Pi's parser assigns on every --tools occurrence (last wins), so a second
-        # flag would silently drop the bridge tool again.
-        merged=merge_bridge_tool(['pi','--mode','rpc','--tools','read','--tools','ls'])
-        self.assertEqual(merged.count('--tools'),1)
-        parsed=self.probe(merged)
-        self.assertEqual(parsed['tools'],['read','ls','codex_mcp'])
-    def test_short_flag_and_duplicate_names(self):
-        merged=merge_bridge_tool(['pi','-t','read,ls','--tools','ls','--verbose'])
-        self.assertEqual(merged.count('--tools')+merged.count('-t'),1)
-        self.assertIn('--verbose',merged)   # unrelated flags survive in place
-        parsed=self.probe(merged)
-        self.assertEqual(parsed['tools'],['read','ls','codex_mcp'])
-    def test_existing_bridge_tool_is_not_duplicated(self):
-        merged=merge_bridge_tool(['pi','--tools','read,codex_mcp'])
-        self.assertEqual(merged,['pi','--tools','read,codex_mcp'])
+    def test_writer_argv_never_names_tools_or_filters_by_name(self):
+        argv=self.spec('default','write')['argv']
+        parsed=self.probe(argv)
+        # --tools is an allowlist over built-in, extension AND custom tools, so
+        # using it would drop every tool Pi's own extensions register.
+        self.assertIsNone(parsed.get('tools'))
+        self.assertIsNone(parsed.get('noTools'))
+        self.assertIsNone(parsed.get('noExtensions'))
+        self.assertIsNone(parsed.get('noSkills'))
+        # --exclude-tools is name-based over the same registry: an extension that
+        # registers a tool named `bash` would be filtered out with the built-in.
+        # The built-in surface is applied and verified inside Pi instead.
+        self.assertIsNone(parsed.get('excludeTools'))
+        self.assertTrue(parsed['extensions'][0].endswith('extensions/managed-surface.ts'))
+    def test_reader_argv_does_not_exclude_anything_by_name(self):
+        spec=self.spec('reader','read')
+        parsed=self.probe(spec['argv'])
+        self.assertIsNone(parsed.get('excludeTools'))
+        self.assertIsNone(parsed.get('tools'))
+        self.assertIn(str(SURFACE),parsed['extensions'])
+        self.assertTrue(spec['surface'])
+    def test_full_builtin_profile_needs_no_surface_plan(self):
+        # A profile that allows every built-in restricts nothing, so it neither
+        # loads the surface extension nor asks the daemon to verify one.
+        spec=self.spec('default','write',tools=list(PI_BUILTIN_TOOLS))
+        self.assertFalse(spec['surface'])
+        self.assertNotIn(str(SURFACE),spec['argv'])
+    def test_empty_builtin_profile_is_still_fail_closed(self):
+        # An empty list is a plan ("no built-in tools"), not "no plan": it must
+        # ship the surface extension with an empty allowlist.
+        spec=self.spec('default','write',tools=[])
+        self.assertTrue(spec['surface'])
+        self.assertEqual(spec['builtins'],[])
+        self.assertIn(str(SURFACE),spec['argv'])
+    def test_default_profiles_load_pi_configuration(self):
+        for profile in ('default','reader'):
+            for argv in (self.spec(profile,'write')['argv'] if profile=='default' else self.spec(profile,'read')['argv'],):
+                self.assertNotIn('--no-extensions',argv)
+                self.assertNotIn('--no-skills',argv)
+    def test_ambient_opt_out_keeps_the_explicit_flags(self):
+        config=self.config()
+        config['profiles']['isolated']={'tools':['read'],'ambient_extensions':False,'ambient_skills':False}
+        argv=launch_spec(config,'isolated','test/model',str(ROOT),'read')['argv']
+        self.assertIn('--no-extensions',argv)
+        self.assertIn('--no-skills',argv)
+        parsed=self.probe(argv)
+        self.assertTrue(parsed['noExtensions'] and parsed['noSkills'])
+        self.assertIsNone(parsed.get('excludeTools'))
+        self.assertTrue(launch_spec(config,'isolated','test/model',str(ROOT),'read')['surface'])
+    def test_surface_plan_covers_every_restricting_profile(self):
+        partial=self.spec('default','write',tools=['read','bash','edit','write'])
+        self.assertTrue(partial['surface'])          # powershell is still restricted
+        self.assertIn(str(SURFACE),partial['argv'])
+        self.assertEqual(partial['builtins'],['read','bash','edit','write'])
+        extra=self.spec('default','write',tools=['read','bash','edit','write','grep'])
+        self.assertTrue(extra['surface'])
+        self.assertEqual(extra['builtins'],['read','bash','edit','write','grep'])
+    def test_skills_are_repeatable_flags(self):
+        dirs=[]
+        for name in ('one','two'):
+            d=Path(self.tmp.name)/name; d.mkdir(); (d/'SKILL.md').write_text(f'---\nname: {name}\ndescription: d\n---\n')
+            dirs.append(str(d))
+        config=self.config()
+        config['profiles']['skilly']={'tools':['read'],'skills':dirs}
+        parsed=self.probe(launch_spec(config,'skilly','test/model',str(ROOT),'read')['argv'])
+        self.assertEqual(parsed['skills'],dirs)  # repeatable, inherited flags append without merging
 
 class CodexLauncherProcess(unittest.TestCase):
     """F02 layer-3: a real launcher subprocess must forward Codex's arguments
@@ -861,6 +1246,83 @@ class ScopeEnvIsolation(unittest.IsolatedAsyncioTestCase):
         if wal.exists():
             self.assertNotIn(b'scope-secret-value',wal.read_bytes())
 
+class CodingAgentDirBinding(unittest.IsolatedAsyncioTestCase):
+    """The child Pi must open the agent config dir the CLIENT bound to its scope.
+    PI_CODING_AGENT_DIR is a non-secret configuration locator (like HOME), so it
+    travels through the real chain — client env -> scope snapshot -> daemon ->
+    guard -> Pi — without being listed in inheritance.child_env or profile.env.
+    A profile env value keeps priority and an unset variable keeps Pi's default
+    (HOME/.pi/agent). The reason this is asserted at the child, not at the
+    launch spec: only the child can prove which directory it actually opened."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='inh-agentdir-')
+        self.root=Path(self.tmp.name); self.home=self.root/'state'; self.home.mkdir()
+        self.ws=self.root/'ws'; self.ws.mkdir()
+        self.codex=make_codex_home(self.root/'src')
+        self.client_dir=self.root/'client-agent'; self.client_dir.mkdir()
+        self.profile_dir=self.root/'profile-agent'; self.profile_dir.mkdir()
+        self.rt=None
+        self.addCleanup(self.tmp.cleanup)
+        self.saved_coding_dir=os.environ.pop('PI_CODING_AGENT_DIR',None)
+        self.addCleanup(self._restore)
+    def _restore(self):
+        if self.saved_coding_dir is not None: os.environ['PI_CODING_AGENT_DIR']=self.saved_coding_dir
+    def write_config(self,extra=''):
+        (self.home/'config.toml').write_text('pi_command = '+fake_pi_command()+'\nstartup_timeout_seconds = 25\n'+extra)
+    async def asyncTearDown(self):
+        if self.rt is not None: await self.rt.shutdown()
+    async def _spawn(self,env,rid,profile=None,resume=None):
+        """Open (or, for `resume`, simply reuse) a scope and spawn one agent. A
+        resumed scope performs no rebind, so only the persisted base snapshot can
+        supply the directory — which is what a post-restart worker must rely on."""
+        if self.rt is None: self.rt=Runtime(self.home)
+        if resume is not None:
+            scope=resume
+        else:
+            source={'env':env}
+            if profile is not None: source['profile']=profile
+            r=await self.rt.dispatch('scope_open',{'cwd':str(self.ws),'label':'agentdir'},source=source)
+            scope=r['scope']
+        s=await self.rt.dispatch('spawn',{'scope':scope,'request_id':rid,
+            'cwd':str(self.ws),'task':'simple','access':'read'})
+        return scope,s['agent_id']
+    async def _child_env_probe(self,aid):
+        state=await self.rt.workers[aid].rpc('get_state')
+        return state.get('env_probe',{})
+    async def test_client_bound_directory_reaches_the_child(self):
+        self.write_config()
+        self.assertNotIn('PI_CODING_AGENT_DIR',os.environ)  # the daemon's own env must not be the source
+        scope,aid=await self._spawn({'PATH':os.environ['PATH'],'HOME':os.environ['HOME'],
+            'PI_CODING_AGENT_DIR':str(self.client_dir)},'agentdir-1')
+        probe=await self._child_env_probe(aid)
+        self.assertEqual(probe.get('PI_CODING_AGENT_DIR'),str(self.client_dir))
+        await self.rt.dispatch('close',{'scope':scope,'agent_id':aid,'request_id':'agentdir-close-1'})
+    async def test_profile_env_keeps_priority(self):
+        self.write_config(f'\n[profiles.reader.env]\nPI_CODING_AGENT_DIR = "{self.profile_dir}"\n')
+        scope,aid=await self._spawn({'PATH':os.environ['PATH'],'HOME':os.environ['HOME'],
+            'PI_CODING_AGENT_DIR':str(self.client_dir)},'agentdir-2')
+        probe=await self._child_env_probe(aid)
+        self.assertEqual(probe.get('PI_CODING_AGENT_DIR'),str(self.profile_dir))
+        await self.rt.dispatch('close',{'scope':scope,'agent_id':aid,'request_id':'agentdir-close-2'})
+    async def test_unset_variable_keeps_pi_default(self):
+        self.write_config()
+        scope,aid=await self._spawn({'PATH':os.environ['PATH'],'HOME':os.environ['HOME']},'agentdir-3')
+        probe=await self._child_env_probe(aid)
+        self.assertNotIn('PI_CODING_AGENT_DIR',probe)
+        await self.rt.dispatch('close',{'scope':scope,'agent_id':aid,'request_id':'agentdir-close-3'})
+    async def test_bound_directory_survives_a_daemon_restart(self):
+        self.write_config()
+        env={'PATH':os.environ['PATH'],'HOME':os.environ['HOME'],'CODEX_HOME':str(self.codex),
+             'PI_CODING_AGENT_DIR':str(self.client_dir)}
+        scope,aid=await self._spawn(env,'agentdir-4')
+        await self.rt.dispatch('close',{'scope':scope,'agent_id':aid,'request_id':'agentdir-close-4'})
+        await self.rt.shutdown(); self.rt=None          # a restart drops the in-memory snapshot
+        scope2,aid2=await self._spawn(env,'agentdir-5',resume=scope)
+        self.assertEqual(scope2,scope)
+        probe=await self._child_env_probe(aid2)
+        self.assertEqual(probe.get('PI_CODING_AGENT_DIR'),str(self.client_dir))
+        await self.rt.dispatch('close',{'scope':scope2,'agent_id':aid2,'request_id':'agentdir-close-5'})
+
 def stop_daemon(cli, env, timeout=15.0):
     """`daemon stop --force` returns when shutdown is *requested*, not when the
     daemon process has exited; wait for the IPC socket (unlinked in the daemon's
@@ -955,7 +1417,7 @@ class EnvironmentBindingChain(unittest.TestCase):
             launches=list((state/'agents').glob('*/launch.json'))
             self.assertTrue(launches)
             argv=json.loads(launches[0].read_text())['argv']
-            self.assertNotIn('--extension',argv)
+            self.assertNotIn(str(BRIDGE),argv)
             self.assertNotIn('--skill',argv)
             # The authorized secret value never reached any control-plane file.
             for p in state.rglob('*'):
@@ -1001,7 +1463,7 @@ class EnvironmentBindingChain(unittest.TestCase):
             self._cli(cli,env,'spawn','--scope',scope_id,'--cwd',str(ws),'--task','simple','--access','read')
             launches=list((state/'agents').glob('*/launch.json'))
             argv=json.loads(launches[0].read_text())['argv']
-            self.assertNotIn('--extension',argv)  # master off: no import
+            self.assertNotIn(str(BRIDGE),argv)  # master off: no import
             # Flip the master switch on and rebind: import comes back.
             (state/'config.toml').write_text('pi_command = '+fake_pi_command()+'\nstartup_timeout_seconds = 30\n\n[inheritance]\nenabled = true\nchild_env = ["PI_TEST_AUTH", "PI_TEST_PROBE_FILE", "PI_TEST_PROBE_CMD", "PI_TEST_HOME_TAG"]\n')
             stop_daemon(cli,env)  # fully exited before the next autostart races the same socket

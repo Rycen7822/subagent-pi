@@ -1,9 +1,78 @@
-# Codex Inheritance for Managed Children (0.2.7)
+# Codex Inheritance for Managed Children
 
-Managed subagents started by this plugin can use your Codex-side global skills
-and MCP servers. Normal `pi` sessions are never affected: inheritance is added
-only to children the daemon boots, only while it is enabled, and only from the
-sources described here.
+Managed subagents started by this plugin run a normal Pi session — Pi's own
+global/project configuration loads exactly as it does for a `pi` you start
+yourself — and then inherit your Codex-side global skills and MCP servers on top
+of it. Normal `pi` sessions are never affected: inheritance is added only to
+children the daemon boots, only while it is enabled, and only from the sources
+described here.
+
+## Pi's own configuration loads first
+
+A managed child is a normal Pi session with a private session file, so it loads
+the same configuration any Pi start would:
+
+- extensions and packages (global `~/.pi/agent/extensions`, packages, project
+  extensions), including MCP-capable extensions a user installed;
+- skills from Pi's own sources (agent dir, project, packages, `settings.skills`)
+  and prompt templates, themes, context files and Pi settings;
+- whatever tools those extensions register.
+
+Two profile keys exist only as an explicit opt-out; both default to `true`:
+
+```toml
+[profiles.reader]
+ambient_extensions = true   # false re-adds --no-extensions
+ambient_skills = true       # false re-adds --no-skills
+tools = ["read", "grep", "find", "ls"]
+```
+
+`tools` is the child's BUILT-IN tool surface, applied by the shipped
+`extensions/managed-surface.ts` on `session_start`: it activates the profile's
+built-ins AND deactivates any built-in the profile does not list, so a built-in
+this plugin does not know about cannot quietly appear in a `reader` child. The
+extension is passed only for profiles that actually restrict the surface (a
+profile that allows every built-in needs no plan); if it is missing from the
+installation, a restricting profile refuses to start instead of launching an
+unbounded child.
+
+Built-in identity comes from Pi, not from the tool name: Pi reports
+`sourceInfo.path = "<builtin:NAME>"` for its own tools, and an extension file for
+its own. A tool an extension registers under a built-in name (`bash`, say) keeps
+Pi's state — the extension tool stays registered and active, while the real
+built-in of that name is gone from the registry anyway. Extension and custom
+tools are never touched by this plugin: with `PI_AGENTS_CHILD_BUILTINS` unset the
+extension leaves the surface exactly as Pi computed it, and it never makes a tool
+write-capable.
+
+Both obvious CLI alternatives are deliberately NOT used, because they filter the
+same registry BY NAME and would therefore also drop an extension tool that
+shadows a built-in:
+
+- `--tools` is an allowlist over built-in, extension and custom tools;
+- `--exclude-tools` is a denylist over built-in, extension and custom tools.
+
+Because the profile's surface is applied inside Pi, the daemon does not take the
+argv on trust: the extension reports what Pi's live registry says after the
+change (`subagent-pi-surface applied ok=... allowed=... builtins=...
+expected=... unidentified=...`), the daemon records it as a `tool_surface` event,
+and a restricted launch fails (`tool_surface_unavailable` when no report
+arrives, `tool_surface_unapplied` when the applied set differs) rather than
+pretending the restriction is in force. Built-in restrictions are only claimed
+for the child that proved them.
+
+Access modes are policy, not a sandbox:
+
+- `access=write`: the profile's built-ins plus Pi's own extension tools.
+- `access=read`: the profile's read built-ins (`read`, `grep`, `find`, `ls` by
+  default) plus Pi's own extension tools. It restricts the built-ins this
+  plugin controls and narrows inherited MCP to read-only tools, but it does NOT
+  restrict what Pi's own extensions, their tools, or Pi's own skills can do —
+  extensions are code that runs in the child. A read child is therefore not a
+  read-only child, and writer exclusivity (`access=write`) is the only
+  confinement this plugin enforces. Earlier versions rejected
+  `read` + extensions outright and claimed a read-only tool surface; that claim
+  is gone because it was never true once Pi's configuration loads.
 
 ## Enable / disable
 
@@ -42,10 +111,10 @@ instead of guessed. `subagent-pi doctor --inheritance` shows each scope's
 source, selected skills/servers, exclusion reasons and missing credential
 names — never values.
 
-## Skills: original paths only
+## Skills: Pi names win, original paths only
 
 When booting a managed child, the daemon appends original `--skill` paths
-(Pi keeps discovery off via `--no-skills` and loads exactly these):
+alongside Pi's own discovered skills:
 
 - project `.agents/skills` under the scope root (existing convention, in place);
 - profile skills (unchanged behavior);
@@ -58,13 +127,59 @@ skills are excluded (recursion guard, by real path inside the plugin install
 and by declared name); skills with the same name from different sources are
 refused with a diagnostic instead of an arbitrary pick; a missing default
 directory is an empty set with a short diagnostic, while user-configured
-missing paths are errors. Codex-specific policy metadata (for example
+missing paths are errors.
+
+Any remaining name collision between an inherited skill and a skill Pi loaded
+from the user's own Pi configuration is resolved BY PI, at the real loading
+boundary: Pi registers the skills it discovered before the CLI `--skill` paths
+and keeps the first registration for a name (verified against Pi 0.85.1), so
+the Pi skill is the one that exists in the session. Nothing is copied, renamed
+or edited: the Pi skill file stays where the user put it and the Codex skill
+file is simply never registered.
+
+Because that decision happens inside Pi, the daemon reads it back instead of
+predicting it: after the boot handshake it asks the live child for
+`get_commands` and stores one `inheritance_skills` event per boot. The event
+lists every inherited `--skill` path with `state` `loaded`, `skipped` or
+`not_loaded` — a `skipped` entry also carries the `name` and the `kept` path of
+the Pi skill that won — plus `pi_skills` for the entries Pi provided on its own.
+If Pi cannot answer (`get_commands` unavailable), the event records the error
+and the boot still succeeds. No BM25, embedding or alias heuristics are used
+anywhere: identity is the name Pi resolved, and the name Pi resolved is the one
+in its registry. Codex-specific policy metadata (for example
 `agents/openai.yaml` invocation policy) is not interpreted: if a skill relies
 on host-specific behavior, it will load but its policy is not enforced by Pi —
 check such skills before delegating them.
 
 Skills are referenced in place, not frozen: a running child keeps what it
 discovered at boot; re-reading a file later shows the current content.
+
+## MCP: no Pi-side registry to deduplicate against
+
+Pi 0.85.1 has no MCP subsystem at all: `pi --help` has no MCP flag, Pi's
+settings have no MCP key, a Pi package manifest declares only
+`extensions`/`skills`/`prompts`/`themes`, and the documented position is
+explicitly "No MCP" (MCP belongs in an extension or package a user installs).
+MCP servers therefore exist in a managed child ONLY through the bridge this
+plugin boots.
+
+That has one consequence worth stating plainly: the "Pi already has a server
+with this name, keep Pi's and skip the Codex one" rule from the requirements
+CANNOT be implemented, and it is NOT implemented. Pi exposes no MCP server
+registry, no server identity and no configuration format for one — `get_commands`
+lists commands, and the extension API's `getAllTools()` reports tool names plus
+their owning extension file, never an MCP server. Deduplicating by server name
+would require guessing a private naming convention inside somebody's MCP
+extension, or inventing a Pi MCP config format, and this plugin does neither.
+The blocker is a missing upstream mechanism, not a deferred task here: if Pi
+ever exposes a server registry, the dedup belongs next to `parse_mcp_servers`.
+
+What IS guaranteed is the part Pi cannot break: inherited MCP is addressed by
+`(server, tool)`, so two servers that both offer a tool named `search` stay
+distinct in the catalog and dispatch to their own server. Same-named tools in
+different servers are never treated as a conflict. In practice a Codex server
+name can also not collide with a Pi-side server, because by construction there
+is no Pi-side server.
 
 ## MCP: read-only TOML, in-memory conversion
 
@@ -104,8 +219,6 @@ Name conflicts with the plugin's own management server are impossible to
 inherit: a server whose resolved command is this plugin's executable is
 excluded by its execution definition (renaming the server in the config does
 not bypass this; renaming the binary itself is out of scope).
-
-## The private channel and the child extension
 
 ## MCP protocol compatibility (0.2.6)
 
@@ -251,7 +364,7 @@ for reconnection on the next explicit operation. A cancellation notice whose
 send fails is swallowed; it never crashes the worker nor turns the
 cancellation into a success.
 
-## Approval policy and read-only children
+## Approval policy and read children
 
 The effective approval for a tool is resolved top-down: deny (disabled_tools
 or unimplementable tool config) highest, then the per-tool `approval_mode`
@@ -281,15 +394,21 @@ than pretending it did not run.
 
 - The bound scope keeps a minimal env snapshot in daemon memory: base keys
   (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `SHELL`, `USER`,
-  `LOGNAME`, `CODEX_HOME`), exactly the variables the current codex config
-  references, and explicitly configured `inheritance.child_env` names (for
-  model-auth env vars). Secret values are never persisted, logged, or included
+  `LOGNAME`, `PI_CODING_AGENT_DIR`, `CODEX_HOME`), exactly the variables the
+  current codex config references, and explicitly configured
+  `inheritance.child_env` names (for model-auth env vars).
+  `PI_CODING_AGENT_DIR` is a non-secret LOCATION the child Pi resolves itself
+  (it decides where Pi's own configuration comes from), which is why it is
+  forwarded and persisted with the other base keys while `CODEX_HOME` is not:
+  the daemon resolves the Codex source itself. Secret values are never persisted, logged, or included
   in events. The base keys are the one exception: they are non-secret, so they
   are stored per scope in the ledger (`scopes.base_env`) and reloaded after a
   daemon restart — without that, a respawned worker would start with no `PATH`.
 - The guard and Pi worker do NOT inherit the daemon's environ: their base
   environment is built from the scope snapshot above, so session B never sees
-  session A's credentials. This base binding happens on EVERY worker boot,
+  session A's credentials and a managed child opens the same Pi configuration
+  directory the client that opened the scope used (unset stays Pi's default;
+  `[profiles.x.env]` still wins). This base binding happens on EVERY worker boot,
   independent of the inheritance master switch — with inheritance disabled a
   worker still gets its own PATH/HOME (and never triggers any Codex source
   access). The bridge gives each MCP stdio server only the base keys `PATH`,
@@ -326,7 +445,29 @@ than pretending it did not run.
 - Model pinning, run/request identities, single-session writer, receipts and
   result-hash acknowledgement are unchanged.
 
-## Known boundaries (unsupported in 0.2.2)
+## Known boundaries
+
+- MCP server-name deduplication against Pi's own MCP set is impossible while
+  Pi has no MCP concept (see above); only the `(server, tool)` addressing
+  guarantee is provided. Do not read the rest of this document as claiming
+  otherwise.
+- The proxy tool name `codex_mcp` is not reserved against Pi's own extensions:
+  if a user-installed extension registers a tool with that name, Pi's registry
+  keeps the load-order winner and this plugin neither detects nor reorders it.
+  That is a tool-name collision inside Pi, not server-name dedup, and it is a
+  reason to keep ambient extensions that provide MCP out of managed children
+  (`ambient_extensions = false`) if you rely on the inherited bridge.
+- A `read` child's built-in surface is bounded by the surface extension (which
+  deactivates every built-in the profile does not list, including built-ins this
+  plugin does not know) and verified from the child's live registry before the
+  boot counts. That verification is a snapshot at `session_start`: a later
+  handler from another extension could re-activate a tool, and Pi's own
+  extensions can do anything their code allows. Read access is a managed
+  tool-surface policy, never a sandbox.
+- Extensions/custom tools keep Pi's activation state, so an extension can expose
+  its own write-capable tool to a `read` child. The plugin does not filter
+  extension tools by name; configure such extensions out
+  (`ambient_extensions = false`) if that matters.
 
 - OAuth / ChatGPT-session authenticated MCP servers, dynamic
   `http_headers_helper`, remote executor stdio, sampling/elicitation, and

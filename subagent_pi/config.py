@@ -12,12 +12,19 @@ DEFAULT = {
     'event_max_count_per_agent': 20000,
     'inheritance': {'enabled': True, 'skills': True, 'mcp': True, 'codex_home': None, 'child_env': [], 'mcp_protocol_mode': 'auto'},
     'profiles': {
-        'default': {'extensions': [], 'skills': [], 'ambient_extensions': False,
-                    'ambient_skills': False, 'tools': ['read','bash','edit','write','grep','find','ls']},
-        'reader': {'extensions': [], 'skills': [], 'ambient_extensions': False,
-                   'ambient_skills': False, 'tools': ['read','grep','find','ls']},
+        'default': {'extensions': [], 'skills': [], 'ambient_extensions': True,
+                    'ambient_skills': True, 'tools': ['read','bash','edit','write','grep','find','ls']},
+        'reader': {'extensions': [], 'skills': [], 'ambient_extensions': True,
+                   'ambient_skills': True, 'tools': ['read','grep','find','ls']},
     }
 }
+# Pi's built-in tools (dist/core/tools/index.js `allToolNames`). A profile's
+# `tools` is its ALLOWED built-in surface, applied by extensions/managed-surface.ts
+# because both CLI filters are wrong for it: --tools is an allowlist over
+# built-in, extension and custom tools, and --exclude-tools filters the same
+# registry BY NAME, so either one would also drop a tool an extension registered
+# under a built-in name.
+PI_BUILTIN_TOOLS = ('read','bash','powershell','edit','write','grep','find','ls')
 
 def load_config(home: Path):
     result = dict(DEFAULT)
@@ -68,6 +75,11 @@ def load_config(home: Path):
         raise AgentError('invalid_config','pi_command must be a nonempty argv list')
     return result
 
+def surface_extension_path() -> Path:
+    """The shipped extension that applies (and reads back) a profile's built-in
+    tool surface inside the child."""
+    return Path(__file__).resolve().parent.parent/'extensions'/'managed-surface.ts'
+
 def launch_spec(config, profile_name, model, cwd, access):
     if profile_name not in config['profiles']: raise AgentError('profile_not_found',f'Unknown profile: {profile_name}')
     p = config['profiles'][profile_name]
@@ -76,19 +88,31 @@ def launch_spec(config, profile_name, model, cwd, access):
     executable = shutil.which(config['pi_command'][0])
     if not executable: raise AgentError('pi_not_found','Pi executable not found; set pi_command in config.toml or PI_AGENTS_PI')
     tools = p.get('tools',[])
-    if not isinstance(tools,list) or any(t not in {'read','bash','edit','write','grep','find','ls'} for t in tools):
+    if not isinstance(tools,list) or any(t not in PI_BUILTIN_TOOLS for t in tools):
         raise AgentError('invalid_config','tools must be a list of Pi builtin names')
     if access == 'read':
         tools = [t for t in tools if t in {'read','grep','find','ls'}]
-        if p.get('ambient_extensions') or p.get('extensions'):
-            raise AgentError('invalid_config','read profile must disable all extensions; tool limits are not an OS sandbox')
     env = p.get('env',{})
     if not isinstance(env,dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in env.items()):
         raise AgentError('invalid_config','profile env must contain string values')
     argv = [executable,*config['pi_command'][1:],'--mode','rpc']
-    if not p.get('ambient_extensions',False): argv.append('--no-extensions')
-    if not p.get('ambient_skills',False): argv.append('--no-skills')
-    argv += ['--tools',','.join(tools)] if tools else ['--no-tools']
+    # Pi's own configuration (extensions, packages, skills, prompts, settings,
+    # MCP-capable extensions) loads by default; --no-extensions/--no-skills exist
+    # only as an explicit per-profile opt-out.
+    if not p.get('ambient_extensions',True): argv.append('--no-extensions')
+    if not p.get('ambient_skills',True): argv.append('--no-skills')
+    # Built-in surface: never an allowlist or a name-based denylist (see
+    # PI_BUILTIN_TOOLS); a profile that restricts it requires the shipped
+    # activator, and the daemon verifies its report before the boot counts.
+    builtins = [t for t in PI_BUILTIN_TOOLS if t in tools]
+    restrict = set(builtins) != set(PI_BUILTIN_TOOLS)
+    surface = surface_extension_path()
+    if restrict:
+        if not surface.is_file():
+            raise AgentError('invalid_config',f'Restricting built-in tools requires {surface}; restore it or allow every built-in tool')
+        argv += ['--extension',str(surface)]
+    # --extension and --skill are repeatable and additive, so profile entries and
+    # inherited entries can coexist without merging flags.
     for flag,key in [('--extension','extensions'),('--skill','skills')]:
         paths = p.get(key,[])
         if not isinstance(paths,list): raise AgentError('invalid_config',f'{key} must be a list')
@@ -101,4 +125,4 @@ def launch_spec(config, profile_name, model, cwd, access):
     if p.get('provider'): argv += ['--provider',text(p['provider'],'provider',128)]
     if p.get('thinking'): argv += ['--thinking',text(p['thinking'],'thinking',32)]
     return {'argv':argv,'cwd':cwd,'profile':profile_name,'access':access,'model':actual_model,'env':env,
-            'ambient_extensions':p.get('ambient_extensions',False),'ambient_skills':p.get('ambient_skills',False)}
+            'builtins':builtins,'surface':restrict}

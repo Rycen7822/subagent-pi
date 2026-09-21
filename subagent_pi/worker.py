@@ -15,6 +15,12 @@ from .common import (MAX_FRAME, AgentError, atomic_json, bounded, crop, dumps, g
 
 RESULT_CAP = 1024 * 1024
 BOOTSTRAP_MAX = 4 * 1024 * 1024
+# How long the built-in surface report may take after Pi answered get_state. The
+# shipped extension writes it during session_start, so a missing report means it
+# did not load or did not run; the boot then fails instead of claiming a
+# built-in restriction that was never applied.
+SURFACE_TIMEOUT_SECONDS = 10.0
+SURFACE_PREFIX = 'subagent-pi-surface '
 
 def message_text(message):
     content = message.get('content',[])
@@ -39,6 +45,9 @@ class Worker:
         self.events_written = 0
         self.tasks = []
         self.write_lock = asyncio.Lock()
+        self.surface = None          # parsed report from extensions/managed-surface.ts
+        self.surface_ready = asyncio.Event()
+        self.surface_buf = b''
     def start(self):
         self.tasks = [asyncio.create_task(self.read_stdout()),asyncio.create_task(self.read_stderr()),asyncio.create_task(self.watch_exit())]
     async def rpc(self, kind, timeout=None, **params):
@@ -93,6 +102,21 @@ class Worker:
                 if not chunk: break
                 if total < 512*1024:
                     data = chunk[:512*1024-total]; f.write(data); f.flush(); total += len(data)
+                self.note_surface(chunk)
+    def note_surface(self, chunk):
+        """Collect the built-in surface report the shipped extension writes after
+        reading Pi's live registry back. Only lines the daemon asked for (a
+        profile that restricts the built-in surface) are meaningful; a no-plan
+        line means the extension had nothing to apply."""
+        parts = (self.surface_buf + chunk).split(b'\n')
+        self.surface_buf = parts.pop()[-4096:]
+        for raw in parts:
+            line = raw.decode('utf-8','replace')
+            if not line.startswith(SURFACE_PREFIX): continue
+            words = line.split()
+            if words[1:2] != ['applied']: continue
+            self.surface = parse_surface_line(line)
+            self.surface_ready.set()
     async def watch_exit(self):
         code = await self.proc.wait()
         with contextlib.suppress(Exception):  # consume a final agent_end before reconciliation
@@ -108,11 +132,101 @@ def write_all(fd, data):
         written = os.write(fd, view)
         view = view[written:]
 
+def close_quietly(fd):
+    """The fd owner closes exactly once; a second close or an already-gone pipe is
+    never an error here."""
+    if fd is None: return
+    with contextlib.suppress(OSError): os.close(fd)
+
+def _skill_file(path: str) -> Path:
+    """--skill takes a skill directory; Pi reports the SKILL.md it registered."""
+    entry = Path(path)
+    if entry.name != 'SKILL.md': entry = entry / 'SKILL.md'
+    try: return entry.resolve()
+    except (OSError, RuntimeError): return entry
+
+
+async def resolve_skills(rt, w, plan):
+    """Record how Pi actually resolved the inherited skill paths.
+
+    Pi resolves skill name collisions itself and keeps the skill it discovered
+    from the user's own Pi configuration (discovered skills are registered before
+    CLI --skill paths), so an inherited skill that duplicates a Pi skill is
+    dropped at Pi's loading boundary. Asking the live child which skills its
+    registry holds is the only honest way to report which inherited entries lost
+    and which Pi entry was kept; a failure here never fails the boot.
+    """
+    from .inheritance import pi_skill_name
+    aid, generation = w.agent['id'], w.generation
+    try:
+        data = await w.rpc('get_commands')
+    except AgentError as exc:
+        rt.store.event(aid,None,generation,'inheritance_skills',
+            bounded({'source':plan.get('source'),'error':exc.code,'message':crop(exc.message,300)}))
+        return
+    registered = {}
+    for entry in data.get('commands') or []:
+        if not isinstance(entry,dict) or entry.get('source') != 'skill': continue
+        name = str(entry.get('name') or '')
+        name = name[len('skill:'):] if name.startswith('skill:') else name
+        info = entry.get('sourceInfo') if isinstance(entry.get('sourceInfo'),dict) else {}
+        path = info.get('path') or entry.get('path')
+        if name and isinstance(path,str): registered[name] = {'path':path,'real':_skill_file(path)}
+    by_real = {e['real']: n for n,e in registered.items()}
+    records = []
+    for path in plan['skills']:
+        real = _skill_file(path)
+        if real in by_real:
+            records.append({'path':path,'name':by_real[real],'state':'loaded'})
+            continue
+        name = pi_skill_name(real)
+        kept = registered.get(name)
+        if kept:
+            records.append({'path':path,'name':name,'state':'skipped','kept':kept['path']})
+        else:
+            records.append({'path':path,'name':name,'state':'not_loaded'})
+    ours = {_skill_file(p) for p in plan['skills']}
+    pi_owned = [{'name':n,'path':e['path']} for n,e in registered.items() if e['real'] not in ours]
+    rt.store.event(aid,None,generation,'inheritance_skills',
+        bounded({'source':plan.get('source'),'inherited':records,'pi_skills':pi_owned},4096))
+
+
+def parse_surface_line(text):
+    """Parse one `subagent-pi-surface applied ...` evidence line into fields."""
+    fields = {}
+    for part in text.split()[2:]:
+        key,_,value = part.partition('=')
+        fields[key] = value
+    fields['ok'] = fields.get('ok') == 'true'
+    return fields
+
+async def verify_surface(rt, w, timeout=SURFACE_TIMEOUT_SECONDS):
+    """Require the built-in surface report before a restricted profile boots.
+
+    The applied set is read back from Pi's live registry inside the child, so the
+    daemon learns whether the profile's built-in surface really took effect (and
+    which built-ins the child ended up with) instead of trusting argv. A missing
+    or not-ok report fails the launch: a read-only worker is never handed a
+    write-capable built-in that this plugin could not confirm it removed."""
+    aid, generation = w.agent['id'], w.generation
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(w.surface_ready.wait(),timeout)
+    report = w.surface
+    if report is None:
+        rt.store.event(aid,None,generation,'tool_surface',
+            bounded({'ok':False,'reason':'no-report'},2048))
+        raise AgentError('tool_surface_unavailable',
+            'Managed Pi never reported its built-in tool surface; check that the shipped extension loads (see the agent stderr log)')
+    rt.store.event(aid,None,generation,'tool_surface',bounded(report,2048))
+    if not report['ok']:
+        raise AgentError('tool_surface_unapplied',
+            f"Managed Pi did not apply the profile's built-in tool surface (applied={report.get('builtins','')} expected={report.get('expected','')})")
+
 async def boot_worker(rt, a):
     """Start the guard/Pi child for one agent generation, hand it the private
     bootstrap payload, and only report success after Pi confirms the managed
     session and the bridge reports readiness for this exact generation."""
-    from .binding import child_env, inheritance_plan, merge_bridge_tool
+    from .binding import child_env, inheritance_plan
 
     aid=a['id']
     if len([w for w in rt.workers.values() if not w.closed]) >= rt.config['max_resident_agents']:
@@ -137,8 +251,6 @@ async def boot_worker(rt, a):
     # the persisted launch spec and argv stay untouched.
     plan=inheritance_plan(rt,a,spec,generation)
     argv=[*argv,*plan['argv']]
-    if plan['bridge']:
-        argv=merge_bridge_tool(argv)  # never a second --tools flag
     payload={**spec,'argv':argv,'generation':generation}
     atomic_json(directory/'launch.json',payload)
     if plan['diagnostics']:
@@ -156,6 +268,10 @@ async def boot_worker(rt, a):
         rt.store.agent_update(aid,state='starting',generation=generation,cleanup='pending')
         guard=Path(__file__).with_name('worker_guard.py')
         guard_env=child_env(rt,a['scope'],spec)
+        if spec.get('surface'):
+            # Consumed and deleted by extensions/managed-surface.ts in the child;
+            # an empty value means "no built-in tools at all".
+            guard_env['PI_AGENTS_CHILD_BUILTINS']=','.join(spec.get('builtins',[]))
         pass_fds=()
         if bootstrap_r is not None:
             guard_env['PI_AGENTS_BOOTSTRAP_FD']=str(bootstrap_r)
@@ -189,6 +305,8 @@ async def boot_worker(rt, a):
                 raise AgentError('session_mismatch','Pi did not select the managed session path')
             if state.get('isStreaming'):
                 raise AgentError('unexpected_activity','Pi started a model turn without an explicit task')
+            if spec.get('surface'):
+                await verify_surface(rt,w)
             if plan['payload'] is not None:
                 # get_state success does not prove the bridge loaded; require its
                 # structured receipt for this exact generation. Ownership transfers
@@ -196,6 +314,8 @@ async def boot_worker(rt, a):
                 # failure cleanup below must not close it again.
                 fd, receipt_r = receipt_r, None
                 await read_receipt(rt,fd,aid,generation,min(rt.config['startup_timeout_seconds'],20))
+            if plan['skills']:
+                await resolve_skills(rt,w,plan)
             # Pin the model Pi actually selected so a later global default
             # change does not silently alter a recovered agent.
             resolved_model=state.get('model')
@@ -214,14 +334,10 @@ async def boot_worker(rt, a):
             await terminate(rt,w)
             raise
     finally:
-        if bootstrap_r is not None:
-            with contextlib.suppress(OSError): os.close(bootstrap_r)
-        if not handed_off and bootstrap_w is not None:
-            with contextlib.suppress(OSError): os.close(bootstrap_w)
-        if receipt_r is not None:
-            with contextlib.suppress(OSError): os.close(receipt_r)
-        if receipt_w is not None:
-            with contextlib.suppress(OSError): os.close(receipt_w)
+        close_quietly(bootstrap_r)
+        if not handed_off: close_quietly(bootstrap_w)
+        close_quietly(receipt_r)
+        close_quietly(receipt_w)
 
 async def write_bootstrap(rt, fd, agent_id, generation, data):
     """Write the payload from a worker thread. The thread owns the fd and closes
@@ -235,8 +351,7 @@ async def write_bootstrap(rt, fd, agent_id, generation, data):
         except OSError:
             return 'broken'
         finally:
-            with contextlib.suppress(OSError):
-                os.close(fd)
+            close_quietly(fd)
     try:
         status = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, _write_and_close), 30)
         if status == 'broken':  # store writes stay on the event-loop thread (sqlite is single-thread bound)

@@ -117,6 +117,6 @@ class RuntimeModuleBoundaries(unittest.TestCase):
         # worker.boot_worker imports binding lazily so binding can stay importable
         # without a Runtime instance (and no module-level cycle appears).
         src=(ROOT/'subagent_pi/worker.py').read_text()
-        self.assertIn('from .binding import child_env, inheritance_plan, merge_bridge_tool',src)
+        self.assertIn('from .binding import child_env, inheritance_plan',src)
 
 if __name__=='__main__': unittest.main()

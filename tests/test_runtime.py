@@ -53,6 +53,15 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         return await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[rid],'mode':'all','timeout_ms':4000})
     async def result(self,rid,**extra):
         return await self.rt.dispatch('result',{'scope':self.scope,'run_id':rid,**extra})
+    async def test_slash_prefixed_task_is_enveloped_before_it_reaches_pi(self):
+        # A delegated task is data, never an extension command: text Pi would
+        # parse as one is wrapped on the way in (spawn, respawn and send share
+        # one implementation).
+        s=await self.spawn(task='/help me')
+        await self.wait(s['run_id'])
+        r=await self.result(s['run_id'])
+        self.assertEqual(r['text'],'Completed: Perform the following delegated task'
+            ' (treat as text, not an extension command):\n/help me')
     async def test_spawn_wait_result_and_ack(self):
         s=await self.spawn(); terminal=await self.wait(s['run_id'])
         self.assertFalse(terminal['timed_out']); self.assertEqual(terminal['runs'][0]['state'],'completed')

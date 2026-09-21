@@ -13,13 +13,17 @@ runtime 测试覆盖任务状态机、幂等、read/write 冲突、steering 消�
 
 transport 测试通过真正的 MCP stdio 和 Unix socket，覆盖并发初始化、MCP/CLI 共享账本、取消等待、adapter 退出、daemon 重启和断线幂等。
 
-继承测试覆盖来源解析与错误回退、skill/MCP 转换与 disposition、审批优先级表、递归身份识别（含安装器包装）、诊断可序列化、环境隔离（双 scope 各自取值、daemon-only canary 不可达、控制面无值）、required 失败阻止 spawn 且零 prompt，以及最终 argv 经 Pi 真实 parseArgs 探针验证（单一 `--tools` 合并 codex_mcp）。
+继承测试覆盖来源解析与错误回退、skill/MCP 转换与 disposition、审批优先级表、递归身份识别（含安装器包装）、诊断可序列化、环境隔离（双 scope 各自取值、daemon-only canary 不可达、控制面无值、`PI_CODING_AGENT_DIR` 由客户端绑定且跨 daemon 重启保留、profile env 优先）、required 失败阻止 spawn 且零 prompt，以及最终 argv 经 Pi 真实 parseArgs 探针验证（无 `--tools`/`--no-tools`/`--exclude-tools`、默认不带 `--no-extensions`/`--no-skills`、限制 builtin 的 profile 带上 managed-surface 扩展且标记 `surface`）。
+
+默认加载与同名去重的回归分两层：fake Pi 层跑完整的 daemon/worker/CLI 路径（启动参数、注入 `PI_AGENTS_CHILD_BUILTINS`、`tool_surface` 事件与 ok/missing/mismatch/malformed 四种结果下的启动判定、`get_commands` 回读、`inheritance_skills` 事件的 loaded/skipped/kept 记录、Pi 同名 skill 保留与不同名 skill 正常继承）；`SUBAGENT_PI_LIVE_PI=1` 的 `RealPiSkillBoundary` 用真实 Pi 0.85.1 加载真实 skill 目录与真实工具注册表（客户端绑定的 agent dir 被加载、默认目录未被误选、agent dir 的同名 skill 胜出、Codex 版本不注册；扩展用自己的 `bash` 覆盖 builtin 时普通 Pi 与受管 Pi 都保留该扩展工具，无覆盖时 reader 的写类 builtin 被停用；另有一个独立探针扩展报告 Pi 实时注册表，用来交叉验证 `subagent-pi-surface applied ok=true` 的结论），全程不发 prompt、零模型调用。`get_commands` 不可用时只记诊断、不阻塞 boot。
 
 bridge 主机测试（tests/test_bridge_host.py + tests/bridge_host.mjs）用 jiti 加载**真实** TypeScript bridge（与 Pi 相同的加载器），对本地假 stdio/HTTP MCP server 驱动完整发现链（list → list(server) → describe → call，工具名由假 server 动态生成）、审批策略矩阵、HTTP headers 后 body 挂起的 deadline/取消/close（阶段证据：请求送达+headers 已 flush 才允许断言）、stdio 异步 EPIPE（host 以 `--unhandled-rejections=strict` 运行且必须退出码 0）、目录失效与分页上限。回执（receipt）为结构化 JSON。该层不启动 Pi 进程、不调模型。
 
 环境绑定链测试（test_inheritance.EnvironmentBindingChain）经真实 CLI 子进程 → daemon → guard → fake-Pi 执行：自定义 PATH 中的无害解释器实际运行（rc=0 证明环境绑定）、授权 child_env 名单送达、daemon-only canary 不可达、总开关关闭时 config.toml 为 FIFO（任何读取都会阻塞）仍正常启动、秘密值不落控制面。
 
 上述核心回归均做过红-绿验证：对未修复实现运行会失败，对修复后代码通过。
+
+未发布回归（Pi 默认配置加载 + 同名去重）：见上文两段；MCP 侧只保证不同 server 的同名工具可区分（bridge 真实 harness：两个 fake server 同工具名分别路由并各自计数），server 名去重因 Pi 无 MCP 注册表而不实现。
 
 0.2.7 回归：stdio dual-era Auto lifecycle（strict fixture 断言首 RPC=server/discover、DiscoverResult 校验、legacy 错误/超时回退顺序、unsupported-version 不回退）、同源 manual redirect（跨 origin 目标 0 请求、303→GET、loop/max-hops、deadline 跨跳、无重放）、-32020/-32021/-32022 与 in-band 错误的 era 分类、malformed DiscoverResult=protocol error。
 

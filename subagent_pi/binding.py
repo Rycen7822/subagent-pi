@@ -5,8 +5,9 @@ import json
 from pathlib import Path
 
 from .common import AgentError, BASE_ENV_KEYS, dumps, text
-from .inheritance import (CODEX_MCP_BASELINE, Diagnostic, collect_skills, parse_mcp_servers,
-    policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
+from .inheritance import (CODEX_MCP_BASELINE, SERVER_POLICY_KEYS, SERVER_RESOLVED_KEYS, Diagnostic,
+    collect_skills, parse_mcp_servers, policy_filter, read_codex_config, referenced_env_names,
+    resolve_codex_home, resolve_environment)
 
 def child_env(rt, sid, spec):
     """Base environment for the guard/Pi child, built from the scope's bound
@@ -94,7 +95,7 @@ def inheritance_plan(rt, a, spec, generation):
     The persisted launch argv is never touched; secrets resolve into the pipe
     payload only, diagnostics carry names, never values."""
     inh = rt.config['inheritance']
-    empty = {'argv': [], 'payload': None, 'diagnostics': [], 'bridge': False, 'servers': []}
+    empty = {'argv': [], 'payload': None, 'diagnostics': [], 'bridge': False, 'servers': [], 'skills': []}
     if not inh.get('enabled'):
         return {**empty, 'reason': 'inheritance disabled by config'}
     scope = rt.store.scope(a['scope'])
@@ -134,7 +135,8 @@ def inheritance_plan(rt, a, spec, generation):
     usable = [s for s in servers if s.get('disposition') == 'ok']
     diagnostics = [d.as_dict() for d in skill_diag + mcp_diag]
     argv = []
-    for path in (p for p in skill_paths if p not in existing_skills):
+    inherited_skills = [p for p in skill_paths if p not in existing_skills]
+    for path in inherited_skills:
         argv += ['--skill', path]
     bridge_path = Path(__file__).resolve().parent.parent / 'extensions' / 'codex-mcp-bridge.ts'
     load_bridge = bool(inh.get('mcp', True) and usable and bridge_path.exists())
@@ -142,39 +144,14 @@ def inheritance_plan(rt, a, spec, generation):
     payload = None
     if load_bridge:
         argv += ['--extension', str(bridge_path)]
-        internal = ('env_var_names', 'env_header_names', 'static_env', 'static_headers',
-                    'disposition', 'reasons')
+        internal = (*SERVER_RESOLVED_KEYS, *SERVER_POLICY_KEYS)
         payload = {'v': 1,
                    'agent': {'id': a['id'], 'access': spec['access'], 'generation': generation},
                    'source': source,
                    'mcp': {'servers': [{k: v for k, v in s.items() if k not in internal} for s in usable]}}
     return {'argv': argv, 'payload': payload, 'diagnostics': diagnostics,
-            'bridge': load_bridge, 'servers': [s['name'] for s in usable], 'source': source}
-
-def merge_bridge_tool(argv, tool='codex_mcp'):
-    """Merge the bridge tool into Pi's single tool allowlist over the FULL argv.
-    Pi's CLI parser assigns on every --tools occurrence (last wins), so appending
-    a second flag would wipe the builtin reader/writer allowlist, and merging only
-    the first flag would let a later one drop the bridge tool again. Every
-    occurrence is therefore merged into one flag. With no tool flag at all, argv
-    is left untouched: Pi then allows extension tools by default, and a bare
-    --tools would strip builtins.
-    """
-    flags = [k for k, x in enumerate(argv) if x in ('--tools', '-t')]
-    if flags:
-        names = []
-        consumed = set(flags)
-        for k in flags:
-            if k + 1 >= len(argv): continue
-            consumed.add(k + 1)
-            for name in argv[k + 1].split(','):
-                if name and name not in names: names.append(name)
-        if tool not in names: names.append(tool)
-        rest = [x for k, x in enumerate(argv) if k not in consumed]
-        return [*rest, '--tools', ','.join(names)]
-    if '--no-tools' in argv:
-        return [x for x in argv if x != '--no-tools'] + ['--tools', tool]
-    return argv
+            'bridge': load_bridge, 'servers': [s['name'] for s in usable], 'source': source,
+            'skills': inherited_skills}
 
 def doctor(rt):
     inh=rt.config['inheritance']
