@@ -87,9 +87,14 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         receipt=self.rt.store.one('SELECT * FROM receipts WHERE id=?',(r['receipt_id'],))
         self.assertEqual(receipt['state'],'consumed')
     async def test_unconsumed_steering_is_not_success(self):
-        s=await self.spawn('NO_CONSUME')
+        # The turn must still be running when the steer arrives, otherwise the
+        # steer is rejected (agent_idle) or lands after the fake server dropped
+        # its queue and the run can never finish; a 1s window keeps the steer
+        # inside the turn and the wait outcome is asserted rather than implied.
+        s=await self.spawn('delay=1.0|NO_CONSUME')
         r=await self.mutation('send',s['agent_id'],mode='steer',message='Too late')
-        await self.wait(s['run_id'])
+        terminal=await self.wait(s['run_id'])
+        self.assertFalse(terminal['timed_out'])
         state=self.rt.store.one('SELECT state FROM receipts WHERE id=?',(r['receipt_id'],))['state']
         self.assertEqual(state,'not_consumed')
     async def test_followup_is_separate_durable_run(self):
