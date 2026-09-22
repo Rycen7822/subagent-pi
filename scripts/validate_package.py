@@ -24,6 +24,8 @@ for filename in ('mcp.json','.mcp.json'):
     assert list(servers)==['subagent-pi']
     assert servers['subagent-pi']['command']
     assert servers['subagent-pi']['args'][-1]=='mcp'
+    if filename=='mcp.json':
+        assert servers['subagent-pi']['command']=='./bin/subagent-pi'
 assert len((root/'skills/pi-subagents/SKILL.md').read_text().splitlines())<=35
 assert len({t['name'] for t in TOOLS})==len(TOOLS)
 for t in TOOLS:

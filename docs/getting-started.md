@@ -23,7 +23,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 默认安装目录：`~/.local/share/subagent-pi-marketplace/plugins/subagent-pi`。本地目录清单：`~/.local/share/subagent-pi-marketplace/.agents/plugins/marketplace.json`。CLI：`~/.local/bin/subagent-pi`。
 
-脚本生成 portable `plugin.json` / `mcp.json`，同时提供旧式 `.codex-plugin/plugin.json` / `.mcp.json` 回退。安装后的两份 MCP 配置指向相同的**绝对 Python 与程序路径**；不是让模型推断插件路径，也不依赖 MCP 启动 cwd。
+脚本生成 portable `plugin.json` / `mcp.json`，同时提供旧式 `.codex-plugin/plugin.json` / `.mcp.json` 回退。Portable 配置使用宿主按插件根目录解析的 `./bin/subagent-pi`，安装时在启动脚本中固定 Python 解释器；旧式配置使用绝对路径。两者均不依赖 MCP 启动 cwd。
 
 在 Codex 输入 `/plugins`，安装 Subagent Pi Local 中的 Subagent Pi，再开启新会话。`--register` 不等于已经通过 Codex UI 安装插件。旧版不支持 portable manifest 时依赖兼容清单；宿主能力仍需本机验证。
 
@@ -34,7 +34,7 @@ python3 scripts/install.py --pi /absolute/path/to/pi
 codex plugin marketplace add "$HOME/.local/share/subagent-pi-marketplace"
 ```
 
-不要只把源目录移动到某个地方，就假定 PATH 中已经有 `subagent-pi`。分发源清单使用 `subagent-pi mcp`；安装脚本会生成不依赖 PATH 的实际入口。
+不要只把源目录移动到某个地方，就假定 PATH 中已经有 `subagent-pi`。安装脚本会创建 CLI 链接，并为插件固定实际启动入口。
 
 ## 首次使用与 scope
 

@@ -36,7 +36,7 @@ class PackageTests(unittest.TestCase):
     def test_manifest_structure_and_no_hooks(self):
         result=subprocess.run([sys.executable,str(ROOT/'scripts/validate_package.py')],capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
-    def test_real_local_install_and_absolute_mcp_paths(self):
+    def test_real_local_install_and_portable_mcp_launcher(self):
         with tempfile.TemporaryDirectory(prefix='subagent-pi-install-') as tmp:
             base=Path(tmp); dest=base/'marketplace'; bins=base/'bin'; home=base/'state'
             cmd=[sys.executable,str(ROOT/'scripts/install.py'),'--dest',str(dest),'--bin-dir',str(bins),'--state-home',str(home)]
@@ -45,8 +45,13 @@ class PackageTests(unittest.TestCase):
             plugin=dest/'plugins/subagent-pi'
             config=json.loads((plugin/'mcp.json').read_text())
             server=config['mcpServers']['subagent-pi']
-            self.assertTrue(Path(server['command']).is_absolute())
-            self.assertEqual(server['args'][0],str(plugin/'bin/subagent-pi'))
+            self.assertEqual(server['command'],'./bin/subagent-pi')
+            self.assertEqual(server['args'],['mcp'])
+            launcher=plugin/server['command']
+            self.assertEqual(launcher.read_text().splitlines()[0],'#!'+str(Path(sys.executable).resolve()))
+            legacy=json.loads((plugin/'.mcp.json').read_text())['mcpServers']['subagent-pi']
+            self.assertEqual(legacy['command'],str(Path(sys.executable).resolve()))
+            self.assertEqual(legacy['args'],[str(plugin/'bin/subagent-pi'),'mcp'])
             self.assertEqual(server['env']['PI_AGENTS_HOME'],str(home))
             self.assertFalse((plugin/'hooks').exists())
             from scripts.ship_manifest import ship_files
@@ -55,7 +60,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(installed,shipped)
             self.assertFalse((plugin/'node_modules').exists())
             self.assertFalse((plugin/'.work').exists())
-            version=subprocess.run([sys.executable,str(bins/'subagent-pi'),'--version'],capture_output=True,text=True)
+            version=subprocess.run([str(launcher),'--version'],cwd=base,capture_output=True,text=True)
             self.assertEqual(version.returncode,0,version.stderr)
             self.assertEqual(version.stdout.strip(),__version__)
             r2=subprocess.run(cmd,capture_output=True,text=True,timeout=20)

@@ -3,7 +3,7 @@
   "mcpServers": {
     "subagent-pi": {
       "type": "stdio",
-      "command": "subagent-pi",
+      "command": "./bin/subagent-pi",
       "args": ["mcp"]
     }
   }

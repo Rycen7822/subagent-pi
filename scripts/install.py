@@ -43,9 +43,11 @@ def install(args):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
         entry=str(plugin/'bin/subagent-pi')
-        # Resolve paths at install time. Do not depend on undocumented plugin-root substitutions or host cwd.
+        # Portable commands must stay inside the plugin; pin Python in the launcher.
+        launcher=stage/'payload/bin/subagent-pi'
+        launcher.write_text('#!'+str(Path(sys.executable).resolve())+'\n'+launcher.read_text().split('\n',1)[1])
         server={'command':str(Path(sys.executable).resolve()),'args':[entry,'mcp'],'env':{'PI_AGENTS_HOME':str(home)}}
-        portable={'$schema':'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json','mcpServers':{'subagent-pi':{'type':'stdio',**server}}}
+        portable={'$schema':'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json','mcpServers':{'subagent-pi':{'type':'stdio','command':'./bin/subagent-pi','args':['mcp'],'env':server['env']}}}
         atomic_json(stage/'payload/mcp.json',portable)
         atomic_json(stage/'payload/.mcp.json',{'mcpServers':{'subagent-pi':server}})
         backup=destination/'plugins/subagent-pi.previous'
