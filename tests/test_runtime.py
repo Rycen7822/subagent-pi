@@ -50,7 +50,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def mutation(self,op,aid,**extra):
         return await self.rt.dispatch(op,{'scope':self.scope,'agent_id':aid,'request_id':self.key(),**extra})
     async def wait(self,rid):
-        return await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[rid],'mode':'all','timeout_ms':4000})
+        return await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[rid],'mode':'all','timeout_seconds':4})
     async def result(self,rid,**extra):
         return await self.rt.dispatch('result',{'scope':self.scope,'run_id':rid,**extra})
     async def until(self,probe,timeout=8.0):
@@ -246,8 +246,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.result(s['run_id']))['run']['state'],'interrupted')
         self.assertEqual((await self.result(f['run_id']))['text'],'Completed: replacement')
     async def test_wait_timeout_never_cancels(self):
-        s=await self.spawn('delay=0.5|work')
-        result=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[s['run_id']],'timeout_ms':10})
+        s=await self.spawn('delay=2|work')
+        start=asyncio.get_running_loop().time()
+        result=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[s['run_id']],'timeout_seconds':1})
+        self.assertGreaterEqual(asyncio.get_running_loop().time()-start,.9)
         self.assertTrue(result['timed_out']); self.assertEqual(result['runs'][0]['state'],'running')
         await self.wait(s['run_id'])
     async def test_cancel_wait_never_cancels(self):
@@ -259,9 +261,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_wait_any_all(self):
         a=await self.spawn('delay=0.05|A'); b=await self.spawn('delay=0.4|B')
         ids=[a['run_id'],b['run_id']]
-        first=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':ids,'mode':'any','timeout_ms':3000})
+        first=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':ids,'mode':'any','timeout_seconds':3})
         self.assertTrue(any(r['state']=='completed' for r in first['runs']))
-        last=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':ids,'mode':'all','timeout_ms':3000})
+        last=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':ids,'mode':'all','timeout_seconds':3})
         self.assertTrue(all(r['state']=='completed' for r in last['runs']))
     async def test_foreign_scope_is_rejected(self):
         s=await self.spawn()
@@ -299,7 +301,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             agent=await self.spawn('BIG'); agents.append(agent)
             await self.wait(agent['run_id'])
             await self.mutation('close',agent['agent_id'])
-        page=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[a['run_id'] for a in agents],'mode':'all','timeout_ms':0})
+        page=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[a['run_id'] for a in agents],'mode':'all','timeout_seconds':0})
         self.assertLessEqual(sum(len(r['result'].get('text','').encode()) for r in page['runs']),8192)
         for run in page['runs']:
             preview=run['result']; text=preview.get('text',''); more=preview['has_more']; offset=preview['next_offset']

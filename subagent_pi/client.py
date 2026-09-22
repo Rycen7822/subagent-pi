@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from .common import MAX_FRAME, DEFAULT_WAIT_MS, AgentError, dumps, private_dir, read_frame, socket_path
+from .common import MAX_FRAME, DEFAULT_WAIT_SECONDS, AgentError, dumps, private_dir, read_frame, socket_path
 from . import PROTOCOL_VERSION
 
 BASE_TIMEOUT = 45
@@ -31,14 +31,14 @@ def boot_budget(home):
 
 def call_timeout(op, params, home=None):
     """Client-side wait for one IPC call, derived from the daemon's own budget.
-    For boot ops the run deadline (timeout_ms) is irrelevant: the call returns as
+    For boot ops the run deadline (timeout_seconds) is irrelevant: the call returns as
     soon as the worker is up, regardless of how long the task may then run."""
     if op in BOOT_OPS:
         return max(BASE_TIMEOUT, boot_budget(home))
-    ms=params.get('timeout_ms',DEFAULT_WAIT_MS if op=='wait' else 0)
-    return max(BASE_TIMEOUT, (ms or 0)/1000 + 10)
+    seconds=params.get('timeout_seconds',DEFAULT_WAIT_SECONDS) if op=='wait' else 0
+    return max(BASE_TIMEOUT, (seconds or 0) + 10)
 
-async def request(home,op,params,timeout=45,autostart=True,source=None):
+async def request(home,op,params,timeout=45,autostart=True,source=None,on_result=None):
     sock=socket_path(home)
     async def connect(): return await asyncio.open_unix_connection(str(sock),limit=MAX_FRAME)
     try: reader,writer=await connect()
@@ -61,11 +61,19 @@ async def request(home,op,params,timeout=45,autostart=True,source=None):
                 await asyncio.sleep(.05)
     try:
         frame={'v':PROTOCOL_VERSION,'op':op,'params':params}
+        if op=='wait' and on_result is not None: frame['wait_delivery']=True
         if source is not None: frame['source']=source
         writer.write((dumps(frame)+'\n').encode()); await writer.drain()
         response=await asyncio.wait_for(read_frame(reader),timeout)
         if not response: raise AgentError('connection_lost','No response; mutation may have committed. Retry the same request_id.')
         if not response.get('ok'): raise AgentError(**response.get('error',{'code':'protocol_error','message':'Invalid reply'}))
+        if on_result is not None:
+            await on_result(response['result'])
+            if op=='wait':
+                # Confirm only after the adapter wrote the result to its caller.
+                # Failed confirmation must not emit a second MCP response.
+                with contextlib.suppress(OSError):
+                    writer.write(b'{"received":true}\n'); await writer.drain()
         return response['result']
     except asyncio.TimeoutError:
         raise AgentError('client_timeout','Client stopped waiting. Pi was NOT cancelled; query state or retry the SAME mutation request_id.')

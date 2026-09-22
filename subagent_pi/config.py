@@ -3,12 +3,12 @@ import os
 from pathlib import Path
 import shutil
 import tomllib
-from .common import AgentError, MAX_WAIT_MS, text
+from .common import AgentError, MAX_WAIT_SECONDS, text
 
 DEFAULT = {
     'max_resident_agents': 4, 'max_agents_per_scope': 16,
     'rpc_timeout_seconds': 20, 'startup_timeout_seconds': 30,
-    'default_run_timeout_seconds': 1800, 'max_wait_seconds': MAX_WAIT_MS // 1000,
+    'default_run_timeout_seconds': 1800, 'max_wait_seconds': MAX_WAIT_SECONDS,
     'event_max_count_per_agent': 20000,
     'inheritance': {'enabled': True, 'skills': True, 'mcp': True, 'codex_home': None, 'child_env': [], 'mcp_protocol_mode': 'auto'},
     'profiles': {

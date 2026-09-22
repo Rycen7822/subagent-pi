@@ -19,7 +19,7 @@ async def run(args):
             a=await request(home,'spawn',{'scope':scope,'cwd':temp,'access':'read','task':'Read marker.txt and reply with its exact contents. Do not access other files.',
                             'request_id':'smoke-spawn',**({'model':args.model} if args.model else {})})
             print('Spawned:',a)
-            terminal=await request(home,'wait',{'scope':scope,'run_ids':[a['run_id']],'timeout_ms':120000},timeout=130)
+            terminal=await request(home,'wait',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':120},timeout=130)
             print('Wait:',terminal)
             if terminal['timed_out']: raise RuntimeError('Smoke wait timed out; inspect the preserved run')
             result=await request(home,'result',{'scope':scope,'run_id':a['run_id']})

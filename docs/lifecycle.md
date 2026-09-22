@@ -2,7 +2,7 @@
 
 ## 身份与状态
 
-scope 是父任务集合；agent_id 是长期身份；run_id 是一项委托任务；generation 是一次受管子进程；request_id 是控制操作的幂等身份。MCP 与 CLI 使用同一份账本。
+scope 是父任务集合；agent_id 是长期身份；run_id 是一项委托任务；generation 是一次受管子进程；request_id 是控制操作的幂等身份。MCP 与 CLI 使用同一份账本。 创建时用 name 标注角色或任务（如 git-stats-fix），同一 scope 内唯一；省略时使用 agent_id。创建、任务摘要、等待、问题、结果和通知均携带该名称；名称不用于寻址，后续操作仍使用 ID。
 
 agent 状态包括 starting、running、needs_input、idle、stopping、dormant、closed、orphaned、crashed。run 状态包括 queued、starting、running、needs_input、completed、failed、interrupted、crashed、cancelled、timed_out。completed 表示执行正常结束，不证明答案正确或可以发布。
 
@@ -26,11 +26,23 @@ daemon 结算时校验 generation、run_id 和 stopping，终态幂等。迟到/
 
 默认最多 4 个 resident agent，每个 scope 最多 16 个历史 agent。writer 独占同一或嵌套 cwd，跨 scope 检查；parent Codex 不受此锁约束。
 
+Pi 不会获得父 Codex 的对话历史。把任务所需的上下文显式写入 task；继承 skills/MCP 不等于继承对话或授权。按任务需要简短说明以下内容即可，不要求固定格式，也不自动注入提示：
+
+```text
+目标：修复底栏 Git 增删统计。
+已知事实：连续编辑会累计重复计数；入口 src/git-changes.ts。重命名处理是否有问题仍需核实。
+范围与授权：可修改该模块、相关测试和必要文档；保留其他工作区改动，不提交、推送或安装。
+验收：统计当前相对 HEAD 的差异，覆盖撤销和部分提交；先跑相关测试。
+交付：说明根因、修改和实际验证结果；遇到超出授权范围的决定时向父代理提问。
+```
+
+复用 agent 时，它保留自己的 Pi 历史；后续 message 只需补充新任务、变化的事实和边界，不能假定它看到了父会话的新消息。只需补充当前任务时用 steer；新任务用 follow_up 或空闲时的 send。
+
 ## Steering 与 follow-up
 
 `mode="steer"` 仅用于活动任务：输入加入插件队列，等当前 SDK 调用结束后作为同一 run 的续跑执行。它不再插入正在进行的 Pi 工具循环。不同扩展输入和外部 steer 统一按接受顺序消费；不模拟 Pi 交互式 steer 的抢先优先级。普通 Pi 的行为不变。
 
-queued 仅表示接受。consumed 来自 user message_end 的文本 FIFO 匹配，不证明模型理解或服从。未消费输入在任务终态标为 not_consumed；响应不确定可为 unknown，禁止自动重发。idle steer 返回 agent_idle，不隐式启动或恢复。
+steer 回执的 execution=after_current_sdk_call 表示调度方式，不是已经执行，也不保证失败或中断后仍会消费。delivery=queued 仅表示接受。consumed 来自 user message_end 的文本 FIFO 匹配，不证明模型理解或服从。未消费输入在任务终态标为 not_consumed；响应不确定可为 unknown，禁止自动重发。idle steer 返回 agent_idle，不隐式启动或恢复。需要立即停止时应显式 close；需要替换任务时用 interrupt=true，中断不能撤销已有副作用。
 
 `mode="follow_up"` 由 daemon 持久排队，每项有独立 run_id，前一个任务及其续跑全部结束后才开始。`mode="send"` 只用于 idle agent。
 
@@ -50,7 +62,7 @@ respawn 要求旧 writer 已消失且会话存在；agent_id 不变、generation
 
 ## 父代理关注与回答
 
-`pi_wait_agent` 用 daemon 的事件条件等待，不轮询进度。默认最多等 10 分钟，单次最多 1 小时；timeout_ms 是上限，不是固定延迟，0 只检查当前状态。默认 any 在任一任务完成时立即返回；all 等所有正常完成，但失败、崩溃、中断、取消、运行超时或需要输入仍立即返回。取消等待只断开这次读取，不停止子代理。显式设置更小的 max_wait_seconds 会限制默认值和允许的上限；等待超时与任务自己的 deadline 无关。
+`pi_wait_agent` 用 daemon 的事件条件等待，不轮询进度。默认最多等 10 分钟，单次最多 1 小时；timeout_seconds 以秒为单位（默认 600、最大 3600），是上限，不是固定延迟，0 只检查当前状态。默认 any 在任一任务完成时立即返回；all 等所有正常完成，但失败、崩溃、中断、取消、运行超时或需要输入仍立即返回。取消等待只断开这次读取，不停止子代理。显式设置更小的 max_wait_seconds 会限制默认值和允许的上限；等待超时与任务自己的 deadline 无关。
 
 `questions` 带 agent_id、run_id、问题 id、正文和选择项，供 `pi_answer_agent` 使用；模型可调用仅在受管子进程注册的 `ask_parent`，暂停工具执行直到显式回答。回答不会自动批准其他请求。标准安装使用 Codex 原生清单，为本插件设置 3630 秒 MCP 超时，覆盖一小时等待及传输余量；其他 MCP 客户端或手动使用通用清单时，仍需保证外层工具超时足够长。
 
@@ -60,6 +72,10 @@ wait 的每个终态结果最多预读 2 KiB，整页文本共用 8 KiB 预算�
 
 完成、失败、崩溃、取消、中断、超时或问题产生持久通知；插件调用 `codex queue --thread … --message …`，由原 Codex 进程读取队列。父会话已完成回合但仍加载时会自动开启后续回合；忙碌时等到空闲，跨进程检查通常约 10 秒。不会强制打断正在工作的父代理，也不会复活已经关闭或明确中断的父会话。通知只带任务定位和事件类型，明确标为自动子代理事件，不构成用户授权。
 
-投递状态区分 pending/sending/queued/failed/unknown/superseded：queued 只表示收到入队回执，不保证父代理已处理；提交超时、异常退出或发送中的 daemon 重启记为 unknown，绝不盲重发（CLI 每次调用都会生成新消息 ID）。尚未投递的问题若已回答、结果若已 ack，则取消该待发提醒；已经入队的提醒可能与主动 wait 重叠，父代理应按 run ID/hash 检查最新状态。daemon 停止时未发出的通知会保留到下次启动。无可信父身份时不猜测目的会话，仍以 wait/list 收取结果。
+同一父会话对指定 run 的主动 wait 优先：等待期间暂缓对应通知，MCP/CLI 写出响应后通过 IPC 回执把该响应中的事件标为 observed，不再排队唤醒。取消、断连、写出失败或 10 秒内未收到交付回执时恢复通知资格。observed 只证明适配器已写出响应，不代表模型已处理，也不等于结果 ack；另一父会话的读取不能抑制原父会话通知。问题和终态分别记录，收到问题不会隐藏后续完成。正常使用始终等待明确的剩余 run_ids；未指定时仍返回未 ack 的任务，包括此前已读的终态。
+
+通知状态为 pending/sending/observed/queued/failed/unknown/superseded。queued 只是 Codex 入队回执；已发送或已入队的消息无法由插件撤回，主动 wait 开始前已排队的事件仍可能迟到，应忽略已处理事件。未发送的问题若已回答、结果若已 ack，则标为 superseded。独立父会话最多四路投递，每个父会话串行；待发问题优先，单次发送最多 30 秒。提交超时、异常退出或发送中的 daemon 重启记为 unknown，绝不盲重发。重启保留 observed 和未发通知，无可信父身份时仍以 wait/list 收取结果。
 
 此机制要求 Codex 支持 queue（实测 0.155.1），使用绑定时的本地 CODEX_HOME；远程会话不在本机消息存储中时不能据此承诺唤醒。未修改 Pi/Codex 宿主，也不模拟键盘或重启用户会话。
+
+等待接口不再接受 timeout_ms / --timeout-ms。IPC 协议升级为 v2；升级后需在旧任务清理完成时正常重启插件 daemon/MCP 连接，混用旧客户端或旧 daemon 会明确返回 version_mismatch，不自动停止用户进程。

@@ -77,9 +77,9 @@ profile 支持 `[profiles.NAME.env]` 的字符串环境覆盖。值在每次启�
 
 startup_timeout_seconds 仅控制初始 Pi handshake；rpc_timeout_seconds 控制控制命令回执；default_run_timeout_seconds 控制一项运行的总时限。
 
-wait 的 timeout_ms 只是调用等待，不停止任务。MCP 客户端还有自己的超时，长 wait 须由使用者调整宿主配置；插件不自动改 Codex 的工具超时或批准策略。
+wait 的 timeout_seconds 以秒计，只限制调用等待，不停止任务。标准 Codex 安装在本插件清单中设置 3630 秒工具超时；其他 MCP 客户端或手工安装需要自行保证外层超时足够长。插件不改全局配置或批准策略。
 
-客户端对 IPC 调用的等待按 daemon 自身预算推导：普通操作是 max(45s, timeout_ms+10s)；启动/回收类操作（spawn、respawn、close、interrupt）覆盖 daemon 的启动预算（由 startup_timeout_seconds 推导，默认约 90s），因为一次健康但缓慢的启动不应被报成失败。spawn 的 timeout_seconds 是**运行**时限，不影响该调用本身的等待。
+客户端对 IPC 调用的等待按 daemon 自身预算推导：wait 是 max(45s, timeout_seconds+10s)，其他普通操作为 45s；启动/回收类操作（spawn、respawn、close、interrupt）覆盖 daemon 的启动预算（由 startup_timeout_seconds 推导，默认约 90s），因为一次健康但缓慢的启动不应被报成失败。spawn 的 timeout_seconds 是**运行**时限，不影响该调用本身的等待。
 
 模型 HTTP 请求时限、代理、认证和模型流解析交由 Pi。调整 Pi 自身的 httpIdleTimeoutMs 时，不要把它与本插件的 wait 或总运行时限混淆。没有输出不自动代表死进程，插件不以“多久没有 token”作为杀进程条件。
 

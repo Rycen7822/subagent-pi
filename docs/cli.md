@@ -40,13 +40,15 @@ subagent-pi follow-up AGENT_ID --scope ID (--message TEXT | --message-file FILE_
   [--request-id KEY]
 ```
 
+task 应包含目标、必要上下文、授权范围和验收要求；Pi 不复制父 Codex 对话。steer 等当前 SDK 调用结束后在同一 run 续跑，回执 execution=after_current_sdk_call 不代表消费；follow-up 创建独立 run；send 用于空闲 agent。要立即停止工作用 close，替换工作用 send --interrupt。具体委派示例见 [lifecycle.md](lifecycle.md#spawn)。
+
 ## Observe / results
 
 ```text
 subagent-pi list --scope ID [--limit N]
 subagent-pi inspect AGENT_ID --scope ID [--after SEQ] [--limit N]
   [--detail tools|full] [--max-bytes N]
-subagent-pi wait [RUN_IDS...] --scope ID [--mode any|all] [--timeout-ms N]
+subagent-pi wait [RUN_IDS...] --scope ID [--mode any|all] [--timeout-seconds N]
 subagent-pi result RUN_ID --scope ID [--offset N] [--max-bytes N]
 subagent-pi ack RUN_ID --scope ID --sha256 HASH [--request-id KEY]
 ```

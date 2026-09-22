@@ -2,14 +2,14 @@
 
 ## Unreleased
 
-- 事件等待默认 10 分钟、最长 1 小时；任务完成/提问/异常即时返回，取消等待不取消任务。统一 CLI/MCP/IPC 预算，Codex 安装使用原生清单声明本插件的长调用超时，无需宿主补丁或全局配置修改。
-- 自动绑定 MCP 调用元数据中的父会话；完成/失败/停止/问题通过 codex queue 唤醒仍加载的空闲父会话。通知持久化去重，未知提交不重试，不强行打断或复活已停止的父会话。
+- wait 统一使用 timeout_seconds / --timeout-seconds（旧毫秒参数明确拒绝，IPC v2 需更新连接）；默认 10 分钟、最长 1 小时；任务完成/提问/异常即时返回，取消等待不取消任务。统一 CLI/MCP/IPC 预算，Codex 安装使用原生清单声明本插件的长调用超时，无需宿主补丁或全局配置修改。
+- 自动绑定 MCP 调用元数据中的父会话；完成/失败/停止/问题通过 codex queue 唤醒仍加载的空闲父会话。主动 wait 写出响应后抑制重复通知，断连/失败恢复提醒，交付与结果 ack 分离；最多四个父会话独立投递，未知提交不重试。已入队消息无法撤回，不强行打断或复活已停止的父会话。
 
-- MCP 连接复用 scope/cwd；wait 返回有界结果与问题，失败/停止优先返回；统一停止工具。新增受管 ask_parent 和按 Pi 实际模型校验的 thinking，保留精确 hash ack；父会话可通过 Codex 官方队列自动续跑。
+- MCP 连接复用 scope/cwd；角色名称贯穿创建、等待、问题、结果和通知，操作仍按稳定 ID 定位；wait 返回有界结果与问题，失败/停止优先返回；统一停止工具。新增受管 ask_parent 和按 Pi 实际模型校验的 thinking，保留精确 hash ack；父会话可通过 Codex 官方队列自动续跑。
 - 幂等摘要不再受 JSON 字段顺序影响，仍接受旧版本按原字段顺序重试的已存回执。
 - 修复启动期扩展本地命令被误拒绝，以及桌面通知等 stdout 输出破坏 JSON 协议帧的问题；保留无归属模型输入拒绝，不修改 Pi 宿主。
 - 改用插件拥有的 Pi SDK 子进程与串行任务队列，移除全部宿主补丁及能力修订协商。完成事件绑定 run_id，排空 SDK 调用和扩展续跑后才结算。
-- steer 改为同一任务内的有序续跑，保留完整 input/before_agent_start 路径；handled 主输入明确失败，后继任务继续。过期异步输入不能进入新任务。
+- steer 改为同一任务内的有序续跑，回执明确 after_current_sdk_call 并携带名称，保留完整 input/before_agent_start 路径；handled 主输入明确失败，后继任务继续。工具与技能明确委派上下文、授权边界和验收要求，不复制父对话；过期异步输入不能进入新任务。
 - interrupt 统一终止并核验受管进程组；显式 interrupt+新消息在验证清理后启动新 generation。不会修改或终止普通 Pi。
 - 默认加载 Pi 自身资源、Pi-first skills 与 builtin 来源隔离保持；SDK settings 写入限制在子进程内存，验证目标更新为原版 Pi 0.87.0。
 - 修复重复 dev-setup 的目录/符号链接清理；用 SDK 生命周期测试替换宿主补丁矩阵，精简生命周期和测试文档。
@@ -87,7 +87,7 @@ tightens its previous guarantee.
 
 - 自动绑定 MCP 调用元数据中的父会话；完成/失败/停止/问题通过 codex queue 唤醒仍加载的空闲父会话。通知持久化去重，未知提交不重试，不强行打断或复活已停止的父会话。
 
-- MCP 连接复用 scope/cwd；wait 返回有界结果与问题，失败/停止优先返回；统一停止工具。新增受管 ask_parent 和按 Pi 实际模型校验的 thinking，保留精确 hash ack；父会话可通过 Codex 官方队列自动续跑。
+- MCP 连接复用 scope/cwd；角色名称贯穿创建、等待、问题、结果和通知，操作仍按稳定 ID 定位；wait 返回有界结果与问题，失败/停止优先返回；统一停止工具。新增受管 ask_parent 和按 Pi 实际模型校验的 thinking，保留精确 hash ack；父会话可通过 Codex 官方队列自动续跑。
 - 幂等摘要不再受 JSON 字段顺序影响，仍接受旧版本按原字段顺序重试的已存回执。
 - GitHub Actions CI：python-core（3.11/3.14）与 integration（真实 Pi 0.85.1 + Node 22.19.0，bridge tests 真实执行 + ZIP/FILES.sha256 校验）；0 模型调用、0 secrets、`contents: read`。
 

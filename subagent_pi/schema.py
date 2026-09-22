@@ -1,5 +1,5 @@
 """One compact schema source shared by the MCP adapter and IPC validator."""
-from .common import AgentError, DEFAULT_WAIT_MS, MAX_WAIT_MS
+from .common import AgentError, DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS
 S={'type':'string'}
 ID={'type':'string','minLength':1,'maxLength':128}
 SCOPE={'scope':{**ID,'description':'Optional after pi_context binds this MCP connection; pass explicitly to address another scope.'}}
@@ -16,14 +16,14 @@ TOOLS=[
       {'cwd':{**S,'description':'Absolute current workspace directory, never the daemon directory.'},'scope':ID,'label':S,
        'inheritance':{'type':'boolean','description':'Explicitly enable or disable Codex skill/MCP inheritance for this scope.'},
        'codex_home':{**S,'description':'Explicit trusted Codex home directory; rebinds this scope as a management action.'}},['cwd']),
- tool('pi_spawn_agent','spawn','Start an asynchronous Pi agent. Returns an agent and run ID. No native Codex /agents integration.',
-      {**SCOPE,**REQ,'cwd':S,'task':S,'name':S,'profile':S,'model':S,'thinking':{**ID,'description':'Pi thinking level for the selected model. Omit to inherit Pi settings. Unsupported values return that model’s available levels.'},'access':{'type':'string','enum':['read','write'],'default':'write'},'timeout_seconds':{'type':'integer','minimum':1,'maximum':604800}},
+ tool('pi_spawn_agent','spawn','Start an independent Pi session and asynchronous task. Parent Codex conversation and sandbox are not inherited. Returns named agent/run IDs; no native Codex /agents integration.',
+      {**SCOPE,**REQ,'cwd':S,'task':{**S,'description':'Self-contained delegation: goal, relevant findings and file paths, authorized actions/edit boundaries, constraints, acceptance checks and expected report. Distinguish confirmed facts from hypotheses; do not assume Pi saw the parent conversation.'},'name':{**ID,'description':'Short role/task label, unique within this scope (e.g. git-stats-fix). Returned as name; use agent_id/run_id for operations. Omit to use agent_id as the name.'},'profile':S,'model':S,'thinking':{**ID,'description':'Pi thinking level for the selected model. Omit to inherit Pi settings. Unsupported values return that model’s available levels.'},'access':{'type':'string','enum':['read','write'],'default':'write','description':'Managed tool policy, not an OS sandbox. Ambient Pi extensions retain their own capabilities.'},'timeout_seconds':{'type':'integer','minimum':1,'maximum':604800}},
       ['request_id','task']),
- tool('pi_send_input','send','Send a new task to an idle agent, queue an ordered continuation in the active task, or queue a separate follow-up. interrupt=true verifies child termination then starts a replacement process. Queued is not consumed.',
-      {**AGENT,**REQ,'message':S,'mode':{'type':'string','enum':['send','steer','follow_up'],'default':'steer'},'interrupt':{'type':'boolean','default':False}},
+ tool('pi_send_input','send','Submit input to an existing Pi session. Queued is not consumed. interrupt=true terminates and verifies the owned process before starting a replacement with this message; it does not roll back effects.',
+      {**AGENT,**REQ,'message':{**S,'description':'New work or a correction, with any changed facts, permissions and acceptance criteria. The child retains its own Pi history, but cannot see new parent conversation.'},'mode':{'type':'string','enum':['send','steer','follow_up'],'default':'steer','description':'send: new run on an idle agent. steer: same-run continuation after the current SDK call finishes, not a mid-call interruption. follow_up: separate run after the active task and all its continuations.'},'interrupt':{'type':'boolean','default':False}},
       ['agent_id','request_id','message']),
  tool('pi_wait_agent','wait','Event-driven wait, default 10 minutes, maximum 1 hour. Returns immediately on any completion (default any mode), failure, stop or question; all mode waits for all normal completions but still returns early for problems/questions. No polling or fixed sleep. Includes bounded results and exact hashes; never acknowledges. Cancelling the wait does not stop agents.',
-      {**SCOPE,'run_ids':{'type':'array','items':ID,'maxItems':100},'mode':{'type':'string','enum':['any','all'],'default':'any'},'timeout_ms':{'type':'integer','minimum':0,'maximum':MAX_WAIT_MS,'default':DEFAULT_WAIT_MS,'description':'Maximum wait, not a fixed delay. 0 checks immediately. Host MCP timeout can impose a shorter limit.'}},[],True),
+      {**SCOPE,'run_ids':{'type':'array','items':ID,'maxItems':100},'mode':{'type':'string','enum':['any','all'],'default':'any'},'timeout_seconds':{'type':'integer','minimum':0,'maximum':MAX_WAIT_SECONDS,'default':DEFAULT_WAIT_SECONDS,'description':'Maximum wait, not a fixed delay. 0 checks immediately. Host MCP timeout can impose a shorter limit.'}},[],True),
  tool('pi_list_agents','list','List this scope and outstanding runs, including completed results not yet acknowledged.',
       {**SCOPE,'limit':{'type':'integer','minimum':1,'maximum':50,'default':20}},[],True),
  tool('pi_inspect_agent','inspect','Read a bounded incremental trace and steering receipts. Reuse next_cursor as after. No raw reasoning or unlimited transcript dump.',

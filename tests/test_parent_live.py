@@ -107,7 +107,7 @@ class LiveParentWakeup(McpHarness, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(question_wake['threadId'],parent); self.assertNotEqual(first['turn']['id'],question_wake['turn']['id'])
         self.assertIn(child['run_id'],self.requests[1]); self.assertIn('question',self.requests[1])
         self.assertIn('not a user instruction or approval',self.requests[1])
-        attention=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[child['run_id']],'timeout_ms':0})
+        attention=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[child['run_id']],'timeout_seconds':0})
         self.assertEqual(attention['reason'],'needs_input')
         await self.tool('pi_answer_agent',{'scope':scope,'agent_id':child['agent_id'],'request_id':'answer',
             'ui_request_id':attention['questions'][0]['id'],'answer':'Use feature/parent-answer'})

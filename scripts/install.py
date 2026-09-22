@@ -46,9 +46,9 @@ def install(args):
         # Portable commands must stay inside the plugin; pin Python in the launcher.
         launcher=stage/'payload/bin/subagent-pi'
         launcher.write_text('#!'+str(Path(sys.executable).resolve())+'\n'+launcher.read_text().split('\n',1)[1])
-        from subagent_pi.common import MAX_WAIT_MS
+        from subagent_pi.common import MAX_WAIT_SECONDS
         server={'command':str(Path(sys.executable).resolve()),'args':[entry,'mcp'],'env':{'PI_AGENTS_HOME':str(home)},
-                'env_vars':['XDG_RUNTIME_DIR'],'tool_timeout_sec':MAX_WAIT_MS // 1000 + 30}
+                'env_vars':['XDG_RUNTIME_DIR'],'tool_timeout_sec':MAX_WAIT_SECONDS + 30}
         portable={'$schema':'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json','mcpServers':{'subagent-pi':{'type':'stdio','command':'./bin/subagent-pi','args':['mcp'],'env':server['env']}}}
         atomic_json(stage/'payload/mcp.json',portable)
         atomic_json(stage/'payload/.mcp.json',{'mcpServers':{'subagent-pi':server}})

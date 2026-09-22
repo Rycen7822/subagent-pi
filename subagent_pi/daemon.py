@@ -9,6 +9,7 @@ import signal
 import sys
 from .common import MAX_FRAME, AgentError, check_peer, dumps, private_dir, read_frame, socket_path
 from .runtime import Runtime
+from . import parent
 from .schema import validate_op
 from . import PROTOCOL_VERSION
 
@@ -27,44 +28,52 @@ async def serve(home: Path):
         sock.unlink(missing_ok=True)
         async def handle(reader,writer):
             current=asyncio.current_task(); clients.add(current)
-            job=None; disconnected=None
+            job=None; disconnected=None; reservation=None; delivered=None
             try:
-                check_peer(writer)
-                req=await asyncio.wait_for(read_frame(reader),10)
-                if not isinstance(req,dict): raise AgentError('invalid_request','Expected an object')
-                if req.get('v')!=PROTOCOL_VERSION: raise AgentError('version_mismatch','Client/daemon protocol versions differ; drain and restart the daemon')
-                op=req.get('op'); params=req.get('params',{})
-                validate_op(op,params)
-                source=req.get('source')
-                if source is not None:
-                    # Trusted-adapter channel: bounded env snapshot, never logged or stored.
-                    if not isinstance(source,dict) or not isinstance(source.get('env'),dict):
-                        raise AgentError('invalid_request','source must be an object with an env object')
-                    env=source['env']
-                    if len(env)>64 or any(not isinstance(k,str) or len(k)>128 or not isinstance(v,str) or len(v)>16384 for k,v in env.items()):
-                        raise AgentError('invalid_request','source env snapshot exceeds bounds')
-                job=asyncio.create_task(runtime.dispatch(op,params,source)); operations.add(job)
-                job.add_done_callback(operations.discard)
-                if op=='wait':
-                    disconnected=asyncio.create_task(reader.read(1))
-                    done,_=await asyncio.wait({job,disconnected},return_when=asyncio.FIRST_COMPLETED)
-                    if disconnected in done and not job.done():
-                        job.cancel(); await asyncio.gather(job,return_exceptions=True); writer.close(); return
-                value=await asyncio.shield(job)
-                reply={'ok':True,'result':value}
-            except AgentError as e: reply={'ok':False,'error':e.as_dict()}
-            except (json.JSONDecodeError,UnicodeDecodeError): reply={'ok':False,'error':{'code':'invalid_json','message':'Invalid JSON request'}}
-            except asyncio.CancelledError: raise
-            except Exception as e:
-                print(f'IPC operation failed: {type(e).__name__}: {e}',file=sys.stderr)
-                reply={'ok':False,'error':{'code':'internal_error','message':'Runtime failure. Inspect the ledger before retrying.'}}
+                try:
+                    check_peer(writer)
+                    req=await asyncio.wait_for(read_frame(reader),10)
+                    if not isinstance(req,dict): raise AgentError('invalid_request','Expected an object')
+                    if req.get('v')!=PROTOCOL_VERSION: raise AgentError('version_mismatch','Client/daemon protocol versions differ; drain and restart the daemon')
+                    op=req.get('op'); params=req.get('params',{})
+                    validate_op(op,params)
+                    source=req.get('source')
+                    if source is not None:
+                        # Trusted-adapter channel: never model arguments or logs.
+                        if not isinstance(source,dict) or not isinstance(source.get('env'),dict):
+                            raise AgentError('invalid_request','source must be an object with an env object')
+                        env=source['env']
+                        if len(env)>64 or any(not isinstance(k,str) or len(k)>128 or not isinstance(v,str) or len(v)>16384 for k,v in env.items()):
+                            raise AgentError('invalid_request','source env snapshot exceeds bounds')
+                    track_delivery=op=='wait' and req.get('wait_delivery') is True
+                    if track_delivery: reservation=parent.reserve_wait(runtime,params,source)
+                    job=asyncio.create_task(runtime.dispatch(op,params,source)); operations.add(job)
+                    job.add_done_callback(operations.discard)
+                    if op=='wait':
+                        disconnected=asyncio.create_task(reader.read(1))
+                        done,_=await asyncio.wait({job,disconnected},return_when=asyncio.FIRST_COMPLETED)
+                        if disconnected in done and not job.done():
+                            job.cancel(); await asyncio.gather(job,return_exceptions=True); return
+                        disconnected.cancel()
+                        await asyncio.gather(disconnected,return_exceptions=True)
+                    value=await asyncio.shield(job)
+                    reply={'ok':True,'result':value}
+                except AgentError as e: reply={'ok':False,'error':e.as_dict()}
+                except (json.JSONDecodeError,UnicodeDecodeError): reply={'ok':False,'error':{'code':'invalid_json','message':'Invalid JSON request'}}
+                except asyncio.CancelledError: raise
+                except Exception as e:
+                    print(f'IPC operation failed: {type(e).__name__}: {e}',file=sys.stderr)
+                    reply={'ok':False,'error':{'code':'internal_error','message':'Runtime failure. Inspect the ledger before retrying.'}}
+                writer.write((dumps(reply)+'\n').encode()); await writer.drain()
+                if reply['ok'] and track_delivery:
+                    receipt=await asyncio.wait_for(read_frame(reader),10)
+                    if receipt=={'received':True}: delivered=value
+            except (OSError,asyncio.TimeoutError,ValueError):
+                pass  # No delivery receipt: pending attention becomes eligible again.
             finally:
                 if disconnected: disconnected.cancel()
+                parent.release_wait(runtime,reservation,delivered)
                 clients.discard(current)
-            try:
-                writer.write((dumps(reply)+'\n').encode()); await writer.drain()
-            except (BrokenPipeError,ConnectionResetError): pass
-            finally:
                 writer.close()
                 with contextlib.suppress(Exception): await writer.wait_closed()
         server=await asyncio.start_unix_server(handle,str(sock),limit=MAX_FRAME)

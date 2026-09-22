@@ -2,7 +2,7 @@
 
 **MCP + 极薄 Skill + CLI + 一个持久化运行时。无 hooks。**
 
-让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、运行中 steer、排队 follow-up、检查工作轨迹、中断、关闭、恢复原会话、收取结果。
+让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、任务内有序续跑、排队 follow-up、检查工作轨迹、中断、关闭、恢复原会话、收取结果。
 
 这是完整源码版 `0.2.9`，针对 **Linux / WSL2，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
 
@@ -73,7 +73,7 @@ subagent-pi spawn --access read --task '检查缓存失效逻辑，只报告问�
 # 使用上一条返回的真实 ID：
 subagent-pi inspect AGENT_ID --scope SCOPE_ID
 subagent-pi steer AGENT_ID --scope SCOPE_ID --message '优先检查索引刷新路径'
-subagent-pi wait RUN_ID --scope SCOPE_ID --timeout-ms 3600000
+subagent-pi wait RUN_ID --scope SCOPE_ID --timeout-seconds 3600
 subagent-pi result RUN_ID --scope SCOPE_ID
 subagent-pi ack RUN_ID --scope SCOPE_ID --sha256 RESULT_SHA256
 subagent-pi close AGENT_ID --scope SCOPE_ID

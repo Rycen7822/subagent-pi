@@ -41,7 +41,8 @@ class Runtime:
         self.shutdown_requested = asyncio.Event()
         self.closing = False
         self.background = set()
-        self.parent_delivery = None
+        self.parent_waits = {}
+        self.parent_deliveries = {}
         self._reconcile()
 
     def spawn_task(self,coro):
@@ -75,8 +76,7 @@ class Runtime:
         async def wake():
             async with self.changed: self.changed.notify_all()
         self.spawn_task(wake())
-        if not self.closing and (self.parent_delivery is None or self.parent_delivery.done()):
-            self.parent_delivery=self.spawn_task(parent.deliver_pending(self))
+        parent.schedule(self)
 
     def event(self,w,kind,payload):
         self.store.event(w.agent['id'],w.run_id,w.generation,kind,bounded(payload,4096))
@@ -380,7 +380,7 @@ class Runtime:
                             self.store.finish(rid,'failed','',e.message)
                             self.store.agent_update(aid,state='crashed'); self.notify()
                         raise AgentError(e.code,e.message,agent_id=aid,run_id=rid)
-                return {'agent_id':aid,'run_id':rid,'scope':sid,'state':self.store.run(sid,rid)['state'],'cwd':cwd,
+                return {'agent_id':aid,'name':name,'run_id':rid,'scope':sid,'state':self.store.run(sid,rid)['state'],'cwd':cwd,
                         **views.model_settings(self.store.agent(sid,aid))}
         if op=='ack':
             r=self.store.run(sid,identifier(p.get('run_id'),'run_id'))
@@ -453,13 +453,15 @@ class Runtime:
                     except AgentError as e:
                         self.store.execute("UPDATE receipts SET state=?,updated=? WHERE id=?",('not_consumed' if e.code=='pi_rejected' else 'unknown',now(),receipt)); raise
                     self.store.execute("UPDATE receipts SET state='queued',updated=? WHERE id=? AND state='sending'",(now(),receipt))
-                    return {'agent_id':aid,'run_id':w.run_id,'receipt_id':receipt,'delivery':self.store.one('SELECT state FROM receipts WHERE id=?',(receipt,))['state']}
+                    return {'agent_id':aid,'name':a['name'],'run_id':w.run_id,'receipt_id':receipt,
+                            'execution':'after_current_sdk_call',
+                            'delivery':self.store.one('SELECT state FROM receipts WHERE id=?',(receipt,))['state']}
                 if mode=='send' and w.run_id: raise AgentError('agent_busy','Use steer, follow_up, or interrupt=true for an active agent')
                 if len(self.store.all("SELECT id FROM runs WHERE agent_id=? AND state='queued'",(aid,)))>=20: raise AgentError('queue_full','Follow-up queue is full')
                 rid=self.add_run(a,msg)
                 if not w.run_id: await self.start_run(w,rid)
                 self.notify()
-                return {'agent_id':aid,'run_id':rid,'state':self.store.run(sid,rid)['state'],'queue_owner':'daemon'}
+                return {'agent_id':aid,'name':a['name'],'run_id':rid,'state':self.store.run(sid,rid)['state'],'queue_owner':'daemon'}
         raise AgentError('unknown_operation',f'Unknown mutation: {op}')
 
     async def deadline_loop(self):

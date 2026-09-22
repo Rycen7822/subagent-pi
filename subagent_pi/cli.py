@@ -39,7 +39,7 @@ def parser():
             if name=='send': q.add_argument('--interrupt',action='store_true')
         if name=='list': q.add_argument('--limit',type=int,default=20)
         if name=='wait':
-            q.add_argument('run_ids',nargs='*'); q.add_argument('--mode',choices=['any','all'],default='any'); q.add_argument('--timeout-ms',type=int,help='Maximum wait in milliseconds, not a fixed delay; default 10 minutes, max 1 hour, 0 checks immediately')
+            q.add_argument('run_ids',nargs='*'); q.add_argument('--mode',choices=['any','all'],default='any'); q.add_argument('--timeout-seconds',type=int,help='Maximum wait in seconds, not a fixed delay; default 10 minutes, max 1 hour, 0 checks immediately')
         if name=='inspect':
             q.add_argument('--after',type=int,default=0); q.add_argument('--limit',type=int,default=20); q.add_argument('--max-bytes',type=int,default=4096); q.add_argument('--detail',choices=['tools','full'],default='tools')
         if name in {'result','ack'}: q.add_argument('run_id')
@@ -150,6 +150,12 @@ async def execute(args):
     if cmd=='wait' and not data['run_ids']: data.pop('run_ids')
     data={k:v for k,v in data.items() if v is not None}
     op={'steer':'send','follow-up':'send','resume':'respawn'}.get(cmd,cmd)
+    if op=='wait':
+        from .parent import capture
+        async def write_result(value): print(dumps(value),flush=True)
+        source={'env':{},'parent':capture(os.environ,os.environ.get('CODEX_THREAD_ID'))}
+        await request(home,op,data,timeout=call_timeout(op,data,home),source=source,on_result=write_result)
+        return None
     result=await request(home,op,data,timeout=call_timeout(op,data,home))
     if 'request_id' in data: result={**result,'request_id':data['request_id']}
     return result

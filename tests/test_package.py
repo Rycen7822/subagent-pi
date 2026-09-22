@@ -25,15 +25,30 @@ class ClientTimeoutBudget(unittest.TestCase):
     def test_boot_timeout_ignores_run_deadline(self):
         # timeout_seconds is the RUN deadline, not a boot budget: a one-week run
         # must not make the spawn call itself wait a week.
-        self.assertEqual(call_timeout('spawn',{'timeout_ms':604800000},None),
+        self.assertEqual(call_timeout('spawn',{'timeout_seconds':604800},None),
                          call_timeout('spawn',{},None))
     def test_wait_scales_with_its_own_timeout(self):
-        from subagent_pi.common import DEFAULT_WAIT_MS, MAX_WAIT_MS
-        self.assertEqual(call_timeout('wait',{},None),DEFAULT_WAIT_MS/1000+10)
-        self.assertEqual(call_timeout('wait',{'timeout_ms':MAX_WAIT_MS},None),MAX_WAIT_MS/1000+10)
-        self.assertGreater(call_timeout('wait',{'timeout_ms':120000},None),
-                           call_timeout('wait',{'timeout_ms':25000},None))
+        from subagent_pi.common import DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS
+        self.assertEqual(call_timeout('wait',{},None),DEFAULT_WAIT_SECONDS+10)
+        self.assertEqual(call_timeout('wait',{'timeout_seconds':MAX_WAIT_SECONDS},None),MAX_WAIT_SECONDS+10)
+        self.assertGreater(call_timeout('wait',{'timeout_seconds':120},None),
+                           call_timeout('wait',{'timeout_seconds':25},None))
         self.assertEqual(call_timeout('list',{},None),45)
+
+
+    def test_wait_schema_and_cli_expose_seconds_only(self):
+        from subagent_pi.schema import BY_NAME, validate_op
+        from subagent_pi.cli import parser
+        from subagent_pi.common import AgentError
+        props=BY_NAME['pi_wait_agent']['inputSchema']['properties']
+        self.assertNotIn('timeout_ms',props)
+        self.assertEqual((props['timeout_seconds']['default'],props['timeout_seconds']['maximum']),(600,3600))
+        for seconds in (0,1,600,3600):
+            validate_op('wait',{'scope':'scope','timeout_seconds':seconds})
+        for args in ({'timeout_ms':600000},{'timeout_seconds':3601},{'timeout_seconds':-1},{'timeout_seconds':True}):
+            with self.subTest(args=args),self.assertRaises(AgentError): validate_op('wait',{'scope':'scope',**args})
+        self.assertEqual(parser().parse_args(['wait','--timeout-seconds','3600']).timeout_seconds,3600)
+        self.assertIsNone(parser().parse_args(['wait']).timeout_seconds)
 
 class PackageTests(unittest.TestCase):
     def test_manifest_structure_and_no_hooks(self):
@@ -55,8 +70,8 @@ class PackageTests(unittest.TestCase):
             legacy=json.loads((plugin/'.mcp.json').read_text())['mcpServers']['subagent-pi']
             self.assertEqual(legacy['command'],str(Path(sys.executable).resolve()))
             self.assertEqual(legacy['args'],[str(plugin/'bin/subagent-pi'),'mcp'])
-            from subagent_pi.common import MAX_WAIT_MS
-            self.assertGreater(legacy['tool_timeout_sec'],call_timeout('wait',{'timeout_ms':MAX_WAIT_MS}))
+            from subagent_pi.common import MAX_WAIT_SECONDS
+            self.assertGreater(legacy['tool_timeout_sec'],call_timeout('wait',{'timeout_seconds':MAX_WAIT_SECONDS}))
             self.assertEqual(legacy['env_vars'],['XDG_RUNTIME_DIR'])
             self.assertFalse((plugin/'plugin.json').exists())  # Native Codex manifest owns the timeout.
             self.assertTrue((plugin/'.codex-plugin/plugin.json').exists())

@@ -68,7 +68,7 @@ class LiveCodexWait(McpHarness, unittest.IsolatedAsyncioTestCase):
             await request(self.home,'list',{'scope':scope['scope']},autostart=False)
             run=await tool('pi_spawn_agent',{'task':'delay=310|long-wait','access':'read','request_id':'long'})
             start=asyncio.get_running_loop().time()
-            # Omit timeout_ms: catches a stale 25s default or 45s IPC budget too.
+            # Omit timeout_seconds: catches a stale 25s default or 45s IPC budget too.
             result=await tool('pi_wait_agent',{'run_ids':[run['run_id']]})
             elapsed=asyncio.get_running_loop().time()-start
             self.assertGreater(elapsed,300)

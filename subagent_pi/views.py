@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import time
 
-from .common import TERMINAL, DEFAULT_WAIT_MS, AgentError, crop, dumps, identifier, integer
+from .common import TERMINAL, DEFAULT_WAIT_SECONDS, AgentError, crop, dumps, identifier, integer
 
 def model_settings(a):
     spec=json.loads(a['launch'])
@@ -21,13 +21,14 @@ def brief_agent(rt, a):
         if w.ui: result['pending_input']=list(w.ui.values())[:4]
     return result
 
-def brief_run(r):
-    return {k:r[k] for k in ('id','agent_id','state','result_sha','ack','error')}
+def brief_run(rt,r):
+    return {**{k:r[k] for k in ('id','agent_id','state','result_sha','ack','error')},
+            'name':rt.store.agent(r['scope'],r['agent_id'])['name']}
 
 def outstanding(rt, sid, limit=20):
     rows=rt.store.all("SELECT * FROM runs WHERE scope=? AND ack=0 ORDER BY created DESC LIMIT ?",(sid,limit))
     count=rt.store.one("SELECT COUNT(*) n FROM runs WHERE scope=? AND ack=0",(sid,))['n']
-    return {'revision':rt.store.scope(sid)['revision'],'runs':[brief_run(r) for r in rows], 'total':count,'omitted':max(0,count-len(rows))}
+    return {'revision':rt.store.scope(sid)['revision'],'runs':[brief_run(rt,r) for r in rows], 'total':count,'omitted':max(0,count-len(rows))}
 
 def inspect(rt,p):
     a=rt.store.agent(p['scope'],identifier(p.get('agent_id'),'agent_id'))
@@ -93,22 +94,28 @@ def result(rt,p):
         try: content=raw.decode('utf-8'); used=len(raw)
         except UnicodeDecodeError: raise AgentError('invalid_offset','Offset must be a UTF-8 boundary returned by this tool')
     usage=json.loads(r['usage'])
-    return {'run':{**brief_run(r),**{k:r[k] for k in ('created','started','ended','deadline')}},'text':content,'result_sha256':r['result_sha'],
+    return {'run':{**brief_run(rt,r),**{k:r[k] for k in ('created','started','ended','deadline')}},'text':content,'result_sha256':r['result_sha'],
             'offset':offset,'next_offset':offset+used,'has_more':offset+used<size,'total_bytes':size,
             'artifact_path':str(path),'acknowledged':bool(r['ack']),
             'result_truncated':usage.get('result_truncated',False),'usage':usage}
 
-async def wait(rt,p):
-    sid=p['scope']; limit=rt.config['max_wait_seconds']*1000
-    ms=integer(p.get('timeout_ms',min(DEFAULT_WAIT_MS,limit)),'timeout_ms',0,limit)
-    mode=p.get('mode','any')
-    if mode not in {'any','all'}: raise AgentError('invalid_argument','mode must be any or all')
+def wait_run_ids(rt,p):
+    sid=p['scope']
     ids=p.get('run_ids')
     if ids is None:
         ids=[r['id'] for r in rt.store.all("SELECT id FROM runs WHERE scope=? AND ack=0 ORDER BY created LIMIT 100",(sid,))]
     if not isinstance(ids,list) or len(ids)>100: raise AgentError('invalid_argument','run_ids must be a list of at most 100 ids')
     ids=list(dict.fromkeys(identifier(x,'run_id') for x in ids))
-    until=time.monotonic()+ms/1000
+    for rid in ids: rt.store.run(sid,rid)
+    return ids
+
+async def wait(rt,p):
+    sid=p['scope']; limit=rt.config['max_wait_seconds']
+    seconds=integer(p.get('timeout_seconds',min(DEFAULT_WAIT_SECONDS,limit)),'timeout_seconds',0,limit)
+    mode=p.get('mode','any')
+    if mode not in {'any','all'}: raise AgentError('invalid_argument','mode must be any or all')
+    ids=wait_run_ids(rt,p)
+    until=time.monotonic()+seconds
     async with rt.changed:
         while True:
             rows=[rt.store.run(sid,rid) for rid in ids]
@@ -120,7 +127,7 @@ async def wait(rt,p):
                 # Share a fixed text budget across the page, never 100 full results.
                 budget=8192; runs=[]; questions=[]
                 for row in rows:
-                    item=brief_run(row)
+                    item=brief_run(rt,row)
                     if row['state'] in TERMINAL and budget>=256:
                         page=result(rt,{'scope':sid,'run_id':row['id'],'max_bytes':min(2048,budget)})
                         item['result']={k:page[k] for k in ('text','result_sha256','next_offset','has_more','total_bytes','result_truncated')}
@@ -130,7 +137,7 @@ async def wait(rt,p):
                     if row['state']=='needs_input':
                         worker=rt.workers.get(row['agent_id'])
                         if worker:
-                            questions.extend({'agent_id':row['agent_id'],'run_id':row['id'],**question}
+                            questions.extend({**question,'agent_id':row['agent_id'],'run_id':row['id'],'name':item['name']}
                                              for question in list(worker.ui.values())[:4])
                     runs.append(item)
                 reason='timeout' if not ready else 'needs_input' if attention else 'failed_or_stopped' if failures else 'completed' if done else 'empty' if not ids else 'timeout'
