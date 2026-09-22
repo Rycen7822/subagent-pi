@@ -2,32 +2,11 @@
 
 ## Unreleased
 
-- 受管子代理默认加载 Pi 自身的配置（extensions/packages/skills/prompts/themes/settings），
-  不再默认传 `--no-extensions`/`--no-skills`；`ambient_extensions`/`ambient_skills`
-  改为显式退出开关（默认 `true`）。
-- builtin 工具面改由新扩展 `extensions/managed-surface.ts` 在 session_start 应用，
-  并按 Pi 报告的来源（`sourceInfo.path = "<builtin:NAME>"`）区分 builtin 与扩展工具：
-  只激活/停用真正的 builtin，扩展注册的同名工具（例如用自己的 `bash` 覆盖 builtin）
-  保持 Pi 给它的状态。`--tools` 与 `--exclude-tools` 都不再使用——两者都按工具名过滤
-  同一份注册表，会连带剔除扩展的同名工具；`merge_bridge_tool` 随之删除。限制 builtin
-  的 profile 若缺少该扩展则拒绝启动，且启动前必须收到子进程回读实时注册表后的报告
-  （`tool_surface` 事件；缺失或与期望不符时 `tool_surface_unavailable` /
-  `tool_surface_unapplied`，不会谎称限制已生效）。
-- 精简：桥接测试共用一个 harness fixture（原先 5 处重复的 skip/临时目录样例），
-  internal server key 与 policy key 各自收敛为单一常量元组，worker 侧工具面校验/技能
-  回读直接取 worker 自己的身份，runtime 的三处 delegated text 信封合并为一个函数；
-  删除 bridge 与测试中的死分支/空转换。
-- `PI_CODING_AGENT_DIR` 作为非秘密配置定位变量随 scope 绑定：客户端环境 → scope 快照 →
-  daemon → guard → 子 Pi，daemon 重启后仍按记录恢复；未设置保持 Pi 默认，profile 的
-  `[profiles.x.env]` 取值仍然优先。
-- skill 同名冲突由 Pi 在加载边界裁决（Pi 已加载的 skill 保留、Codex 版本不注册）；
-  每次 boot 通过 `get_commands` 回读真实注册表并记录 `inheritance_skills`
-  （loaded/skipped/kept），不做 BM25/语义/别名去重，不复制或改名 skill 文件。
-- `access=read` 不再拒绝加载 extensions，也不再声称"只具备只读工具"：只读含义收窄为
-  builtin 限制、继承 MCP 的 readOnly 暴露与写者互斥，均非 OS 沙箱。
-- MCP 不按 server 名去重：Pi 0.85.1 没有 MCP 体系、没有 server 注册表（`get_commands`
-  只列命令，`getAllTools()` 只给工具名与所属扩展文件），无法在不臆造配置格式的前提下
-  判断"Pi 已有同名 server"。仅保证 `(server, tool)` 寻址：不同 server 的同名工具不冲突。
+- 改用插件拥有的 Pi SDK 子进程与串行任务队列，移除全部宿主补丁及能力修订协商。完成事件绑定 run_id，排空 SDK 调用和扩展续跑后才结算。
+- steer 改为同一任务内的有序续跑，保留完整 input/before_agent_start 路径；handled 主输入明确失败，后继任务继续。过期异步输入不能进入新任务。
+- interrupt 统一终止并核验受管进程组；显式 interrupt+新消息在验证清理后启动新 generation。不会修改或终止普通 Pi。
+- 默认加载 Pi 自身资源、Pi-first skills 与 builtin 来源隔离保持；SDK settings 写入限制在子进程内存，验证目标更新为原版 Pi 0.87.0。
+- 修复重复 dev-setup 的目录/符号链接清理；用 SDK 生命周期测试替换宿主补丁矩阵，精简生命周期和测试文档。
 
 ## 0.2.9 — 2026-09-15
 

@@ -5,84 +5,40 @@
 ```bash
 python3 scripts/validate_package.py
 python3 -m unittest discover -s tests -v
-```
-
-使用 tests/fake_pi.py 构造真实本地 subprocess、stdin/stdout JSONL、事件、UI 请求、延迟、中断、crash 和 shell 后代。不使用外部模型、网络或真实仓库。测试自己的临时目录会被清理。
-
-runtime 测试覆盖任务状态机、幂等、read/write 冲突、steering 消费证据、follow-up、wait、interrupt、close、恢复、UTF-8 分页、结果确认和 schema。
-
-transport 测试通过真正的 MCP stdio 和 Unix socket，覆盖并发初始化、MCP/CLI 共享账本、取消等待、adapter 退出、daemon 重启和断线幂等。
-
-继承测试覆盖来源解析与错误回退、skill/MCP 转换与 disposition、审批优先级表、递归身份识别（含安装器包装）、诊断可序列化、环境隔离（双 scope 各自取值、daemon-only canary 不可达、控制面无值、`PI_CODING_AGENT_DIR` 由客户端绑定且跨 daemon 重启保留、profile env 优先）、required 失败阻止 spawn 且零 prompt，以及最终 argv 经 Pi 真实 parseArgs 探针验证（无 `--tools`/`--no-tools`/`--exclude-tools`、默认不带 `--no-extensions`/`--no-skills`、限制 builtin 的 profile 带上 managed-surface 扩展且标记 `surface`）。
-
-默认加载与同名去重的回归分两层：fake Pi 层跑完整的 daemon/worker/CLI 路径（启动参数、注入 `PI_AGENTS_CHILD_BUILTINS`、`tool_surface` 事件与 ok/missing/mismatch/malformed 四种结果下的启动判定、`get_commands` 回读、`inheritance_skills` 事件的 loaded/skipped/kept 记录、Pi 同名 skill 保留与不同名 skill 正常继承）；`SUBAGENT_PI_LIVE_PI=1` 的 `RealPiSkillBoundary` 用真实 Pi 0.85.1 加载真实 skill 目录与真实工具注册表（客户端绑定的 agent dir 被加载、默认目录未被误选、agent dir 的同名 skill 胜出、Codex 版本不注册；扩展用自己的 `bash` 覆盖 builtin 时普通 Pi 与受管 Pi 都保留该扩展工具，无覆盖时 reader 的写类 builtin 被停用；另有一个独立探针扩展报告 Pi 实时注册表，用来交叉验证 `subagent-pi-surface applied ok=true` 的结论），全程不发 prompt、零模型调用。`get_commands` 不可用时只记诊断、不阻塞 boot。
-
-bridge 主机测试（tests/test_bridge_host.py + tests/bridge_host.mjs）用 jiti 加载**真实** TypeScript bridge（与 Pi 相同的加载器），对本地假 stdio/HTTP MCP server 驱动完整发现链（list → list(server) → describe → call，工具名由假 server 动态生成）、审批策略矩阵、HTTP headers 后 body 挂起的 deadline/取消/close（阶段证据：请求送达+headers 已 flush 才允许断言）、stdio 异步 EPIPE（host 以 `--unhandled-rejections=strict` 运行且必须退出码 0）、目录失效与分页上限。回执（receipt）为结构化 JSON。该层不启动 Pi 进程、不调模型。
-
-环境绑定链测试（test_inheritance.EnvironmentBindingChain）经真实 CLI 子进程 → daemon → guard → fake-Pi 执行：自定义 PATH 中的无害解释器实际运行（rc=0 证明环境绑定）、授权 child_env 名单送达、daemon-only canary 不可达、总开关关闭时 config.toml 为 FIFO（任何读取都会阻塞）仍正常启动、秘密值不落控制面。
-
-上述核心回归均做过红-绿验证：对未修复实现运行会失败，对修复后代码通过。
-
-未发布回归（Pi 默认配置加载 + 同名去重）：见上文两段；MCP 侧只保证不同 server 的同名工具可区分（bridge 真实 harness：两个 fake server 同工具名分别路由并各自计数），server 名去重因 Pi 无 MCP 注册表而不实现。
-
-0.2.7 回归：stdio dual-era Auto lifecycle（strict fixture 断言首 RPC=server/discover、DiscoverResult 校验、legacy 错误/超时回退顺序、unsupported-version 不回退）、同源 manual redirect（跨 origin 目标 0 请求、303→GET、loop/max-hops、deadline 跨跳、无重放）、-32020/-32021/-32022 与 in-band 错误的 era 分类、malformed DiscoverResult=protocol error。
-
-0.2.6 回归：modern stdio opt-in（首 RPC=tools/list 携带 modern _meta、server 进程 env 无 marker、unknown marker fail-closed 且不启动进程）、HTTP 400 era 分类（legacy400 回退 / modern400 保持 modern / 无共同版本拒绝 / 401/403/429/503 不降级，副作用 count 0 或 1）、嵌套 x-mcp-header 路径、`=?base64?…?=` 值编码与非 ASCII `Mcp-Name`（strict server 解码后与 body 一致）。
-
-0.2.5 回归：schema 注解 x-mcp-header（strict modern server 校验实收 Mcp-Param-* 与 body 不变）、并发提交下 proxy 串行（server 端 start/end 顺序）、confirm 挂起期间进程死亡（exit/EPIPE，逐进程首 RPC 必为 initialize、副作用恰一次）。
-
-协议一致性夹具（0.2.4）：`fake_mcp_http.py` 提供 strict modern 2026-07-28 模式（缺
-`MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name`/modern `_meta` 即 400 拒绝）、legacy-only
-discovery 模式（`server/discover` → 404 证明可回退）与 legacy session 过期模式
-（第 N 个 session 请求后 404）；EVENTS 证据记录每个请求实际收到的协议头与 `_meta`，
-测试据此断言 bridge 发送的头/体与服务器端 call 次数。
-
-回执 FD 所有权测试（test_runtime.ReceiptFdOwnership）在真实启动失败路径中，用 socketpair 在 `terminate` 清理窗口内抢占已释放的回执 FD 编号，断言失败路径不触碰新连接（修复前该 socket 被 `finally` 误关、写端 EBADF）；并覆盖超时/取消/transport 创建失败三条路径的“恰好关闭一次”。
-
-0.2.8 架构回归（均为先红后绿）：
-
-- `test_transport.test_base_env_survives_daemon_restart`：真实 daemon 起停一次后在同一 scope 上 respawn；经 fake Pi 的 `PI_TEST_PROBE_FILE` 证据通道断言重启后的 worker 仍有 PATH/HOME 并能通过 PATH 找到命令（rc=0）。修复前该处为空 PATH。
-- `test_transport.test_restart_persists_base_env_but_never_secrets`：断言落盘的只有基础键，绑定到 scope 的 secret 不出现在 `scopes.base_env` 与账本字节中。
-- `test_runtime.RestartOwnershipVerdict`：owner.json 缺失时，存活 pid 不得判为 verified、已死 pid 可 verified；owner.json 不可读一律 unknown。修复前存活进程被写成 verified。
-- `test_package.ClientTimeoutBudget`：启动类操作的客户端等待必须覆盖 daemon 启动预算，且不随运行时限 timeout_seconds 膨胀。
-- `test_package.ShipManifest`：ZIP 与安装目录共用的排除规则挡住 `.mypy_cache`/`.cursor`/`dist`/`*.local.md`/`CLAUDE.md` 等本地文件，同时保留运行时必需文件，并断言两条路径确实共用同一规则。
-- `test_inheritance.StoreMigration`：schema 1→当前、2→当前，以及拒绝更高版本。
-
-0.2.9 模块边界回归：
-
-- `test_package.RuntimeModuleBoundaries`：runtime.py 不得重新引入进程机制（signal/fcntl/os.pipe/create_subprocess_exec/killpg/connect_read_pipe/atomic_json/run_in_executor）；worker/binding/views 不得反向 import runtime；`boot_worker` 的局部 import 保持 binding 可脱离 Runtime 独立导入。
-- `test_runtime.ReconcileAndReapAgree`：同一 owner 记录在恢复路径与 `close` 路径必须得出同向结论（不可验证的一律拒绝，已验证死亡的都判 gone）。
-- `test_runtime.RestartOwnershipVerdict` 新增：未到达 fork 点（`cleanup='verified'` 且无 pid）的行必须判 dormant，不得永远悬空；`cleanup='pending'` 且无记录仍为 unknown。
-
-TypeScript 类型检查（一次性 `npm install && npm run setup`，仅开发期，固定 typescript 版本，运行时零 npm 依赖）：
-
-```bash
+npm run setup
 npm run typecheck
 ```
 
-包结构测试只验证当前包内部清单/路径/Skill长度/工具定义，不等同于官方 marketplace 审核，也不替代安装到实际 Codex 的验收。
+默认使用 fake 子进程验证 MCP/CLI → daemon → guard 的协议、任务身份、回执、持久化、进程清理、故障和恢复。Node 队列测试由 Python 套件调用，覆盖串行归属、异常退出、handled 输入和旧回调不能混入新任务。没有模型请求。
 
-默认测试集合即使机器装有 Pi 与登录凭据也**不调用模型**：真实 Pi 检查被门控在 `SUBAGENT_PI_LIVE_PI=1`，只 boot worker（不发 prompt）并验证 bridge 回执。
+继承回归覆盖客户端环境绑定、Pi-first 同名 skill、builtin 来源判定、扩展同名工具保留、MCP 私有 bootstrap/receipt、stdio/HTTP 协议协商与错误路径。bridge 测试需要已安装 Pi 提供依赖；缺少时明确 skip。
 
-## 实际 Pi 测试
+## 原版 Pi SDK 进程测试
 
 ```bash
-python3 scripts/live_smoke.py --allow-model-call
+SUBAGENT_PI_LIVE_PI=1 python3 -m unittest discover -s tests -v
 ```
 
-该测试需要现成 Pi 认证，可能产生费用。它只检查独立 Pi RPC 可以读临时 marker、返回结果、确认并关闭；不能证明任意扩展/provider 组合均兼容。
+使用原版 Pi 0.87.0 的 SDK，隔离 HOME、PI_CODING_AGENT_DIR、workspace 和 daemon。`SUBAGENT_PI_LIVE_PI_BIN` 可选择另一份官方 Pi 安装。无需宿主补丁，不改安装缓存。
 
-## GitHub CI
+真实 MCP → daemon → SDK 子进程使用离线 mock provider，fetch 被替换为抛错函数。覆盖正常任务、before-settle/native continuation、多条及嵌套扩展输入、串行预处理与 FIFO、强制 system prompt、handled 输入、有序 steer、中断预处理、替换进程、迟到计时器隔离与显式 UI 确认。provider context、结果/hash 和进程清理是行为证据。
 
-`.github/workflows/ci.yml` 在每次 main push 与 PR 上运行两个 job：
+`RealPiSkillBoundary` 另验证真实资源加载、Pi-first skills 和 builtin/扩展工具区分，不提交模型任务。全量 live 包括这一层。
 
-- **python-core**（3.11 / 3.14）：package 结构校验 + 完整离线 unittest；未安装 Pi，Pi 依赖的 bridge tests 按现有门控 skip。
-- **integration**（Python 3.11 + Node 22.19.0）：安装固定 `@earendil-works/pi-coding-agent@0.85.1`，`npm ci --ignore-scripts && npm run setup && npm run typecheck`，preflight 确认 `pi` 可见（否则红），完整 unittest（bridge tests 真实执行），最后生成 source ZIP、校验 `FILES.sha256` 无 diff、`sha256sum -c` 与 archive 内容完整性。
+## 打包与类型
 
-CI 默认 0 模型调用（不设置 `SUBAGENT_PI_LIVE_PI`）、0 外部业务 MCP、0 secrets、权限仅 `contents: read`；所有 `actions/*` 均 full commit SHA pin。升级 Pi/Node 需明确修改 workflow 中的 pin。
+```bash
+mkdir -p .work/package
+python3 scripts/package.py --output .work/package/subagent-pi.zip
+sha256sum -c FILES.sha256
+```
 
-## 实际 Codex 验收
+重复打包必须得到相同 manifest/ZIP。包包含 SDK transport 和队列，不含 `.work`、node_modules 或宿主补丁。开发声明从当前 Pi 安装 stage，重复 setup 不得破坏符号链接目标。
 
-安装插件、新建 Codex 会话，用 pi_context + reader 启动一个小任务；在其运行时 inspect 和 steer，再 wait/result/ack。另测中断后继续、关闭后恢复、MCP 重连后同 scope 查询。
+GitHub CI 的 Python lane 跑默认离线套件；integration 固定 Pi 0.87.0、Node 22.19.0，执行类型检查、完整 live 离线套件和打包检查。
 
-当前源码环境没有 Pi/Codex 可执行程序，因此真实 Pi/模型和 Codex UI 验收均不包含在离线报告中。请保留这一差异，不把模拟器的 test pass 写成生产兼容证明。
+## 需要单独授权的验证
+
+真实模型请求可能计费，需要显式同意。离线 MCP 和 SDK 证明不等于已经安装到 Codex。安装后还需新建 Codex 会话检查工具发现、spawn/steer/result/ack、interrupt/respawn，以及实际使用的扩展组合。
+
+尚未证明全部第三方扩展兼容，也未把 Pi 0.85/0.86 或更新版本列为本 SDK transport 的验证目标。扩展自己创建的其他 SDK session、独立模型调用及脱离进程组的后代不受任务队列保证。

@@ -17,7 +17,8 @@ from .common import (TERMINAL, AgentError, RESIDENT_AGENT_STATES, bounded, crop,
     dumps, group_members, identifier, integer, new_id, now, text)
 from .config import load_config, launch_spec
 from .store import Store
-from .worker import RESULT_CAP, boot_worker, message_text, ownership, reap_orphan, terminate
+from .worker import (RESULT_CAP, boot_worker, message_text, ownership,
+    reap_orphan, terminate)
 
 def delegated_text(value: str, envelope: str) -> str:
     """A delegated task is data, never a Pi extension command: text that would be
@@ -84,6 +85,20 @@ class Runtime:
         if not a or a['generation'] != w.generation: return
         kind = e.get('type','unknown')
         w.last_activity = now()
+        if kind == 'agent_start':
+            # Defense against activity outside the managed SDK task queue.
+            # Refuse output immediately, then stop only this owned worker.
+            if w.run_id is None and not w.stopping and a['state'] not in {'closed','dormant'}:
+                w.tainted = 'unowned_run'
+                self.store.agent_update(a['id'],state='dormant',current_run=None)
+                self.event(w,'unowned_run_started',{'run_id':None})
+                self.spawn_task(self.stop_unowned(w))
+                self.notify()
+            return
+        if w.tainted: return
+        if kind == 'extension_error':
+            self.event(w,kind,e)
+            return
         if kind == 'message_update':
             return  # keep text deltas out of SQLite; message_end is canonical
         if kind in {'tool_execution_start','tool_execution_update','tool_execution_end'}:
@@ -127,8 +142,15 @@ class Runtime:
                 self.store.bump(a['scope']); self.notify()
             return
         if kind=='agent_end':
-            self.event(w,'agent_end',{'run_id':w.run_id})
-            if w.run_id: self.spawn_task(self.settle(w,w.run_id))
+            # One low-level run finished. Pi may still retry, compact, run
+            # before-settle work or continue with queued input afterwards, so
+            # this stays a trajectory record.
+            self.event(w,'agent_end',{'run_id':w.run_id,'willRetry':bool(e.get('willRetry'))})
+            return
+        if kind=='managed_task_end':
+            if w.run_id and e.get('runId') == w.run_id:
+                if e.get('error'): w.error=crop(str(e['error']),2000)
+                self.spawn_task(self.settle(w,w.run_id))
             return
         if kind in {'auto_retry_start','auto_retry_end','auto_compaction_start','auto_compaction_end'}:
             self.event(w,kind,e)
@@ -147,7 +169,7 @@ class Runtime:
 
     def require_worker(self,a):
         w=self.workers.get(a['id'])
-        if not w or w.closed: raise AgentError('worker_unavailable','No connected Pi worker; use respawn after checking orphan state')
+        if not w or w.closed or w.tainted: raise AgentError('worker_unavailable','No connected Pi worker; use respawn after checking orphan state')
         return w
 
     async def start_run(self,w,rid):
@@ -163,8 +185,7 @@ class Runtime:
         self.store.execute('INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?)',(receipt,w.agent['id'],rid,w.agent['scope'],r['task'],'sending',now(),now()))
         try:
             # Deliberate natural-language envelope avoids executing a slash command as a task.
-            await w.rpc('prompt',message=r['task'])
-            self.store.execute("UPDATE receipts SET state='queued',updated=? WHERE id=? AND state='sending'",(now(),receipt))
+            await w.rpc('prompt',message=r['task'],runId=rid)
         except AgentError as e:
             if e.code=='pi_rejected':
                 self.store.finish(rid,'failed','',e.message)
@@ -173,6 +194,7 @@ class Runtime:
                 self.notify()
             # Timeouts are uncertain: retain the run and wait for events rather than re-executing.
             raise
+        self.store.execute("UPDATE receipts SET state='queued',updated=? WHERE id=? AND state='sending'",(now(),receipt))
         return receipt
 
     def add_run(self,a,task,state='queued',timeout=None):
@@ -185,14 +207,11 @@ class Runtime:
     async def settle(self,w,rid):
         async with self.agent_locks[w.agent['id']]:
             if w.run_id!=rid or w.stopping: return
-            # An agent_end is a turn boundary, not process death. Check queues before completing the job.
-            try:
-                state=await w.rpc('get_state')
-                if state.get('isStreaming') or state.get('pendingMessageCount',0)>0: return
-            except AgentError:
-                return  # closed-process reconciliation handles it; never assert completion
-            self.store.finish(rid,'failed' if w.error else 'completed',w.last_text,w.error,w.usage)
-            self.event(w,'run_terminal',{'state':'failed' if w.error else 'completed'})
+            # Only the SDK transport's identity-bound task completion can enter
+            # here. Per-run Pi events and transient idle readings never settle it.
+            state='failed' if w.error else 'completed'
+            self.store.finish(rid,state,w.last_text,w.error,w.usage)
+            self.event(w,'run_terminal',{'state':state})
             w.run_id=None; w.ui.clear(); w.current_tool=None
             self.store.agent_update(w.agent['id'],state='idle',current_run=None,cleanup='not_checked')
             self.notify()
@@ -200,6 +219,21 @@ class Runtime:
             if q and not self.closing:
                 try: await self.start_run(w,q['id'])
                 except AgentError as exc: self.event(w,'start_failed',exc.as_dict())
+
+    async def stop_unowned(self,w):
+        """Terminate a worker whose host started a run no daemon run owns.
+
+        The interrupted work is not replayed and its session is kept, so the agent
+        can be respawned deliberately; what is not allowed is a live process that
+        silently continues work the caller was told had stopped.
+        """
+        async with self.agent_locks[w.agent['id']]:
+            a=self.store.one('SELECT * FROM agents WHERE id=?',(w.agent['id'],))
+            if not a or a['generation']!=w.generation or w.closed: return
+            cleanup=await terminate(self,w)
+            self.store.agent_update(a['id'],state='dormant',current_run=None,cleanup=cleanup)
+            self.event(w,'worker_stopped',{'reason':'unowned_run','cleanup':cleanup})
+            self.store.bump(a['scope']); self.notify()
 
     async def fail_worker(self,w,error):
         async with self.agent_locks[w.agent['id']]:
@@ -231,26 +265,16 @@ class Runtime:
         self.store.agent_update(a['id'],state='stopping')
         for q in self.store.all("SELECT id FROM runs WHERE agent_id=? AND state='queued'",(a['id'],)):
             self.store.finish(q['id'],'cancelled','','Cancelled by explicit interruption')
-        try:
-            for ui in list(w.ui):
-                await w.raw({'type':'extension_ui_response','id':ui,'cancelled':True})
-            await w.rpc('clear_queue')
-            await w.rpc('abort')
-            s=await w.rpc('get_state')
-            if s.get('isStreaming') or s.get('pendingMessageCount',0):
-                raise AgentError('abort_unconfirmed','Pi still reports active or queued work')
-            cleanup='not_checked'  # RPC idle does not prove detached shell descendants are gone
-            resident=True
-        except AgentError:
-            cleanup=await terminate(self,w); resident=False
+        # Terminating only this verified process group also cancels input hooks,
+        # authentication preflights and extension timers that Pi cannot abort.
+        cleanup=await terminate(self,w)
         if w.run_id:
             self.store.finish(w.run_id,terminal,w.last_text,'Explicit interruption; filesystem effects may be partial',w.usage)
             self.event(w,'run_terminal',{'state':terminal})
         w.run_id=None; w.ui.clear(); w.current_tool=None
-        self.store.agent_update(a['id'],state='idle' if resident else 'dormant',current_run=None,cleanup=cleanup)
+        self.store.agent_update(a['id'],state='dormant',current_run=None,cleanup=cleanup)
         self.store.bump(a['scope']); self.notify()
-        w.stopping=not resident
-        return {'agent_id':a['id'],'state':'idle' if resident else 'dormant','cleanup':cleanup,'process_retained':resident}
+        return {'agent_id':a['id'],'state':'dormant','cleanup':cleanup,'process_retained':False}
 
     async def dispatch(self,op,p,source=None):
         if op=='ping': return {'version':__version__,'protocol':PROTOCOL_VERSION,'pid':os.getpid()}
@@ -361,8 +385,7 @@ class Runtime:
             if op=='close':
                 w=self.workers.get(aid)
                 if w and not w.closed:
-                    await self.interrupt(a)
-                    cleanup=await terminate(self,w)
+                    cleanup=(await self.interrupt(a))['cleanup']
                 else: cleanup=await reap_orphan(self,a)
                 self.store.agent_update(aid,state='closed' if cleanup=='verified' else 'orphaned',current_run=None,cleanup=cleanup)
                 self.store.bump(sid); self.notify()
@@ -406,7 +429,10 @@ class Runtime:
                 if mode not in {'send','steer','follow_up'}: raise AgentError('invalid_argument','Invalid message mode')
                 if p.get('interrupt',False):
                     await self.interrupt(a)
-                    a=self.store.agent(sid,aid); w=self.require_worker(a); mode='send'
+                    a=self.store.agent(sid,aid)
+                    if a['cleanup']!='verified':
+                        raise AgentError('cleanup_unconfirmed','Previous worker cleanup could not be verified; inspect before respawn')
+                    w=await boot_worker(self,a); mode='send'
                 if mode=='steer':
                     if not w.run_id: raise AgentError('agent_idle','Agent is idle; use mode=send. Steering never implicitly respawns.')
                     if len(self.store.all("SELECT id FROM receipts WHERE agent_id=? AND state IN ('sending','queued')",(aid,)))>=20:
@@ -442,8 +468,9 @@ class Runtime:
             w=self.workers.get(a['id'])
             if w and not w.closed:
                 async with self.agent_locks[a['id']]:
-                    with contextlib.suppress(Exception): await self.interrupt(a)
-                    with contextlib.suppress(Exception): await terminate(self,w)
+                    try: await self.interrupt(a)
+                    except Exception:
+                        with contextlib.suppress(Exception): await terminate(self,w)
                     self.store.agent_update(a['id'],state='dormant',current_run=None)
         tasks=[t for w in self.workers.values() for t in w.tasks]+list(self.background)
         for t in tasks:

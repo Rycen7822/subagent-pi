@@ -289,17 +289,13 @@ class StdioConnection extends McpConnection {
   private proc: ChildProcess | null = null;
   private buffer = "";
   private nextId = 1;
-  private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
-  private stderrTail = "";
-  private generation = 0;
+  private pending = new Map<number, (error: Error | null, result?: unknown) => void>();
   private closed = false;
-  private stdinBroken = false;
   private era: "legacy" | "modern";
   exitError: string | null = null;
 
   constructor(private cfg: ServerCfg) {
     super();
-    this.mirrorHeaders = false;  // header mirroring is an HTTP-transport feature
     this.era = this.cfg.protocol_mode === "modern_2026_07_28" ? "modern" : "legacy";
   }
 
@@ -309,11 +305,7 @@ class StdioConnection extends McpConnection {
 
   private failPending(message: string): void {
     const err = new Error(message);
-    for (const [, entry] of this.pending) {
-      clearTimeout(entry.timer);
-      entry.reject(err);
-    }
-    this.pending.clear();
+    for (const finish of this.pending.values()) finish(err);
   }
 
   private ensureProcess(): ChildProcess {
@@ -342,8 +334,6 @@ class StdioConnection extends McpConnection {
     const env: Record<string, string> = {};
     for (const key of BASE_ENV) if (process.env[key]) env[key] = process.env[key] as string;
     Object.assign(env, this.cfg.env ?? {});
-    this.generation += 1;  // one connection = one handshake generation, ever
-    const myGeneration = this.generation;
     const child = spawn(this.cfg.command, args, {
       cwd: this.cfg.cwd || undefined,
       env,
@@ -351,30 +341,26 @@ class StdioConnection extends McpConnection {
     });
     this.proc = child;
     child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => this.onData(chunk, myGeneration));
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => {
-      this.stderrTail = (this.stderrTail + chunk).slice(-4096);
-    });
+    child.stdout?.on("data", (chunk: string) => this.onData(chunk));
+    child.stderr?.resume(); // drain without retaining server output or secrets
     // The stdin Socket can fail ASYNCHRONOUSLY (server closed its read end; the
     // next write raises EPIPE). ChildProcess 'error' does not cover this and
     // try/catch only sees synchronous failures — this handler settles pending
     // requests deterministically and marks the connection dead for reconnect.
     child.stdin?.on("error", (err: Error) => {
-      if (myGeneration !== this.generation || this.closed) return;
-      this.stdinBroken = true;
+      if (this.closed) return;
       const code = (err as NodeJS.ErrnoException).code ?? "error";
       this.exitError = this.exitError ?? `stdio transport broken: ${code}`;
       this.failPending(`stdio transport broken (${code}); the call may or may not have reached the server`);
     });
     // Spawn failures and early exits reject waiters; never an unhandled 'error' crash.
     child.on("error", (err: Error) => {
-      if (myGeneration !== this.generation || this.closed) return;
+      if (this.closed) return;
       this.exitError = `server failed to start: ${err.message.slice(0, 200)}`;
       this.failPending(this.exitError);
     });
     child.on("exit", () => {
-      if (myGeneration !== this.generation || this.closed) return; // stale process of an older generation
+      if (this.closed) return;
       this.exitError = this.exitError ?? "server process exited";
       this.failPending("stdio server exited before responding");
     });
@@ -383,14 +369,14 @@ class StdioConnection extends McpConnection {
 
   private sendFrame(frame: unknown): void {
     const child = this.ensureProcess();
-    if (this.stdinBroken || !child.stdin?.writable) {
+    if (!child.stdin?.writable) {
       throw new Error("stdio transport is broken; reconnect required");
     }
     child.stdin.write(JSON.stringify(frame) + "\n");
   }
 
-  private onData(chunk: string, generation: number): void {
-    if (generation !== this.generation) return; // stale bytes from a replaced process
+  private onData(chunk: string): void {
+    if (this.closed) return; // a replacement always gets a new connection object
     this.buffer += chunk;
     if (this.buffer.length > MAX_LINE) {
       this.buffer = "";
@@ -406,12 +392,9 @@ class StdioConnection extends McpConnection {
       try {
         const msg = JSON.parse(line) as JsonRpcResponse;
         const id = typeof msg.id === "number" ? msg.id : undefined;
-        if (id !== undefined && this.pending.has(id)) {
-          const entry = this.pending.get(id) as { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
-          this.pending.delete(id);
-          clearTimeout(entry.timer);
-          if (msg.error) entry.reject(new RpcError(msg.error.code, msg.error.message, msg.error.data));
-          else entry.resolve(msg.result);
+        const finish = id === undefined ? undefined : this.pending.get(id);
+        if (finish) {
+          finish(msg.error ? new RpcError(msg.error.code, msg.error.message, msg.error.data) : null, msg.result);
         } else if (msg.id === undefined) {
           const method = (msg as unknown as { method?: string }).method;
           if (method === "notifications/tools/list_changed") this.invalidateCatalog(); // no model wakeup
@@ -430,43 +413,31 @@ class StdioConnection extends McpConnection {
       return null;
     }
     const id = this.nextId++;
-    const promise = new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
-          reject(new Error(`${method} timed out after ${timeoutSec}s`));
-        }
-      }, timeoutSec * 1000);
-      this.pending.set(id, { resolve, reject, timer });
-    });
-    try {
-      // settle the pending entry synchronously, or the rejection would hang until timeout
-      this.sendFrame({ jsonrpc: "2.0", id, method, params: wireParams });
-    } catch (err) {
-      const entry = this.pending.get(id);
-      if (entry) { this.pending.delete(id); clearTimeout(entry.timer); }
-      throw new Error(`failed to send ${method}: ${(err as Error).message.slice(0, 200)}`);
-    }
-    const onAbort = () => {
-      const entry = this.pending.get(id);
-      if (entry) {
+    return new Promise<unknown>((resolve, reject) => {
+      // Every exit (response, timeout, cancellation, write/exit failure, close)
+      // releases the same request-owned timer, listener and pending entry.
+      const finish = (error: Error | null, result?: unknown) => {
         this.pending.delete(id);
-        clearTimeout(entry.timer);
-        entry.reject(new CancelledError(true));
+        clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", onAbort);
+        if (error) reject(error); else resolve(result);
+      };
+      const onAbort = () => {
+        if (!this.pending.has(id)) return;
+        finish(new CancelledError(true));
         try { this.sendFrame({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }); } catch { /* best-effort */ }
+      };
+      const timer = setTimeout(() => finish(new Error(`${method} timed out after ${timeoutSec}s`)), timeoutSec * 1000);
+      this.pending.set(id, finish);
+      try {
+        this.sendFrame({ jsonrpc: "2.0", id, method, params: wireParams });
+      } catch (err) {
+        finish(new Error(`failed to send ${method}: ${(err as Error).message.slice(0, 200)}`));
+        return;
       }
-    };
-    if (opts.signal) {
-      if (opts.signal.aborted) onAbort();
-      else opts.signal.addEventListener("abort", onAbort, { once: true });
-    }
-    try {
-      return await promise;
-    } finally {
-      const entry = this.pending.get(id);
-      if (entry) { this.pending.delete(id); clearTimeout(entry.timer); }
-      opts.signal?.removeEventListener("abort", onAbort);
-    }
+      if (opts.signal?.aborted) onAbort();
+      else opts.signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   async initialize(): Promise<void> {
@@ -577,7 +548,7 @@ class RpcError extends Error {
 /** HTTP-level failure carrying the parsed JSON-RPC error body, when one existed. */
 class HttpRpcError extends Error {
   constructor(public status: number, public jsonRpcCode: number | null,
-              public jsonRpcData: unknown, public bodyParsed: boolean, url: string) {
+              public jsonRpcData: unknown, url: string) {
     super(`HTTP ${status} from ${url}`);
     this.name = "HttpRpcError";
   }
@@ -599,7 +570,7 @@ class HttpConnection extends McpConnection {
   get dead(): boolean { return this.closed; }
   get reusable(): boolean { return !this.closed && !this.stale; }
 
-  private headers(method?: string, toolName?: string, httpMethod = "POST",
+  private headers(method?: string, toolName?: string,
                   paramHeaders?: Record<string, string>): Record<string, string> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -699,7 +670,7 @@ class HttpConnection extends McpConnection {
       const body = id === null ? { jsonrpc: "2.0", method, params: wireParams } : { jsonrpc: "2.0", id, method, params: wireParams };
       const response = await this.send(this.cfg.url as string, {
         method: "POST",
-        headers: this.headers(method, opts.toolName, "POST", opts.paramHeaders),
+        headers: this.headers(method, opts.toolName, opts.paramHeaders),
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -833,17 +804,15 @@ class HttpConnection extends McpConnection {
     // the protocol era and produce a precise diagnostic; it is never logged.
     const url = redactUrl(this.cfg.url ?? "");
     let body: unknown;
-    let parsed = false;
     try {
       body = await this.readBoundedJson(response, MAX_ERROR_BODY);
-      parsed = true;
     } catch { /* not JSON, or over the cap */ }
     const rpc = (body && typeof body === "object" ? (body as { error?: unknown }).error : undefined) as
       { code?: unknown; message?: unknown; data?: unknown } | undefined;
     if (rpc && typeof rpc.code === "number") {
-      return new HttpRpcError(response.status, rpc.code, rpc.data, true, url);
+      return new HttpRpcError(response.status, rpc.code, rpc.data, url);
     }
-    return new HttpRpcError(response.status, null, null, parsed, url);
+    return new HttpRpcError(response.status, null, null, url);
   }
 
   async callTool(name: string, args: unknown, timeoutSec: number, signal?: AbortSignal,
@@ -884,7 +853,7 @@ class HttpConnection extends McpConnection {
     if (this.mode === "legacy" && this.sessionId) {
       try {
         void fetch(this.cfg.url as string, {
-          method: "DELETE", headers: this.headers(undefined, undefined, "DELETE"),
+          method: "DELETE", headers: this.headers(),
           redirect: "manual",  // session termination must never leak to another origin
           signal: AbortSignal.timeout(2000),
         }).then(r => { void r.body?.cancel(); }).catch(() => { });
@@ -897,7 +866,6 @@ class HttpConnection extends McpConnection {
 export default async function (pi: ExtensionAPI) {
   const boot = readBootstrap();
   const connections = new Map<string, McpConnection>();
-  const connecting = new Map<string, Promise<McpConnection>>();
   const servers: ServerCfg[] = boot.payload?.mcp.servers ?? [];
   const access = boot.payload?.agent.access ?? "write";
 
@@ -935,32 +903,21 @@ export default async function (pi: ExtensionAPI) {
     return meta.headerPlan.entries;
   }
 
-  async function ensureConnection(cfg: ServerCfg, signal?: AbortSignal): Promise<McpConnection> {
+  async function ensureConnection(cfg: ServerCfg): Promise<McpConnection> {
     const existing = connections.get(cfg.name);
-    if (existing && existing.reusable) return existing;
-    if (existing) {
-      existing.close();
-      connections.delete(cfg.name);
-    }
-    const inflight = connecting.get(cfg.name);
-    if (inflight) return inflight;
-    const create = (async () => {
-      const conn = cfg.transport === "http" ? new HttpConnection(cfg) : new StdioConnection(cfg);
-      connections.set(cfg.name, conn);
-      try {
-        await conn.initialize();
-      } catch (err) {
-        connections.delete(cfg.name);
-        conn.close();
-        throw new Error(`server ${cfg.name} failed to initialize: ${(err as Error).message.slice(0, 300)}`);
-      }
-      return conn;
-    })();
-    connecting.set(cfg.name, create);
+    if (existing?.reusable) return existing;
+    existing?.close();
+    // Readiness initialization and tool execution are serial. Keep even an
+    // initializing connection here so shutdown can close its pending requests.
+    const conn = cfg.transport === "http" ? new HttpConnection(cfg) : new StdioConnection(cfg);
+    connections.set(cfg.name, conn);
     try {
-      return await create;
-    } finally {
-      connecting.delete(cfg.name);
+      await conn.initialize();
+      return conn;
+    } catch (err) {
+      connections.delete(cfg.name);
+      conn.close();
+      throw new Error(`server ${cfg.name} failed to initialize: ${(err as Error).message.slice(0, 300)}`);
     }
   }
 
@@ -1019,7 +976,7 @@ export default async function (pi: ExtensionAPI) {
     if (!cfg) throw new Error(`Unknown server ${serverName}; use action=list`);
     if (params.action === "list") {
       // level 2: connect THIS server on demand; visibility rules apply here, not just at call time
-      const conn = await ensureConnection(cfg, signal);
+      const conn = await ensureConnection(cfg);
       const tools = await conn.ensureTools(cfg, signal);
       // An invalid x-mcp-header annotation excludes just that tool; the server and
       // its other tools stay usable.
@@ -1038,7 +995,7 @@ export default async function (pi: ExtensionAPI) {
     if (isDenied(cfg, toolName)) {
       throw new Error(`Tool ${serverName}.${toolName} is excluded by the inherited server policy`);
     }
-    const conn = await ensureConnection(cfg, signal);
+    const conn = await ensureConnection(cfg);
     let tools = await conn.ensureTools(cfg, signal);
     let toolMeta = tools.find((t) => t.name === toolName);
     if (!toolMeta) {
@@ -1096,9 +1053,8 @@ export default async function (pi: ExtensionAPI) {
   // serialize conservatively. Enforced twice: here with an in-memory promise
   // chain (no persistent scheduler), and via Pi's executionMode below.
   let executeChain: Promise<unknown> = Promise.resolve();
-  const serializedExecute = async (id: string, params: { action: "list" | "describe" | "call"; server?: string; tool?: string; args?: Record<string, unknown> },
-                                   signal: AbortSignal, onUpdate: unknown, ctx: { ui: { confirm: (title: string, message: string) => Promise<boolean> } }) => {
-    const run = executeChain.then(() => execute(id, params, signal, onUpdate, ctx));
+  const serializedExecute: typeof execute = (...args) => {
+    const run = executeChain.then(() => execute(...args));
     executeChain = run.then(() => undefined, () => undefined);  // a cancelled first call never poisons the chain
     return run;
   };

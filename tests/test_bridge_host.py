@@ -97,10 +97,10 @@ class HostHarness:
         for proc in self.procs:
             if proc is None: continue
             proc.terminate()
-        for proc in self.procs:
-            if proc is None: continue
             try: proc.wait(5)
-            except subprocess.TimeoutExpired: proc.kill()
+            except subprocess.TimeoutExpired:
+                proc.kill(); proc.wait()
+            proc.stdout.close()
     def events(self, path):
         if not Path(path).exists(): return []
         return [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
@@ -126,8 +126,8 @@ class BridgeHostCase(unittest.TestCase):
         if shutil.which('node') is None: self.skipTest('node not available')
         self.tmp = tempfile.TemporaryDirectory(prefix=self.prefix)
         self.h = HostHarness(Path(self.tmp.name))
-        self.addCleanup(self.h.stop)
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.h.stop)
     def http_cfg(self, srv, **over):
         cfg = {'name': 'web', 'transport': 'http', 'url': srv['url'], 'headers': {},
                'bearer_token': None, 'startup_timeout_sec': 10, 'tool_timeout_sec': 5,
@@ -140,8 +140,6 @@ class BridgeHostCase(unittest.TestCase):
 
 class BridgeHostTests(BridgeHostCase):
     prefix = 'bridge-host-'
-    def read_calls(self, log):
-        return log.read_text().splitlines() if log.exists() else []
 
     # ---- happy paths ----
     def test_stdio_list_describe_call(self):
@@ -162,7 +160,7 @@ class BridgeHostTests(BridgeHostCase):
         called = next(r for r in out['results'] if r['step'] == 'call')
         self.assertIn('abcabc', called['text'])
         self.assertIn('structuredContent', called['text'])
-        self.assertIn('echo:{"count": 2, "text": "abc"}', self.read_calls(srv['log']))
+        self.assertIn('echo:{"count": 2, "text": "abc"}', self.h.calls(srv['log']))
     def test_http_json_and_sse(self):
         srv = self.h.start_http()
         cfg = {'name': 'web', 'transport': 'http', 'url': srv['url'],
@@ -191,7 +189,7 @@ class BridgeHostTests(BridgeHostCase):
         self.assertEqual(err['kind'], 'error')
         self.assertIn('timed out', err['message'])
         # Exactly one request reached the server: no retry, no duplicate.
-        self.assertEqual(len(self.read_calls(srv['log'])), 1)
+        self.assertEqual(len(self.h.calls(srv['log'])), 1)
     def test_stdio_exit_mid_call(self):
         srv = self.h.start_stdio(mode='die_after_init')
         out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
@@ -241,7 +239,7 @@ class BridgeHostTests(BridgeHostCase):
         self.assertIn('denied', by['confirm_rejected']['text'])
         self.assertEqual(by['confirm_accepted']['kind'], 'result')
         # delete_file was never sent; echo went out exactly once.
-        calls = self.read_calls(srv['log'])
+        calls = self.h.calls(srv['log'])
         self.assertNotIn('delete_file', ' '.join(calls))
         self.assertEqual([c for c in calls if c.startswith('echo:')], ['echo:{"text": "yes"}'])
     def test_confirm_all_cannot_be_reaxed_by_parent_auto(self):
@@ -254,7 +252,7 @@ class BridgeHostTests(BridgeHostCase):
         ])
         # confirm_all forces the confirmation; the host refuses -> nothing sent.
         self.assertIn('denied', out['results'][0]['text'])
-        self.assertEqual(self.read_calls(srv['log']), [])
+        self.assertEqual(self.h.calls(srv['log']), [])
     def test_allowlist_and_deny_shape_describe(self):
         srv = self.h.start_stdio(hide='status')
         cfg = stdio_cfg(server_env=srv['env'], allowed_tools=['echo'], disabled_tools=[])

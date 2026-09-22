@@ -5,6 +5,7 @@ runtime, plus the tests/CI that document it — and nothing that is local,
 generated or private. Keeping one rule prevents the two lists from drifting
 (a local-only draft once reached both the ZIP and the installed plugin).
 """
+import os
 import re
 from pathlib import Path
 
@@ -39,4 +40,11 @@ def excluded(path: Path, root: Path) -> bool:
 
 def ship_files(root: Path):
     """Every file under `root` that belongs in a release, sorted and deterministic."""
-    return [f for f in sorted(root.rglob('*')) if f.is_file() and not excluded(f, root)]
+    files = []
+    for directory, dirs, names in os.walk(root):
+        # Prune whole excluded trees before discovery, including large SDK installs.
+        dirs[:] = [name for name in dirs if name not in EXCLUDED_DIRS and not EXCLUDED_PATTERNS[1].search(name)]
+        for name in names:
+            path = Path(directory) / name
+            if path.is_file() and not excluded(path, root): files.append(path)
+    return sorted(files)

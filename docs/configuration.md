@@ -17,7 +17,7 @@ max_wait_seconds = 600
 event_max_count_per_agent = 20000
 ```
 
-`pi_command` 是 argv 数组，不经 shell。用于已有 Pi 可执行文件，也可以配置受信任的启动器。不要在这里写管道或命令拼接字符串。安装 `--pi` 仅在 config.toml 不存在时写入路径，不覆盖已有配置。
+`pi_command` 是 argv 数组，不经 shell。指向官方 Pi 可执行文件（可为符号链接）；插件据此定位 SDK，再启动自己的 Node 入口。任意 shell 启动器或原版 Pi RPC 服务不等价于 SDK transport，会在握手时拒绝。不要在这里写管道或命令拼接字符串。安装 `--pi` 仅在 config.toml 不存在时写入路径，不覆盖已有配置。
 
 ## Codex 继承（受管子代理）
 
@@ -71,7 +71,7 @@ model = "provider/model-id"
 
 加载 ambient extensions/skills 意味着个人/项目侧代码和行为会进入子进程；它可能启动额外 MCP、改变 provider、进行递归委托。需要隔离时把 `ambient_extensions`/`ambient_skills` 设为 `false`。`PI_AGENTS_MANAGED_CHILD=1` 只是协作标志，不是恶意子进程的权限屏障。
 
-profile 支持 `[profiles.NAME.env]` 的字符串环境覆盖。它们会进入当前用户私有的 launch snapshot；不要把凭据写进版本控制。常规继承的环境凭据不复制进数据库。
+profile 支持 `[profiles.NAME.env]` 的字符串环境覆盖。值在每次启动时从配置重读，launch snapshot 只记录变量名；不要把凭据写进版本控制。
 
 ## 三种时限
 

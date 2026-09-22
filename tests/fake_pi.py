@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic Pi RPC simulator. No models, credentials, network or repository edits.
+"""Deterministic managed SDK transport simulator. No models, credentials, network or repository edits.
 
 It also stands in for Pi's own skill loader (get_commands returns the registry
 built by skill_registry() from PI_TEST_AMBIENT_SKILL_DIRS plus --skill paths) and
@@ -10,6 +10,7 @@ that report so the daemon-side verification can be tested without real Pi."""
 from __future__ import annotations
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -19,10 +20,14 @@ import subprocess
 import sys
 
 p=argparse.ArgumentParser(add_help=False)
-p.add_argument('--hold-eof',action='store_true'); p.add_argument('--session'); p.add_argument('--session-dir'); p.add_argument('--mode'); p.add_argument('--no-clear',action='store_true'); p.add_argument('--ignore-abort',action='store_true')
+p.add_argument('--hold-eof',action='store_true'); p.add_argument('--session'); p.add_argument('--session-dir'); p.add_argument('--mode')
 p.add_argument('--skill',action='append'); p.add_argument('--extension',action='append'); p.add_argument('--exclude-tools'); p.add_argument('--no-extensions',action='store_true'); p.add_argument('--no-skills',action='store_true')
+p.add_argument('--handle-prompt',action='store_true')
+p.add_argument('--hold-prompt-ms',type=int,default=0)
+p.add_argument('--no-managed-protocol',action='store_true')
 a,_=p.parse_known_args()
-path=Path(a.session) if a.session else Path(a.session_dir)/'test-session.jsonl'; current=None; queue=[]; ui={}; count=0
+MARK_OUTCOME='PI_MOCK_OUTCOME'
+path=Path(a.session) if a.session else Path(a.session_dir)/'test-session.jsonl'; current=None; queue=[]; ui={}
 
 def surface_report():
     """Stand-in for extensions/managed-surface.ts: report the built-in surface the
@@ -128,41 +133,85 @@ def msg(role,body,**extra):
 def response(r,success=True,data=None,error=None):
     emit({'type':'response','id':r.get('id'),'command':r['type'],'success':success,**({'data':data} if data is not None else {}),**({'error':error} if error else {})})
 
-async def run(task):
-    global count
-    count+=1
+TASK_OPTS={'delay','settle','resume','retry','compact','dupsettled'}
+
+def parse_task(task):
+    """Parse test-only key=value| prefixes: turn/post-run delay, continuation and
+    retry counts, compaction, or duplicate managed completion."""
+    opts={}
+    while '|' in task:
+        head,tail=task.split('|',1)
+        key,sep,value=head.partition('=')
+        if not sep or key not in TASK_OPTS: break
+        opts[key]=value; task=tail
+    return task,opts
+
+async def held_prompt(r):
+    """Delay the acceptance reply to exercise uncertain mutation timeouts."""
+    global current
+    await asyncio.sleep(a.hold_prompt_ms/1000)
+    response(r); current=asyncio.create_task(run(r['message'],r['runId']))
+
+async def run(raw_task, rid):
+    task,opts=parse_task(raw_task)
+    delay=float(opts.get('delay',.1)); settle=float(opts.get('settle',0))
+    resume=int(opts.get('resume',0)); retry=int(opts.get('retry',0)); compact=bool(opts.get('compact'))
     emit({'type':'agent_start'})
     msg('user',task)
-    try:
-        if task=='CRASH': os._exit(9)
-        if task=='SPAWN_CHILD':
-            proc=subprocess.Popen(['sleep','120'])
-            emit({'type':'tool_execution_start','toolName':'bash','toolCallId':'sleep','args':{'command':'sleep 120','pid':proc.pid}})
-            await asyncio.sleep(120)
-        if task=='UI_CONFIRM':
-            f=asyncio.get_running_loop().create_future(); ui['ui-1']=f
-            emit({'type':'extension_ui_request','id':'ui-1','method':'confirm','title':'Allow this test operation?','message':'Test-only confirmation'})
-            accepted=await f; ui.pop('ui-1',None)
-            output='confirmed='+str(accepted)
-        else:
-            delay=.1
-            if task.startswith('delay='):
-                raw,task=task.split('|',1); delay=float(raw.split('=',1)[1])
-            emit({'type':'tool_execution_start','toolName':'read','toolCallId':'read-1','args':{'path':'src/example.py','sample':'界'*5000 if task=='BIG' else ''}})
-            await asyncio.sleep(delay/2)
-            if task!='NO_CONSUME':
-                while queue: msg('user',queue.pop(0))
-            emit({'type':'tool_execution_end','toolName':'read','toolCallId':'read-1','isError':False,'result':{'content':[{'type':'text','text':'sample'}]}})
-            await asyncio.sleep(delay/2)
-            if task!='NO_CONSUME':
-                while queue: msg('user',queue.pop(0))
-            else: queue.clear()
-            output=('汉字🙂\u2028\u2029'*3000) if task=='BIG' else 'Completed: '+task
+    if task=='CRASH': os._exit(9)
+    if task=='SPAWN_CHILD':
+        proc=subprocess.Popen(['sleep','120'])
+        emit({'type':'tool_execution_start','toolName':'bash','toolCallId':'sleep','args':{'command':'sleep 120','pid':proc.pid}})
+        await asyncio.sleep(120)
+    if task=='UI_CONFIRM':
+        f=asyncio.get_running_loop().create_future(); ui['ui-1']=f
+        emit({'type':'extension_ui_request','id':'ui-1','method':'confirm','title':'Allow this test operation?','message':'Test-only confirmation'})
+        accepted=await f; ui.pop('ui-1',None)
+        output='confirmed='+str(accepted)
+    else:
+        emit({'type':'tool_execution_start','toolName':'read','toolCallId':'read-1','args':{'path':'src/example.py','sample':'界'*5000 if task=='BIG' else ''}})
+        await asyncio.sleep(delay/2)
+        if task!='NO_CONSUME':
+            while queue: msg('user',queue.pop(0))
+        emit({'type':'tool_execution_end','toolName':'read','toolCallId':'read-1','isError':False,'result':{'content':[{'type':'text','text':'sample'}]}})
+        await asyncio.sleep(delay/2)
+        if task!='NO_CONSUME':
+            while queue: msg('user',queue.pop(0))
+        else: queue.clear()
+        output=('汉字🙂\u2028\u2029'*3000) if task=='BIG' else 'Completed: '+task
+    if compact:
+        # Pi compacts by itself: overflow ends the run with willRetry, the
+        # transcript is replaced, then the retried run continues.
+        msg('assistant','Context overflow; compacting before retry',stopReason='error',errorMessage='context_length_exceeded')
+        emit({'type':'agent_end','messages':[],'willRetry':True})
+        emit({'type':'auto_compaction_start','reason':'overflow'})
+        emit({'type':'auto_compaction_end','aborted':False})
+        emit({'type':'agent_start'})
         msg('assistant',output,stopReason='stop',usage={'input':100,'output':10,'totalTokens':110})
-    except asyncio.CancelledError:
-        msg('assistant','Partial work before interruption',stopReason='aborted')
-    finally:
+    elif retry:
+        # Pi retries by itself: the low-level run ends with a transient error
+        # and agent_end(willRetry), then the retry attempts run.
+        msg('assistant','Transient failure: overloaded',stopReason='error',errorMessage='overloaded')
+        emit({'type':'agent_end','messages':[],'willRetry':True})
+        emit({'type':'auto_retry_start','attempt':1,'delayMs':0,'errorMessage':'overloaded'})
+        for attempt in range(1,retry+1):
+            emit({'type':'agent_start'})
+            if attempt==retry: msg('assistant',output,stopReason='stop',usage={'input':100,'output':10,'totalTokens':110})
+            else: msg('assistant','Transient failure: overloaded',stopReason='error',errorMessage='overloaded')
+            emit({'type':'agent_end','messages':[],'willRetry':attempt<retry})
+        emit({'type':'auto_retry_end','success':True,'attempt':retry})
+    else:
+        msg('assistant',output,stopReason='stop',usage={'input':100,'output':10,'totalTokens':110})
+    emit({'type':'agent_end','messages':[]})
+    # SDK work may continue after a low-level run ends; only the final managed
+    # completion belongs to the daemon task.
+    if settle: await asyncio.sleep(settle)
+    for turn in range(1,resume+1):
+        emit({'type':'agent_start'})
+        msg('assistant',f'Continued {turn}: '+task,stopReason='stop',usage={'input':100,'output':10,'totalTokens':110})
         emit({'type':'agent_end','messages':[]})
+    emit({'type':'managed_task_end','runId':rid})
+    if opts.get('dupsettled'): emit({'type':'managed_task_end','runId':rid})
 
 async def main():
     global current
@@ -193,19 +242,20 @@ async def main():
                                'home_tag':os.environ.get('PI_TEST_HOME_TAG',''),
                                'coding_agent_dir':os.environ.get('PI_CODING_AGENT_DIR',''),
                                'cwd':os.getcwd()},f)
-            response(r,data={'sessionFile':str(path),'sessionId':'fake-session','isStreaming':bool(current and not current.done()),'pendingMessageCount':len(queue),'model':{'id':'fake','provider':'test'},'env_probe':{**{k:v for k,v in sorted(os.environ.items()) if k.startswith('PI_TEST_') and len(v)<=256},
+            state={'sessionFile':str(path),'sessionId':'fake-session','isStreaming':bool(current and not current.done()),'pendingMessageCount':len(queue),'model':{'id':'fake','provider':'test'},'env_probe':{**{k:v for k,v in sorted(os.environ.items()) if k.startswith('PI_TEST_') and len(v)<=256},
                            # Non-secret location, asserted by the agent-dir binding tests:
-                           **({'PI_CODING_AGENT_DIR':os.environ['PI_CODING_AGENT_DIR']} if os.environ.get('PI_CODING_AGENT_DIR') else {})},'path_probe':None if 'PI_TEST_PROBE_CMD' not in os.environ else {'rc':0}})
+                           **({'PI_CODING_AGENT_DIR':os.environ['PI_CODING_AGENT_DIR']} if os.environ.get('PI_CODING_AGENT_DIR') else {})},'path_probe':None if 'PI_TEST_PROBE_CMD' not in os.environ else {'rc':0}}
+            if not a.no_managed_protocol: state['subagentProtocol']=1
+            response(r,data=state)
         elif kind=='prompt':
             if current and not current.done(): response(r,False,error='Already streaming')
-            else: response(r); current=asyncio.create_task(run(r['message']))
+            elif a.handle_prompt and MARK_OUTCOME in r.get('message',''):
+                response(r)
+                emit({'type':'managed_task_end','runId':r['runId'],'error':'Pi handled the input without producing an assistant result'})
+            elif a.hold_prompt_ms:
+                current=asyncio.create_task(held_prompt(r))
+            else: response(r); current=asyncio.create_task(run(r['message'],r['runId']))
         elif kind=='steer': queue.append(r['message']); response(r)
-        elif kind=='clear_queue':
-            if a.no_clear: response(r,False,error='Unknown command: clear_queue')
-            else: old=list(queue); queue.clear(); response(r,data={'steering':old,'followUp':[]})
-        elif kind=='abort':
-            if not a.ignore_abort and current and not current.done(): current.cancel(); await current
-            response(r)
         elif kind=='get_commands':
             response(r,data={'commands':[{'name':'skill:'+n,'source':'skill','sourceInfo':{'path':p}}
                                          for n,p in sorted(SKILLS.items())]})
@@ -214,7 +264,9 @@ async def main():
             if f and not f.done(): f.set_result(r.get('confirmed',False))
         else: response(r,False,error='Unknown command')
     if a.hold_eof: await asyncio.sleep(120)
-    if current and not current.done(): current.cancel(); await current
+    if current and not current.done():
+        current.cancel()
+        with contextlib.suppress(asyncio.CancelledError): await current
     transport.close()
 
 asyncio.run(main())

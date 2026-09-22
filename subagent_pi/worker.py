@@ -1,4 +1,4 @@
-"""One managed Pi child: its JSONL RPC channel, boot handoff fds and process-group
+"""One managed Pi child: its JSONL SDK transport, boot handoff fds and process-group
 ownership. The Runtime owns state; this module owns the process-facing mechanics."""
 from __future__ import annotations
 import asyncio
@@ -48,6 +48,9 @@ class Worker:
         self.surface = None          # parsed report from extensions/managed-surface.ts
         self.surface_ready = asyncio.Event()
         self.surface_buf = b''
+        # Set when the host starts work no daemon run owns (see Runtime.stop_unowned):
+        # the worker is being stopped and none of its output may be absorbed.
+        self.tainted = None
     def start(self):
         self.tasks = [asyncio.create_task(self.read_stdout()),asyncio.create_task(self.read_stderr()),asyncio.create_task(self.watch_exit())]
     async def rpc(self, kind, timeout=None, **params):
@@ -57,9 +60,7 @@ class Worker:
         future = asyncio.get_running_loop().create_future()
         self.pending[rid] = future
         try:
-            async with self.write_lock:
-                self.proc.stdin.write((dumps({'id':rid,'type':kind,**params})+'\n').encode())
-                await self.proc.stdin.drain()
+            await self.raw({'id':rid,'type':kind,**params})
             response = await asyncio.wait_for(asyncio.shield(future),timeout or self.rt.config['rpc_timeout_seconds'])
             if not response.get('success'):
                 raise AgentError('pi_rejected',crop(str(response.get('error','Pi rejected the command')),2000),command=kind)
@@ -222,6 +223,27 @@ async def verify_surface(rt, w, timeout=SURFACE_TIMEOUT_SECONDS):
         raise AgentError('tool_surface_unapplied',
             f"Managed Pi did not apply the profile's built-in tool surface (applied={report.get('builtins','')} expected={report.get('expected','')})")
 
+def managed_command(argv):
+    """Locate the SDK beside the chosen Pi executable; never edit that install.
+
+    Explicit non-Pi commands are protocol implementations (principally the offline
+    fake in tests). Boot verifies the plugin protocol before accepting either.
+    """
+    import shutil
+    executable = Path(argv[0]).resolve()
+    for directory in list(executable.parents)[:5]:
+        manifest = directory/'package.json'
+        if not manifest.is_file(): continue
+        try: package = json.loads(manifest.read_text())
+        except (OSError, ValueError): continue
+        if package.get('name') != '@earendil-works/pi-coding-agent': continue
+        sdk = directory/'dist/index.js'
+        node = shutil.which('node')
+        if not sdk.is_file() or not node:
+            raise AgentError('sdk_unavailable','Pi SDK and Node.js are required; reinstall the official Pi package')
+        return [node,str(Path(__file__).resolve().parent.parent/'runtime/pi-sdk.mjs'),str(sdk),*argv[1:]]
+    return argv
+
 async def boot_worker(rt, a):
     """Start the guard/Pi child for one agent generation, hand it the private
     bootstrap payload, and only report success after Pi confirms the managed
@@ -251,7 +273,7 @@ async def boot_worker(rt, a):
     # the persisted launch spec and argv stay untouched.
     plan=inheritance_plan(rt,a,spec,generation)
     argv=[*argv,*plan['argv']]
-    payload={**spec,'argv':argv,'generation':generation}
+    payload={**spec,'argv':managed_command(argv),'generation':generation}
     atomic_json(directory/'launch.json',payload)
     if plan['diagnostics']:
         rt.store.event(aid,None,generation,'inheritance_diagnostics',
@@ -263,7 +285,6 @@ async def boot_worker(rt, a):
             raise AgentError('bootstrap_too_large','Inherited MCP configuration exceeds the private channel limit')
         bootstrap_r,bootstrap_w=os.pipe()
         receipt_r,receipt_w=os.pipe()
-    handed_off=False
     try:
         rt.store.agent_update(aid,state='starting',generation=generation,cleanup='pending')
         guard=Path(__file__).with_name('worker_guard.py')
@@ -289,8 +310,8 @@ async def boot_worker(rt, a):
             os.close(bootstrap_r)  # daemon keeps only the payload write end
             os.close(receipt_w)    # child keeps the receipt write end
             bootstrap_r=None; receipt_w=None
-            handed_off=True
             rt.spawn_task(write_bootstrap(rt,bootstrap_w,aid,generation,body))
+            bootstrap_w=None  # the writer task now owns and closes this end
         try:
             state=await w.rpc('get_state',timeout=rt.config['startup_timeout_seconds'])
             actual=state.get('sessionFile')
@@ -305,6 +326,9 @@ async def boot_worker(rt, a):
                 raise AgentError('session_mismatch','Pi did not select the managed session path')
             if state.get('isStreaming'):
                 raise AgentError('unexpected_activity','Pi started a model turn without an explicit task')
+            if state.get('subagentProtocol') != 1:
+                raise AgentError('unsupported_transport',
+                    'The child must use subagent-pi SDK transport; stock Pi RPC and host patches are not supported')
             if spec.get('surface'):
                 await verify_surface(rt,w)
             if plan['payload'] is not None:
@@ -335,7 +359,7 @@ async def boot_worker(rt, a):
             raise
     finally:
         close_quietly(bootstrap_r)
-        if not handed_off: close_quietly(bootstrap_w)
+        close_quietly(bootstrap_w)
         close_quietly(receipt_r)
         close_quietly(receipt_w)
 
@@ -431,6 +455,15 @@ def ownership(directory: Path, a) -> dict:
         return {'status': 'unknown', 'reason': 'A process group remains but its leaders cannot be verified; manual inspection required', 'record': record}
     return {'status': 'gone', 'reason': 'Verified leaders are dead and no process group remains', 'record': record}
 
+async def stop_group(pgid):
+    """Signal and verify a group whose ownership the caller has already proved."""
+    for sig,wait in ((signal.SIGTERM,1.5),(signal.SIGKILL,1.0)):
+        if not group_members(pgid): break
+        with contextlib.suppress(ProcessLookupError): os.killpg(pgid,sig)
+        until=time.monotonic()+wait
+        while group_members(pgid) and time.monotonic()<until: await asyncio.sleep(.025)
+    return 'unknown' if group_members(pgid) else 'verified'
+
 async def terminate(rt, w):
     w.stopping=True
     pgid=w.proc.pid
@@ -440,14 +473,7 @@ async def terminate(rt, w):
     if not owned and group_members(pgid):
         rt.store.agent_update(w.agent['id'],cleanup='unknown')
         return 'unknown'
-    # a live process created by this daemon; ownership is never inferred from a bare PID
-    for sig,wait in ((signal.SIGTERM,1.5),(signal.SIGKILL,1.0)):
-        members=group_members(pgid)
-        if not members: break
-        with contextlib.suppress(ProcessLookupError): os.killpg(pgid,sig)
-        until=time.monotonic()+wait
-        while group_members(pgid) and time.monotonic()<until: await asyncio.sleep(.025)
-    cleanup='unknown' if group_members(pgid) else 'verified'
+    cleanup=await stop_group(pgid)
     w.closed=True
     with contextlib.suppress(asyncio.TimeoutError): await asyncio.wait_for(w.proc.wait(),2)
     rt.store.agent_update(w.agent['id'],cleanup=cleanup)
@@ -460,8 +486,4 @@ async def reap_orphan(rt, a):
         raise AgentError('ownership_unknown',verdict['reason'])
     pgid=verdict['record'].get('guard_pid')
     if not pgid: raise AgentError('ownership_unknown','No verified process group')
-    for sig,delay in ((signal.SIGTERM,1.5),(signal.SIGKILL,1.0)):
-        with contextlib.suppress(ProcessLookupError): os.killpg(pgid,sig)
-        until=time.monotonic()+delay
-        while group_members(pgid) and time.monotonic()<until: await asyncio.sleep(.03)
-    return 'unknown' if group_members(pgid) else 'verified'
+    return await stop_group(pgid)

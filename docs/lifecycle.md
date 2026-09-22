@@ -2,62 +2,46 @@
 
 ## 身份与状态
 
-scope 是父任务集合；agent_id 是长期逻辑身份；run_id 是一项委托任务；generation 是一次 Pi 进程实例；request_id 是控制操作的幂等身份。
+scope 是父任务集合；agent_id 是长期身份；run_id 是一项委托任务；generation 是一次受管子进程；request_id 是控制操作的幂等身份。MCP 与 CLI 使用同一份账本。
 
-agent 状态包括 starting、running、needs_input、idle、stopping、dormant、closed、orphaned、crashed。run 状态包括 queued、starting、running、needs_input、completed、failed、interrupted、crashed、cancelled、timed_out。completed 仅表示这轮执行正常结束，不证明任务答案正确、测试通过或可以发布。
+agent 状态包括 starting、running、needs_input、idle、stopping、dormant、closed、orphaned、crashed。run 状态包括 queued、starting、running、needs_input、completed、failed、interrupted、crashed、cancelled、timed_out。completed 表示执行正常结束，不证明答案正确或可以发布。
+
+## 完成边界
+
+插件的 SDK 子进程拥有任务内输入队列。一个 run 可以包含多次 SDK prompt，以及 Pi 自己在 prompt 内完成的工具调用、重试、自动压缩和 before-settle 续跑。插件逐项 await SDK 调用，队列排空才发出携带 run_id 的 `managed_task_end`；Pi 的 `agent_end` / `agent_settled` 只描述宿主活动，不能结算任务。
+
+扩展的 `pi.sendUserMessage` 及会触发执行的 `pi.sendMessage` 接入该队列；SDK 的公开 ExtensionRuntime action bindings 仅在受管子进程内绑定，未修改 AgentSession、原型或安装文件。输入按接受顺序串行执行，包含 input hook、认证及 before_agent_start，所以不会出现并发预处理抢占底层 run。每次用户消息续跑走完整 SDK prompt 路径，重新应用当前扩展的提示与工具规则；custom message 续跑沿用 SDK 的 sendCustomMessage 语义。
+
+每条任务链用 AsyncLocalStorage 保留归属。任务结束后的异步输入会被拒绝并记录诊断，不能混入后继任务；没有活动任务时扩展不能自动启动模型任务。扩展自己创建其他 SDK session 或独立进程不受此队列管理，扩展仍是受信任的代码，插件不是沙箱。
+
+主输入被 handled 且整条任务没有 assistant 结果时记为 failed，并继续排队的后继任务。SDK 异常同样产生明确终态。消息被接受不等于已经执行；正常完成不依赖 sleep、空闲轮询或 deadline。
+
+daemon 结算时校验 generation、run_id 和 stopping，终态幂等。迟到/重复完成不能结束另一个 run。结果包括该任务链的最后 assistant 文本和累计 usage，读取不确认结果，ack 必须绑定精确 SHA-256。
 
 ## Spawn
 
-`pi_context` 先建立明确的 workspace 根；`pi_spawn_agent` 的 cwd 必须是该根或其子目录，并且是绝对路径。新 agent 使用 Pi 的 `--session-dir` 建立独立会话；运行时读取 `get_state.sessionFile` 作为后续恢复路径。成功返回后任务在 daemon 中继续，不需要保持 MCP/CLI 调用打开。
+`pi_context` 建立 workspace 根；spawn 的 cwd 必须是其自身或子目录的绝对路径。guard 启动插件自己的 Node SDK 入口，它加载所选 Pi 安装旁的 SDK。SessionManager 创建独立持久会话，后续恢复沿用同一路径。
 
-默认最多 4 个 resident agent，每个 scope 最多 16 个历史逻辑 agent。满额时明确报错，不静默抢占；关闭 idle agent 释放进程槽位，新的任务集合可以新建 scope。writer 在驻留期间独占同一或嵌套 cwd，跨 scope 也检查；parent Codex 不受此锁约束。
+默认最多 4 个 resident agent，每个 scope 最多 16 个历史 agent。writer 独占同一或嵌套 cwd，跨 scope 检查；parent Codex 不受此锁约束。
 
-## Steering
+## Steering 与 follow-up
 
-`pi_send_input(mode="steer")` 仅用于活动 agent。返回 queued 只代表 Pi 接受，不代表已消费。通过后续 user message_end 事件的文本 FIFO 匹配观察 consumed。匹配证据不是 Pi 提供的端到端唯一消息 ID，不是“模型理解了或服从了”的证明。
+`mode="steer"` 仅用于活动任务：输入加入插件队列，等当前 SDK 调用结束后作为同一 run 的续跑执行。它不再插入正在进行的 Pi 工具循环。不同扩展输入和外部 steer 统一按接受顺序消费；不模拟 Pi 交互式 steer 的抢先优先级。普通 Pi 的行为不变。
 
-若任务先结束，未消费消息标为 not_consumed；断线或响应不确定可能标为 unknown。相关状态可从 inspect 的 receipts 读取。相同文本的重复消息依接收先后匹配；不能依据文本匹配建立安全授权保证。
+queued 仅表示接受。consumed 来自 user message_end 的文本 FIFO 匹配，不证明模型理解或服从。未消费输入在任务终态标为 not_consumed；响应不确定可为 unknown，禁止自动重发。idle steer 返回 agent_idle，不隐式启动或恢复。
 
-idle agent 的 steer 返回 agent_idle，不隐式开始新 turn，更不会隐式 respawn。steer 不打断已经执行中的工具，也不撤销文件修改。
-
-## Send 与 follow-up
-
-`mode="send"` 在 idle agent 上创建一个新 run，沿用同一个 Pi session。
-
-`mode="follow_up"` 在 daemon 中创建 durable queued run。当前 run 完成后顺序发送下一项 prompt。刻意不用 Pi 原生 follow_up 来承载不同 run，以免把多项结果混入一个难以区分的 agent_end 边界。
-
-该队列在 broker 重启后不盲目重放：未执行条目标为 cancelled，运行中条目标为 crashed，并保留结果/恢复线索。用户显式决定下一步。steer/队列上限为 20，超出明确拒绝。
+`mode="follow_up"` 由 daemon 持久排队，每项有独立 run_id，前一个任务及其续跑全部结束后才开始。`mode="send"` 只用于 idle agent。
 
 ## Interrupt
 
-先取消 daemon follow-up 队列，再清 Pi steering/follow-up 队列，取消 pending UI 请求，发送 abort，并确认 Pi 已空闲。
+interrupt 取消 daemon 排队任务，并终止、核验插件自己拥有的进程组。这也停止输入 hook、认证预处理和扩展计时器；不会靠 Pi 的瞬时 idle 声称停止成功。返回 `process_retained=false`、state=dormant，cleanup 如实报告 verified/unknown。不会向普通 Pi 会话发信号。
 
-如果 clear_queue 不支持、abort 超时或仍有活动状态，退回终止受管理进程组。返回 process_retained 和 cleanup。`cleanup=not_checked` 表示 RPC 已空闲，但不声称所有子进程都已消失。
-
-`pi_send_input(interrupt=true, message=...)` 是 interrupt 后开始一项新 run；若中断降级为关闭 Pi 进程，则返回 worker_unavailable，需要显式 respawn，不隐藏重启行为。
+session 和结果保留；单独 interrupt 后需显式 respawn。`pi_send_input(interrupt=true, message=...)` 明确要求替换工作：只有旧进程清理 verified 后才启动新 generation 执行该新消息，不重放旧任务。清理无法确认则拒绝替换。
 
 ## Close 与 respawn
 
-close 终止受管理进程组，先 TERM 再 KILL 并检查；保留 session 和所有结果。若无法确认清理，状态保持 orphaned/unknown，不自动恢复。
+close 先 TERM 再 KILL 并核验受管进程组，保留会话和结果。无法确认归属/清理时阻止恢复，不对猜测 PID 发信号。
 
-respawn 仅在旧 writer 不再活动、session 存在时工作；agent_id 不变、generation 增加。可附加新的 message；不附加时只恢复为 idle。不会重放旧 shell 命令、自动扩大权限或自动换模型。
+respawn 要求旧 writer 已消失且会话存在；agent_id 不变、generation 增加。可附加新消息，不附加则恢复为 idle。CLI resume 是其别名。已存活的 idle agent 使用 send。
 
-CLI 的 resume 是 respawn 的别名，适用于 dormant/closed/crashed 的 agent。仍然存活的 idle agent 应用 send，而不是 resume。
-
-## Wait
-
-wait 可指定精确 run_ids，也可省略以捕获当时的未确认任务集合。默认 any；all 等待所有选中 run 成为终态，遇到 needs_input 则立即返回。
-
-默认 25 秒，支持显式更长等待，但须小于宿主 MCP 工具超时。取消 wait 仅取消订阅等待，不发送 abort；stdout 活动、读文件、工具进度不会让 wait 返回。
-
-未确认的已完成任务会令 wait 立即返回，这是防遗漏设计。处理并确认它们后，再等新任务。不要反复等待同一个已完成但未确认的 run。
-
-## Result acknowledgement
-
-result 按 UTF-8 字节分页；next_offset 是下一页合法起点，hash 对应完整保存文件。阅读不改变 ack。完成处理或显式放弃结果后，通过 run_id + result_sha256 确认。ack 不删除文件。
-
-确认错误 hash 会被拒绝，active run 不能确认。所有终态包括失败和取消也要纳入未处理任务集合。原始 Pi session 保留完整上下文；给模型的轨迹按上限展示，不包含 raw thinking。
-
-## Needs input
-
-select/input/editor 需要文本回答，confirm 需要布尔值。pi_answer_agent 仅对当前待处理的 UI request ID 生效，不自动批准。只支持上述 Pi RPC 对话框交互，不模拟 TUI 组件或任意终端交互。
+受管会话不允许扩展切换、fork、reload 或导航到其他 session；关闭/恢复是唯一替换入口。Pi 配置、技能、provider、工具和普通生命周期扩展仍加载，TUI 专用界面按 headless 模式处理。

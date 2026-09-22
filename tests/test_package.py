@@ -1,5 +1,7 @@
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,10 +48,16 @@ class PackageTests(unittest.TestCase):
             self.assertTrue(Path(server['command']).is_absolute())
             self.assertEqual(server['args'][0],str(plugin/'bin/subagent-pi'))
             self.assertEqual(server['env']['PI_AGENTS_HOME'],str(home))
+            self.assertFalse((plugin/'hooks').exists())
+            from scripts.ship_manifest import ship_files
+            shipped={f.relative_to(ROOT) for f in ship_files(ROOT)}
+            installed={f.relative_to(plugin) for f in plugin.rglob('*') if f.is_file()}
+            self.assertEqual(installed,shipped)
+            self.assertFalse((plugin/'node_modules').exists())
+            self.assertFalse((plugin/'.work').exists())
             version=subprocess.run([sys.executable,str(bins/'subagent-pi'),'--version'],capture_output=True,text=True)
             self.assertEqual(version.returncode,0,version.stderr)
             self.assertEqual(version.stdout.strip(),__version__)
-            self.assertFalse((plugin/'hooks').exists())
             r2=subprocess.run(cmd,capture_output=True,text=True,timeout=20)
             self.assertNotEqual(r2.returncode,0)
             self.assertIn('Already installed',r2.stderr)
@@ -85,7 +93,7 @@ class ShipManifest(unittest.TestCase):
     def test_runtime_files_are_included(self):
         m=self.ship()
         for needed in ['subagent_pi/runtime.py','subagent_pi/worker.py','subagent_pi/views.py',
-                       'subagent_pi/binding.py','bin/subagent-pi','extensions/codex-mcp-bridge.ts',
+                       'subagent_pi/binding.py','runtime/pi-sdk.mjs','runtime/task-queue.mjs','bin/subagent-pi','extensions/codex-mcp-bridge.ts',
                        'plugin.json','docs/architecture.md','skills/pi-subagents/SKILL.md',
                        '.github/workflows/ci.yml','scripts/ship_manifest.py']:
             self.assertFalse(m.excluded(ROOT/needed,ROOT),f'{needed} would be missing')
@@ -94,11 +102,6 @@ class ShipManifest(unittest.TestCase):
         files=m.ship_files(ROOT)
         self.assertEqual(files,sorted(files))
         self.assertEqual(len(files),len(set(files)))
-    def test_package_and_install_share_one_rule(self):
-        package=(ROOT/'scripts/package.py').read_text()
-        install=(ROOT/'scripts/install.py').read_text()
-        self.assertIn('ship_files',package)
-        self.assertIn('excluded',install)
 
 class RuntimeModuleBoundaries(unittest.TestCase):
     """runtime.py orchestrates state; the process, binding and projection mechanics
@@ -119,4 +122,68 @@ class RuntimeModuleBoundaries(unittest.TestCase):
         src=(ROOT/'subagent_pi/worker.py').read_text()
         self.assertIn('from .binding import child_env, inheritance_plan',src)
 
-if __name__=='__main__': unittest.main()
+class DevSetupStaging(unittest.TestCase):
+    """scripts/dev-setup.mjs runs on every npm install/setup and stages Pi's type
+    declarations for typecheck. It must survive its own previous output and must
+    never delete a directory a symlink points at."""
+    def setUp(self):
+        if not shutil.which('node'): raise unittest.SkipTest('node not available')
+        self.tmp=tempfile.TemporaryDirectory(prefix='dev-setup-'); self.root=Path(self.tmp.name)
+        self.pi=self.root/'lib/node_modules/pi-coding-agent'
+        (self.pi/'dist').mkdir(parents=True)
+        (self.pi/'dist/index.d.ts').write_text('export declare const version: string;\n')
+        cli=self.pi/'dist/cli.js'; cli.write_text('#!/usr/bin/env node\n'); cli.chmod(0o755)
+        (self.pi/'node_modules/typebox').mkdir(parents=True)
+        (self.pi/'node_modules/typebox/index.d.ts').write_text('export type T = 1;\n')
+        (self.pi/'node_modules/@types/node').mkdir(parents=True)
+        (self.pi/'node_modules/@types/node/index.d.ts').write_text('declare const nodeMarker: 1;\n')
+        self.bin=self.root/'bin'; self.bin.mkdir()
+        (self.bin/'pi').symlink_to(cli)          # the executable symlink must resolve into the dist tree
+        self.cwd=self.root/'project'; (self.cwd/'node_modules/@types').mkdir(parents=True)
+    def tearDown(self): self.tmp.cleanup()
+    def setup_script(self):
+        env={**os.environ,'PATH':str(self.bin)+os.pathsep+os.environ.get('PATH','')}
+        return subprocess.run(['node',str(ROOT/'scripts/dev-setup.mjs')],cwd=self.cwd,env=env,
+            capture_output=True,text=True,timeout=120)
+    def test_repeated_runs_replace_stale_directories_and_refresh_types(self):
+        first=self.setup_script()
+        self.assertEqual(first.returncode,0,first.stderr)
+        staged=self.cwd/'node_modules/@types/node/index.d.ts'
+        self.assertTrue(staged.is_file())
+        (self.pi/'dist/index.d.ts').write_text('export declare const version: "refreshed";\n')
+        second=self.setup_script()
+        self.assertEqual(second.returncode,0,second.stderr)
+        self.assertIn('refreshed',(self.cwd/'node_modules/pi-host/dist/index.d.ts').read_text())
+        self.assertTrue((self.cwd/'node_modules/pi-host/node_modules/typebox/index.d.ts').is_file())
+        self.assertIn('staged Pi types from',second.stdout)
+    def test_symlinked_targets_are_unlinked_not_deleted(self):
+        outside=self.root/'outside'; (outside/'keep').mkdir(parents=True)
+        (outside/'keep/data.txt').write_text('must survive\n')
+        (self.cwd/'node_modules/@types/node').symlink_to(outside)
+        (self.cwd/'node_modules/pi-host').symlink_to(outside)
+        for run in range(2):
+            done=self.setup_script()
+            self.assertEqual(done.returncode,0,f'run {run+1}: {done.stderr}')
+        self.assertTrue((outside/'keep/data.txt').is_file(),'setup deleted the directory a symlink pointed at')
+        self.assertFalse((self.cwd/'node_modules/@types/node').is_symlink())
+        self.assertTrue((self.cwd/'node_modules/@types/node/index.d.ts').is_file())
+
+
+class SdkTransport(unittest.TestCase):
+    def test_task_ownership_contract(self):
+        if not shutil.which('node'): self.skipTest('Node.js not installed')
+        done=subprocess.run(['node','--test',str(ROOT/'tests/task-queue.test.mjs')],capture_output=True,text=True)
+        self.assertEqual(done.returncode,0,done.stdout+done.stderr)
+
+    def test_stock_pi_command_resolves_only_to_plugin_files(self):
+        from subagent_pi.worker import managed_command
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); (root/'dist/bundle').mkdir(parents=True)
+            manifest=root/'package.json'; manifest.write_text('{"name":"@earendil-works/pi-coding-agent"}')
+            cli=root/'dist/bundle/cli.js'; cli.write_text('unchanged cli')
+            sdk=root/'dist/index.js'; sdk.write_text('unchanged sdk')
+            before={p:p.read_bytes() for p in (manifest,cli,sdk)}
+            with patch('shutil.which',return_value='/usr/bin/node'):
+                argv=managed_command([str(cli),'--mode','rpc'])
+            self.assertEqual(argv[1:],[str(ROOT/'runtime/pi-sdk.mjs'),str(sdk),'--mode','rpc'])
+            self.assertEqual({p:p.read_bytes() for p in before},before)

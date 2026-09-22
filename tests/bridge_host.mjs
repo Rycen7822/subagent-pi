@@ -10,10 +10,9 @@
  * actions.json = [{action,server,tool,args,confirm,abortAfterMs,closeAfterMs,
  *                  launch,awaitPending,name}]
  */
-import { openSync, readFileSync, writeSync, mkdtempSync, existsSync } from 'node:fs';
+import { openSync, readFileSync, writeFileSync, realpathSync, existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { execSync } from 'node:child_process';
 
 // Locate the installed Pi distribution (only used as a fallback for jiti/
@@ -22,7 +21,7 @@ function findPiDir() {
   if (process.env.PI_CODING_AGENT_DIR) return process.env.PI_CODING_AGENT_DIR;
   try {
     const exe = execSync('command -v pi', { shell: '/bin/bash' }).toString().trim();
-    const real = execSync(`readlink -f ${exe}`).toString().trim();
+    const real = realpathSync(exe);
     const parts = real.split('/');
     for (let i = parts.length; i >= 1; i--) {
       const parent = parts.slice(0, i).join('/');
@@ -41,18 +40,14 @@ catch { jitiEntry = join(PI_DIR, 'node_modules', 'jiti', 'lib', 'jiti.mjs'); }
 const { createJiti } = require_(jitiEntry);
 
 const [payloadPath, actionsPath, resultPath] = process.argv.slice(2);
-const payload = JSON.parse(readFileSync(payloadPath, 'utf8'));
 const actions = JSON.parse(readFileSync(actionsPath, 'utf8'));
 
 // The bridge reads PI_AGENTS_BOOTSTRAP_FD to EOF, so a regular read-only fd of
 // the payload file exercises the identical read/parse path. Receipt fd is a
 // temp file the bridge writes and closes.
-const dir = mkdtempSync(join(tmpdir(), 'bridge-host-'));
-const payloadFile = join(dir, 'payload.json');
-writeSync(openSync(payloadFile, 'w'), JSON.stringify(payload));
-const bootstrapFd = openSync(payloadFile, 'r');
-const receiptPath = join(dir, 'receipt.json');
-const receiptFd = openSync(receiptPath, 'wx', 0o600);
+const bootstrapFd = openSync(payloadPath, 'r');
+const receiptPath = join(dirname(resultPath), 'receipt.json');
+const receiptFd = openSync(receiptPath, 'w', 0o600);
 process.env.PI_AGENTS_BOOTSTRAP_FD = String(bootstrapFd);
 process.env.PI_AGENTS_BRIDGE_RECEIPT_FD = String(receiptFd);
 
@@ -109,7 +104,7 @@ for (const step of actions) {
 }
 await Promise.allSettled(launched.splice(0)); // never leave a step unsettled
 
-writeSync(openSync(resultPath, 'w'), JSON.stringify({
+writeFileSync(resultPath, JSON.stringify({
   registered: registered ? { name: registered.name, parameters: registered.parameters, executionMode: registered.executionMode } : null,
   receipt,
   confirm_count: confirmCount,

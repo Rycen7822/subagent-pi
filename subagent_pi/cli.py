@@ -62,13 +62,13 @@ def split_codex_cwd(tail):
     """Read-only scan for Codex's -C/--cd (also --cd=DIR / -CDIR) before the first
     `--`; last occurrence wins. Arguments are returned VERBATIM: Codex applies the
     chdir itself, so stripping the flag would leave it in the wrong project."""
-    cwd=None; after_dd=False; i=0
+    cwd=None; i=0
     while i<len(tail):
         a=tail[i]
-        if not after_dd and a=='--': after_dd=True; i+=1; continue
-        if not after_dd and a in ('-C','--cd') and i+1<len(tail): cwd=tail[i+1]; i+=2; continue
-        if not after_dd and a.startswith('--cd='): cwd=a[5:]; i+=1; continue
-        if not after_dd and a.startswith('-C') and len(a)>2: cwd=a[2:]; i+=1; continue
+        if a=='--': break
+        if a in ('-C','--cd') and i+1<len(tail): cwd=tail[i+1]; i+=2; continue
+        if a.startswith('--cd='): cwd=a[5:]; i+=1; continue
+        if a.startswith('-C') and len(a)>2: cwd=a[2:]; i+=1; continue
         i+=1
     return cwd,list(tail)
 

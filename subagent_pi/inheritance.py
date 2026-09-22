@@ -150,7 +150,7 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
     name conflicts, honor disabled entries."""
     diagnostics: list[Diagnostic] = []
     selected: list[str] = []
-    by_real: dict[Path, str] = {}
+    by_real: set[Path] = set()
     by_name: dict[str, str] = {}
     plugin_root = Path(__file__).resolve().parent.parent
     disabled = _disabled_skill_paths(codex_home, raw)
@@ -158,24 +158,24 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
     for raw_path in existing_skill_paths:
         selected.append(raw_path)
         real = Path(raw_path).resolve()
-        by_real[real] = raw_path
+        by_real.add(real)
         name = _skill_name(real / 'SKILL.md') if real.is_dir() else None
         if name:
             by_name.setdefault(name, raw_path)
 
-    sources: list[tuple[str, Path]] = []
+    sources: list[Path] = []
     if project_cwd:
         agents = Path(project_cwd) / '.agents' / 'skills'
         if agents.is_dir():
-            sources.append(('project', agents))
+            sources.append(agents)
     codex_skills = codex_home / 'skills'
     if codex_skills.is_dir():
-        sources.append(('codex_global', codex_skills))
+        sources.append(codex_skills)
     else:
         diagnostics.append(Diagnostic('skills', codex_home / 'skills', 'codex global skills directory not present; treated as empty'))
 
     count = 0
-    for source, directory in sources:
+    for directory in sources:
         try:
             entries = sorted(p for p in directory.iterdir() if not p.name.startswith('.'))
         except OSError as exc:
@@ -210,7 +210,7 @@ def collect_skills(codex_home: Path, raw: dict, project_cwd: str | None,
                 diagnostics.append(Diagnostic('skills', label, 'skill limit exceeded; remaining codex skills skipped'))
                 continue
             selected.append(str(real))
-            by_real[real] = str(real)
+            by_real.add(real)
             if name:
                 by_name[name] = str(real)
             count += 1
@@ -270,23 +270,14 @@ def _tool_policy(server: dict, name: str) -> tuple[dict, list[Diagnostic]]:
     return {'default': default, 'tools': tools, 'denied': sorted(denied), 'budgets': budgets}, diagnostics
 
 
-def _num_field(server: dict, key: str, default: float, maximum: float = 3600) -> tuple[float, list[Diagnostic]]:
-    """Floating-point seconds: current Codex accepts 0.5/1.5-style timeout values."""
+def _num_field(server: dict, key: str, default: float, maximum: float = 3600,
+               *, integral: bool = False) -> tuple[float, list[Diagnostic]]:
+    """Seconds accept fractions; the legacy millisecond field accepts integers."""
     value = server.get(key, default)
-    diagnostics: list[Diagnostic] = []
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0 or value > maximum:
-        diagnostics.append(Diagnostic('mcp', server.get('name', '?'), f'invalid {key}; using default'))
-        return default, diagnostics
-    return value, diagnostics
-
-
-def _int_field(server: dict, key: str, default: int, maximum: int = 3600) -> tuple[int, list[Diagnostic]]:
-    value = server.get(key, default)
-    diagnostics: list[Diagnostic] = []
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0 or value > maximum:
-        diagnostics.append(Diagnostic('mcp', server.get('name', '?'), f'invalid {key}; using default'))
-        return default, diagnostics
-    return value, diagnostics
+    valid_type = isinstance(value, int) if integral else isinstance(value, (int, float))
+    if isinstance(value, bool) or not valid_type or value <= 0 or value > maximum:
+        return default, [Diagnostic('mcp', server.get('name', '?'), f'invalid {key}; using default')]
+    return value, []
 
 
 def _resolve_self_paths(command: str, args: list[str], cwd: str | None,
@@ -410,7 +401,7 @@ def parse_mcp_servers(codex_home: Path, raw: dict, protocol_mode: str = 'auto') 
                                                   'startup_timeout_ms ignored: startup_timeout_sec takes precedence (Codex semantics)'))
                 diagnostics.extend(tdiag)
             else:
-                ms, mdiag = _int_field(server, 'startup_timeout_ms', 10000, maximum=3600000)
+                ms, mdiag = _num_field(server, 'startup_timeout_ms', 10000, maximum=3600000, integral=True)
                 entry['startup_timeout_sec'] = ms / 1000
                 diagnostics.extend(mdiag)
             tool_timeout, ttdiag = _num_field(server, 'tool_timeout_sec', 60)
@@ -502,8 +493,7 @@ def resolve_environment(servers: list[dict], env_snapshot: dict) -> tuple[list[d
         if server.get('disposition') != 'ok':
             continue
         problems: list[str] = []
-        out = {k: v for k, v in server.items() if k not in SERVER_RESOLVED_KEYS}
-        out['env'] = dict(server.get('static_env', {}))
+        out = {'env': dict(server.get('static_env', {}))}
         if server['transport'] == 'stdio':
             for var in server.get('env_var_names', []):
                 value = env_snapshot.get(var)

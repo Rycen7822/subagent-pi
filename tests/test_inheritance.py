@@ -22,7 +22,7 @@ sys.path.insert(0,str(ROOT))
 from subagent_pi.common import AgentError, dumps, socket_path
 from subagent_pi.config import PI_BUILTIN_TOOLS, load_config, launch_spec
 from subagent_pi.inheritance import (CODEX_MCP_BASELINE, capture_scope_env, collect_skills, parse_mcp_servers,
-    pi_skill_name, policy_filter, read_codex_config, referenced_env_names, resolve_codex_home, resolve_environment)
+    policy_filter, referenced_env_names, resolve_codex_home, resolve_environment)
 from subagent_pi.runtime import Runtime
 from subagent_pi.store import SCHEMA_VERSION, Store
 from subagent_pi.worker import write_bootstrap
@@ -187,12 +187,14 @@ startup_timeout_sec = 7
 tool_timeout_sec = 33
 default_tools_approval_mode = "auto"
 '''
-class McpParsing(unittest.TestCase):
+class McpParsingCase(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(prefix='inh-mcp-'); self.base=Path(self.tmp.name)
         self.home=make_codex_home(self.base)
     def tearDown(self): self.tmp.cleanup()
     def parse(self,config): return parse_mcp_servers(self.home,tomllib.loads(config))
+
+class McpParsing(McpParsingCase):
     def test_stdio_modern_opt_in_selects_modern_and_strips_marker(self):
         config='''
 [mcp_servers.a]
@@ -1487,7 +1489,7 @@ if __name__=='__main__':
     unittest.main()
 
 
-class CodexConfigCompatTests(McpParsing):
+class CodexConfigCompatTests(McpParsingCase):
     """P1-B: every current Codex RawMcpServerConfig field lands in exactly one
     compatibility class; unknown fields still fail closed."""
     def test_field_classification_matrix(self):

@@ -14,7 +14,7 @@ import tempfile
 SOURCE=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(SOURCE))
 sys.path.insert(0,str(SOURCE/'scripts'))
-from ship_manifest import excluded
+from ship_manifest import ship_files
 from subagent_pi import __version__
 from subagent_pi.common import atomic_json, atomic_write, state_home
 
@@ -37,12 +37,11 @@ def install(args):
     (destination/'plugins').mkdir(exist_ok=True)
     stage=Path(tempfile.mkdtemp(prefix='.subagent-pi-stage-',dir=destination))
     try:
-        # Exact same ship-file rule as scripts/package.py: the installed plugin and
-        # the ZIP must never diverge on what is local, generated or private.
-        def ignore(directory,names):
-            base=Path(directory)
-            return {n for n in names if excluded(base/n,SOURCE)}
-        shutil.copytree(SOURCE,stage/'payload',ignore=ignore,dirs_exist_ok=False)
+        # Install the exact release file set; never traverse private/cache trees.
+        for source in ship_files(SOURCE):
+            target = stage/'payload'/source.relative_to(SOURCE)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
         entry=str(plugin/'bin/subagent-pi')
         # Resolve paths at install time. Do not depend on undocumented plugin-root substitutions or host cwd.
         server={'command':str(Path(sys.executable).resolve()),'args':[entry,'mcp'],'env':{'PI_AGENTS_HOME':str(home)}}

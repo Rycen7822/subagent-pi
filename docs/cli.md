@@ -64,7 +64,7 @@ subagent-pi answer AGENT_ID UI_REQUEST_ID --scope ID --answer TEXT_OR_TRUE_FALSE
   [--request-id KEY]
 ```
 
-resume 为 respawn 别名；live idle agent 使用 send。close 保留 session；daemon stop --force 会影响所有 scope 的 resident agents，而非当前 scope。
+interrupt 停止并核验子进程，保留 session；再次使用需 respawn。interrupt+message 显式替换为新进程。resume 为 respawn 别名；live idle agent 使用 send。close 保留 session；daemon stop --force 会影响所有 scope 的 resident agents，而非当前 scope。
 
 ## Runtime / docs
 

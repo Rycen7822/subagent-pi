@@ -3,9 +3,10 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
-import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -14,7 +15,11 @@ sys.path.insert(0,str(ROOT))
 from subagent_pi.client import request
 from subagent_pi.common import AgentError, socket_path
 
-class TransportTests(unittest.IsolatedAsyncioTestCase):
+class McpHarness:
+    """MCP stdio boundary over a real daemon, shared by the fake-Pi IPC tests and
+    the real-Pi lifecycle tests (which replace pi_command, HOME and the agent dir
+    themselves, then run the daemon at the same protocol boundary)."""
+    READ_TIMEOUT=8
     async def asyncSetUp(self):
         self.tmp=tempfile.TemporaryDirectory(prefix='subagent-pi-ipc-')
         self.root=Path(self.tmp.name); self.home=self.root/'state'; self.home.mkdir()
@@ -43,7 +48,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def send(self,method,params=None,rid=None):
         self.reqid+=1; rid=rid or self.reqid
         self.mcp.stdin.write((json.dumps({'jsonrpc':'2.0','id':rid,'method':method,'params':params or {}})+'\n').encode()); await self.mcp.stdin.drain(); return rid
-    async def receive(self): return json.loads(await asyncio.wait_for(self.mcp.stdout.readline(),8))
+    async def receive(self): return json.loads(await asyncio.wait_for(self.mcp.stdout.readline(),self.READ_TIMEOUT))
     async def rpc(self,method,params=None):
         rid=await self.send(method,params); value=await self.receive(); self.assertEqual(value['id'],rid); return value
     async def initialize(self):
@@ -55,6 +60,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response['result'].get('isError'),value)
         return value
 
+
+class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
     async def test_ipc_autostart_single_daemon(self):
         a,b=await asyncio.gather(request(self.home,'ping',{}),request(self.home,'ping',{}))
         self.assertEqual(a['pid'],b['pid'])
@@ -196,4 +203,243 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b'sk-do-not-persist',(self.home/'registry.sqlite').read_bytes())
         await rt.shutdown()
 
-if __name__=='__main__': unittest.main()
+class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
+    """Real Pi plus an offline mock provider through the real MCP boundary.
+
+    Gated by SUBAGENT_PI_LIVE_PI=1 and never part of the default suite. The mock
+    provider replaces global fetch with a thrower, so a model request cannot be
+    made; Pi, its agent dir and HOME are all isolated under the test root.
+    SUBAGENT_PI_LIVE_PI_BIN selects an isolated Pi install (default: PATH).
+
+    Uses the plugin-owned SDK child against an unmodified Pi 0.87 installation.
+    """
+    BIN=os.environ.get('SUBAGENT_PI_LIVE_PI_BIN','pi')
+    BEFORE_SETTLE='PI_MOCK_BEFORE_SETTLE'
+    READ_TIMEOUT=45
+
+    async def asyncSetUp(self):
+        if os.environ.get('SUBAGENT_PI_LIVE_PI')!='1':
+            raise unittest.SkipTest('set SUBAGENT_PI_LIVE_PI=1 to run the real-Pi check; default suite never launches Pi')
+        if not shutil.which(self.BIN): raise unittest.SkipTest(f'{self.BIN} not available')
+        await super().asyncSetUp()
+        self.pi_home=self.root/'userhome'; self.pi_home.mkdir()
+        self.pi_agent=self.root/'agent'; self.pi_agent.mkdir()
+        (self.pi_agent/'settings.json').write_text(json.dumps({'compaction':{'enabled':False},'retry':{'enabled':False}}))
+        self.saved_env={k:os.environ.get(k) for k in ('HOME','PI_CODING_AGENT_DIR')}
+        os.environ['HOME']=str(self.pi_home); os.environ['PI_CODING_AGENT_DIR']=str(self.pi_agent)
+
+    async def asyncTearDown(self):
+        await super().asyncTearDown()
+        for key,value in self.saved_env.items():
+            if value is None: os.environ.pop(key,None)
+            else: os.environ[key]=value
+
+    def write_config(self,**profile_env):
+        knobs={'PI_OFFLINE':'"1"','PI_SKIP_VERSION_CHECK':'"1"','PI_TELEMETRY':'"0"',**profile_env}
+        (self.home/'config.toml').write_text(
+            'pi_command = '+json.dumps([self.BIN])+'\nrpc_timeout_seconds=20\nstartup_timeout_seconds=60\n'
+            '[inheritance]\nenabled = false\n'
+            '[profiles.reader]\nprovider = "pi-mock-offline"\nmodel = "mock"\nextensions = '
+            +json.dumps([str(ROOT/'tests/pi_mock_provider.ts')])+'\n'
+            '[profiles.reader.env]\n'+''.join(f'{k} = {v}\n' for k,v in knobs.items()))
+
+    async def lifecycle(self):
+        """Spawn a reader, queue one follow-up, wait for both, return the run
+        outputs plus the child's stderr (the mock's boundary marker)."""
+        await self.initialize()
+        scope=(await self.tool('pi_context',{'cwd':str(self.workspace)}))['scope']
+        a=await self.tool('pi_spawn_agent',{'scope':scope,'cwd':str(self.workspace),'access':'read',
+            'task':'offline first','request_id':'live-spawn'})
+        q=await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],'mode':'follow_up',
+            'message':'offline second','request_id':'live-follow'})
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id'],q['run_id']],
+            'timeout_ms':8000,'mode':'all'})
+        stderr=(self.home/'agents'/a['agent_id']/'stderr.log').read_text()
+        return scope,a,q,done,stderr
+
+    async def results(self,scope,runs):
+        return [(await self.tool('pi_agent_result',{'scope':scope,'run_id':r['id']}))['text'] for r in runs]
+
+    async def payloads(self,scope,runs):
+        return [await self.tool('pi_agent_result',{'scope':scope,'run_id':r['id']}) for r in runs]
+
+    async def wait_marker(self,path,text,count=1,timeout=15.0):
+        """Bounded handshake on a child-side marker; never a fixed sleep."""
+        loop=asyncio.get_running_loop(); end=loop.time()+timeout
+        while loop.time()<end:
+            if path.exists() and path.read_text().count(text)>=count: return path.read_text()
+            await asyncio.sleep(.05)
+        raise AssertionError(f'{text!r} x{count} not observed in {path} within {timeout}s')
+
+    async def test_stock_sdk_completion_and_follow_up(self):
+        self.write_config()
+        scope,a,q,done,_=await self.lifecycle()
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1','MOCK_REPLY_2'])
+        close=await self.tool('pi_close_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'close'})
+        self.assertEqual(close['cleanup'],'verified')
+
+    async def test_before_settle_work_and_native_continuation(self):
+        self.write_config(PI_MOCK_CONTINUE='"1"',PI_MOCK_SETTLE_MS='"100"')
+        scope,a,q,done,trace=await self.lifecycle()
+        self.assertFalse(done['timed_out'],done)
+        self.assertIn('PI_MOCK_BEFORE_SETTLE',trace)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_2','MOCK_REPLY_3'])
+
+    async def test_multiple_nested_extension_inputs_remain_in_the_original_task(self):
+        self.write_config(PI_MOCK_SETTLED_SEND='"ONE"',PI_MOCK_SETTLED_SIBLING='"TWO"',
+                          PI_MOCK_SETTLED_NESTED='"THREE"',PI_MOCK_SETTLED_INPUT_MS='"150"',PI_MOCK_CONTEXT='"1"')
+        scope,a,q,done,trace=await self.lifecycle()
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_4','MOCK_REPLY_5'])
+        entered=re.findall(r'PI_MOCK_SETTLED_INPUT_TEXT (.+)',trace)
+        self.assertEqual(entered,['ONE','TWO','THREE'])
+        before=await self.payloads(scope,done['runs'])
+        after=await self.payloads(scope,done['runs'])
+        self.assertEqual([r['result_sha256'] for r in before],[r['result_sha256'] for r in after])
+
+    async def test_handled_extension_continuation_drains_without_an_extra_run(self):
+        self.write_config(PI_MOCK_SETTLED_SEND='"HANDLED"',PI_MOCK_SETTLED_INPUT='"handled"',
+                          PI_MOCK_SETTLED_INPUT_MS='"150"')
+        scope,a,q,done,trace=await self.lifecycle()
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1','MOCK_REPLY_2'])
+        self.assertIn('PI_MOCK_SETTLED_INPUT_MODE handled',trace)
+
+    async def test_handled_primary_fails_and_the_next_task_runs(self):
+        self.write_config(PI_MOCK_BLOCK_INPUT='"offline first"',PI_MOCK_BLOCK_MS='"150"',
+                          PI_MOCK_BLOCK_RESULT='"handled"')
+        scope,a,q,done,trace=await self.lifecycle()
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual([r['state'] for r in done['runs']],['failed','completed'])
+        self.assertEqual(await self.results(scope,done['runs']),['','MOCK_REPLY_1'])
+        first=(await self.payloads(scope,done['runs']))[0]
+        self.assertIn('without producing',first['run']['error'])
+
+    async def start_case(self,task='FIRST'):
+        await self.initialize()
+        scope=(await self.tool('pi_context',{'cwd':str(self.workspace)}))['scope']
+        a=await self.tool('pi_spawn_agent',{'scope':scope,'cwd':str(self.workspace),'access':'read',
+            'task':task,'request_id':'spawn'})
+        return scope,a,self.home/'agents'/a['agent_id']/'stderr.log'
+
+    async def follow_and_wait(self,scope,a):
+        q=await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],'mode':'follow_up',
+            'message':'NEXT_TASK','request_id':'follow'})
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id'],q['run_id']],
+            'timeout_ms':8000,'mode':'all'})
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual([r['state'] for r in done['runs']],['completed','completed'])
+        return done
+
+    async def test_concurrent_extension_submissions_have_serial_preflights_and_preserve_forced_prompt(self):
+        release=self.root/'release'; release.mkdir()
+        self.write_config(PI_MOCK_EXT_FOLLOWUP='"ONE,TWO"',PI_MOCK_BLOCK_INPUT='"ONE,TWO"',
+                          PI_MOCK_BLOCK_MS='"60000"',PI_MOCK_BLOCK_RELEASE_DIR=json.dumps(str(release)),
+                          PI_MOCK_FORCE_PROMPT='"KEEP_FORCED_PROMPT"',PI_MOCK_WIRE='"1"')
+        scope,a,path=await self.start_case()
+        await self.wait_marker(path,'PI_MOCK_INPUT_BLOCKED_START 1 ONE')
+        # Both inputs were accepted in agent_start. The second preflight cannot
+        # run ahead, even if its release is already available.
+        (release/'2').touch()
+        self.assertNotIn('PI_MOCK_INPUT_BLOCKED_START 2',path.read_text())
+        (release/'1').touch()
+        done=await self.follow_and_wait(scope,a)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_3','MOCK_REPLY_4'])
+        trace=path.read_text()
+        self.assertLess(trace.index('PI_MOCK_INPUT_BLOCKED_END 1'),trace.index('PI_MOCK_INPUT_BLOCKED_START 2'))
+        wires=[json.loads(line.split(' ',2)[2]) for line in trace.splitlines() if line.startswith('PI_MOCK_WIRE ')]
+        self.assertEqual([w['forced'] for w in wires],['KEEP_FORCED_PROMPT']*4)
+        self.assertIn('ONE',wires[1]['texts']); self.assertIn('TWO',wires[2]['texts'])
+        self.assertNotIn('NEXT_TASK',wires[2]['texts'])
+
+    async def test_steer_is_an_ordered_continuation_with_its_own_input_hook_and_prompt(self):
+        self.write_config(PI_MOCK_STREAM_MS='"500"',PI_MOCK_FORCE_PROMPT='"FORCED"',PI_MOCK_WIRE='"1"')
+        scope,a,path=await self.start_case()
+        await self.wait_marker(path,'PI_MOCK_REPLY 1')
+        receipt=await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],'mode':'steer',
+            'message':'STEER_TEXT','request_id':'steer'})
+        self.assertEqual(receipt['run_id'],a['run_id'])
+        done=await self.follow_and_wait(scope,a)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_2','MOCK_REPLY_3'])
+        wires=[json.loads(line.split(' ',2)[2]) for line in path.read_text().splitlines() if line.startswith('PI_MOCK_WIRE ')]
+        self.assertEqual([w['forced'] for w in wires],['FORCED']*3)
+        self.assertNotIn('STEER_TEXT',wires[0]['texts']); self.assertIn('STEER_TEXT',wires[1]['texts'])
+        inspected=await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id'],
+            'limit':100,'max_bytes':16384})
+        observed=[r for r in inspected['receipts'] if r['id']==receipt['receipt_id']]
+        self.assertEqual([r['state'] for r in observed],['consumed'])
+        consumed=[e for e in inspected['events'] if e['type']=='control_consumed'
+            and e['data']['request_id']==receipt['receipt_id']]
+        self.assertEqual(len(consumed),1)
+
+    async def test_interrupt_stops_a_primary_input_hook_and_preserves_the_session(self):
+        release=self.root/'release'
+        self.write_config(PI_MOCK_BLOCK_INPUT='"BLOCK"',PI_MOCK_BLOCK_MS='"60000"',
+                          PI_MOCK_RELEASE_FILE=json.dumps(str(release)))
+        scope,a,path=await self.start_case('BLOCK')
+        await self.wait_marker(path,'PI_MOCK_INPUT_BLOCKED_START')
+        q=await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],'mode':'follow_up',
+            'message':'CANCELLED_FOLLOW','request_id':'queued'})
+        stop=await self.tool('pi_interrupt_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'interrupt'})
+        self.assertEqual((stop['state'],stop['cleanup'],stop['process_retained']),('dormant','verified',False))
+        release.touch()
+        self.assertNotIn('PI_MOCK_REPLY',path.read_text())
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id'],q['run_id']],'timeout_ms':100})
+        self.assertEqual([r['state'] for r in done['runs']],['interrupted','cancelled'])
+
+    async def test_interrupt_stops_a_steer_preflight_without_leaking_to_replacement(self):
+        self.write_config(PI_MOCK_STREAM_MS='"300"',PI_MOCK_BLOCK_INPUT='"CANCEL_STEER"',PI_MOCK_BLOCK_MS='"60000"')
+        scope,a,path=await self.start_case()
+        await self.wait_marker(path,'PI_MOCK_REPLY 1')
+        await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],'mode':'steer',
+            'message':'CANCEL_STEER','request_id':'steer'})
+        await self.wait_marker(path,'PI_MOCK_INPUT_BLOCKED_START')
+        replaced=await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],'interrupt':True,
+            'message':'REPLACEMENT','request_id':'replace'})
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[replaced['run_id']],'timeout_ms':8000})
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1'])
+
+    async def test_ambient_provider_default_and_settings_remain_unchanged(self):
+        self.write_config()
+        config=self.home/'config.toml'
+        config.write_text(config.read_text().replace('provider = "pi-mock-offline"\nmodel = "mock"\n',''))
+        settings=self.pi_agent/'settings.json'
+        settings.write_text(json.dumps({'defaultProvider':'pi-mock-offline','defaultModel':'mock',
+            'compaction':{'enabled':False},'retry':{'enabled':False}}))
+        before=settings.read_bytes()
+        scope,a,q,done,_=await self.lifecycle()
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1','MOCK_REPLY_2'])
+        self.assertEqual(settings.read_bytes(),before)
+
+    async def test_old_extension_timer_cannot_attach_to_the_next_task(self):
+        release=self.root/'late'
+        self.write_config(PI_MOCK_LATE_RELEASE=json.dumps(str(release)),PI_MOCK_STREAM_MS='"400"',PI_MOCK_CONTEXT='"1"')
+        scope,a,path=await self.start_case()
+        await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_ms':8000})
+        second=await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],'mode':'send',
+            'message':'SECOND','request_id':'second'})
+        await self.wait_marker(path,'PI_MOCK_REPLY 2')
+        release.touch()
+        await self.wait_marker(path,'PI_MOCK_LATE_ATTEMPTED')
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[second['run_id']],'timeout_ms':8000})
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_2'])
+        self.assertNotIn('STALE_TIMER_INPUT',path.read_text())
+        self.assertNotIn('PI_MOCK_REPLY 3',path.read_text())
+
+    async def test_extension_confirmation_requires_explicit_mcp_answer(self):
+        self.write_config(PI_MOCK_CONFIRM='"1"')
+        scope,a,path=await self.start_case('ASK')
+        await self.wait_marker(path,'PI_MOCK_CONFIRM_WAIT')
+        state=await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']})
+        question=state['agent']['pending_input'][0]
+        self.assertEqual(question['method'],'confirm')
+        self.assertNotIn('PI_MOCK_REPLY',path.read_text())
+        await self.tool('pi_answer_agent',{'scope':scope,'agent_id':a['agent_id'],
+            'ui_request_id':question['id'],'answer':True,'request_id':'answer'})
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_ms':8000})
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1'])

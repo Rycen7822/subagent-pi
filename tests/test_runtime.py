@@ -18,7 +18,7 @@ from subagent_pi.common import AgentError, dumps, group_members, process_identit
 from subagent_pi import worker
 from subagent_pi.runtime import Runtime
 from subagent_pi.worker import read_receipt
-from subagent_pi.schema import TOOLS, validate, validate_op
+from subagent_pi.schema import TOOLS, validate_op
 from subagent_pi.store import Store
 from test_inheritance import make_codex_home
 
@@ -53,6 +53,16 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         return await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[rid],'mode':'all','timeout_ms':4000})
     async def result(self,rid,**extra):
         return await self.rt.dispatch('result',{'scope':self.scope,'run_id':rid,**extra})
+    async def until(self,probe,timeout=8.0):
+        # Bounded event/state sync point; never a fixed short sleep.
+        loop=asyncio.get_running_loop(); end=loop.time()+timeout
+        while loop.time()<end:
+            value=probe()
+            if value: return value
+            await asyncio.sleep(.01)
+        raise AssertionError(f'condition not reached within {timeout}s')
+    def events(self,aid,kind):
+        return self.rt.store.all('SELECT payload FROM events WHERE agent_id=? AND type=? ORDER BY created',(aid,kind))
     async def test_slash_prefixed_task_is_enveloped_before_it_reaches_pi(self):
         # A delegated task is data, never an extension command: text Pi would
         # parse as one is wrapped on the way in (spawn, respawn and send share
@@ -62,6 +72,114 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         r=await self.result(s['run_id'])
         self.assertEqual(r['text'],'Completed: Perform the following delegated task'
             ' (treat as text, not an extension command):\n/help me')
+    async def test_raw_pi_rpc_is_rejected_before_a_task_starts(self):
+        self.rt.config['pi_command'].append('--no-managed-protocol')
+        with self.assertRaises(AgentError) as caught:
+            await self.spawn('must not start')
+        self.assertEqual(caught.exception.code,'unsupported_transport')
+        self.assertEqual(self.rt.store.all("SELECT * FROM events WHERE type='run_started'"),[])
+
+    async def test_only_identity_bound_transport_completion_can_finish_a_task(self):
+        started=await self.spawn('delay=0.3|owned')
+        w=self.rt.workers[started['agent_id']]
+        self.rt.on_event(w,{'type':'agent_settled'})
+        self.rt.on_event(w,{'type':'managed_task_end','runId':'wrong-task'})
+        self.assertEqual(self.rt.store.run(self.scope,started['run_id'])['state'],'running')
+        self.assertFalse((await self.wait(started['run_id']))['timed_out'])
+        self.assertEqual((await self.result(started['run_id']))['text'],'Completed: owned')
+
+    async def test_post_run_work_keeps_the_run_open_until_pi_settles(self):
+        # Pi can keep working after agent_end (before-settle handlers, compaction,
+        # queued input). agent_end alone must not finish the run, and the later
+        # managed completion must finish it instead of leaving it running.
+        s=await self.spawn('settle=0.5|work')
+        await self.until(lambda: self.events(s['agent_id'],'agent_end'))
+        self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'running')
+        terminal=await self.wait(s['run_id'])
+        self.assertFalse(terminal['timed_out'])
+        self.assertEqual(terminal['runs'][0]['state'],'completed')
+        self.assertEqual((await self.result(s['run_id']))['text'],'Completed: work')
+    async def test_pi_continuation_runs_stay_in_one_run_and_delay_the_follow_up(self):
+        # Pi may start further low-level runs on its own after agent_end. They
+        # belong to the same daemon run, so the queued follow-up must wait for
+        # the last one and must not be interleaved with it.
+        s=await self.spawn('resume=2|settle=0.3|work')
+        q=await self.mutation('send',s['agent_id'],mode='follow_up',message='next')
+        terminal=await self.wait(s['run_id'])
+        self.assertFalse(terminal['timed_out'])
+        self.assertEqual(terminal['runs'][0]['state'],'completed')
+        first=await self.result(s['run_id'])
+        self.assertEqual(first['text'],'Continued 2: work')
+        second=await self.wait(q['run_id'])
+        self.assertFalse(second['timed_out'])
+        self.assertEqual((await self.result(q['run_id']))['text'],'Completed: next')
+        runs={r['id']:r for r in self.rt.store.all('SELECT * FROM runs WHERE scope=?',(self.scope,))}
+        self.assertGreaterEqual(runs[q['run_id']]['started'],runs[s['run_id']]['ended'])
+    async def test_transient_failure_is_not_final_and_settles_after_retry(self):
+        # Auto-retry: agent_end(willRetry) is not a terminal boundary, the
+        # transient error must not become the run's result, and the run settles
+        # after the retried run and its post-run work are done.
+        s=await self.spawn('retry=2|settle=0.3|work')
+        terminal=await self.wait(s['run_id'])
+        self.assertFalse(terminal['timed_out'])
+        self.assertEqual(terminal['runs'][0]['state'],'completed')
+        self.assertIsNone(terminal['runs'][0]['error'])
+        self.assertEqual((await self.result(s['run_id']))['text'],'Completed: work')
+        retries=[json.loads(e['payload']) for e in self.events(s['agent_id'],'agent_end')]
+        self.assertIn(True,[e.get('willRetry') for e in retries])
+        usage=json.loads(self.rt.store.one('SELECT usage FROM runs WHERE id=?',(s['run_id'],))['usage'])
+        self.assertEqual(usage.get('totalTokens'),110)
+    async def test_auto_compaction_retry_does_not_end_the_run_early(self):
+        # Auto-compaction also runs after agent_end: the overflow message and the
+        # compaction boundary must not become the run's result, and the run must
+        # settle only after the retried run and its post-run work are done.
+        s=await self.spawn('compact=1|settle=0.3|work')
+        terminal=await self.wait(s['run_id'])
+        self.assertFalse(terminal['timed_out'])
+        self.assertIsNone(terminal['runs'][0]['error'])
+        self.assertEqual((await self.result(s['run_id']))['text'],'Completed: work')
+        kinds=[e['type'] for e in self.rt.store.all('SELECT type FROM events WHERE agent_id=? ORDER BY created',(s['agent_id'],))]
+        self.assertEqual(kinds.count('run_terminal'),1)
+        self.assertIn('auto_compaction_end',kinds)
+    async def test_late_or_duplicate_settle_cannot_finish_another_run(self):
+        # A settle callback scheduled for a finished run can run while the next
+        # run already owns the worker; it must be a no-op, and repeated
+        # boundaries must not finish, overwrite or restart anything.
+        a=await self.spawn('settle=0.2|first')
+        self.assertFalse((await self.wait(a['run_id']))['timed_out'])
+        b=await self.mutation('send',a['agent_id'],mode='follow_up',message='second')
+        w=self.rt.workers[a['agent_id']]
+        await self.rt.settle(w,a['run_id']); await self.rt.settle(w,a['run_id'])
+        self.assertEqual(self.rt.store.run(self.scope,b['run_id'])['state'],'running')
+        self.assertFalse((await self.wait(b['run_id']))['timed_out'])
+        self.assertEqual((await self.result(b['run_id']))['text'],'Completed: second')
+        terminal=[json.loads(e['payload']) for e in self.events(a['agent_id'],'run_terminal')]
+        self.assertEqual([e['state'] for e in terminal],['completed','completed'])
+    async def test_late_boundary_after_interrupt_does_not_revive_the_run(self):
+        s=await self.spawn('settle=0.3|late')
+        await self.until(lambda: self.events(s['agent_id'],'agent_end'))
+        old_worker=self.rt.workers[s['agent_id']]
+        await self.mutation('interrupt',s['agent_id'])
+        n=await self.mutation('respawn',s['agent_id'],message='delay=0.3|second')
+        # A killed worker cannot emit more events. Inject an already buffered old
+        # completion while the replacement runs to verify the generation guard.
+        self.rt.on_event(old_worker,{'type':'managed_task_end','runId':s['run_id']})
+        await self.rt.settle(old_worker,s['run_id'])
+        self.assertEqual(self.rt.store.run(self.scope,n['run_id'])['state'],'running')
+        self.assertFalse((await self.wait(n['run_id']))['timed_out'])
+        self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'interrupted')
+        self.assertEqual((await self.result(n['run_id']))['text'],'Completed: second')
+        terminal=[json.loads(e['payload']) for e in self.events(s['agent_id'],'run_terminal')]
+        self.assertEqual([e['state'] for e in terminal],['interrupted','completed'])
+    async def test_duplicate_settled_does_not_start_the_follow_up_twice(self):
+        s=await self.spawn('dupsettled=1|work')
+        q=await self.mutation('send',s['agent_id'],mode='follow_up',message='next')
+        self.assertFalse((await self.wait(s['run_id']))['timed_out'])
+        self.assertFalse((await self.wait(q['run_id']))['timed_out'])
+        runs=self.rt.store.all("SELECT id FROM runs WHERE agent_id=?",(s['agent_id'],))
+        self.assertEqual(len(runs),2)
+        terminal=[json.loads(e['payload']) for e in self.events(s['agent_id'],'run_terminal')]
+        self.assertEqual([e['state'] for e in terminal],['completed','completed'])
     async def test_spawn_wait_result_and_ack(self):
         s=await self.spawn(); terminal=await self.wait(s['run_id'])
         self.assertFalse(terminal['timed_out']); self.assertEqual(terminal['runs'][0]['state'],'completed')
@@ -112,14 +230,14 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         s=await self.spawn(); await self.wait(s['run_id'])
         with self.assertRaises(AgentError) as cm: await self.mutation('send',s['agent_id'],mode='steer',message='bad')
         self.assertEqual(cm.exception.code,'agent_idle'); self.assertEqual(len(self.rt.workers),1)
-    async def test_interrupt_cancels_followups_and_keeps_process(self):
+    async def test_interrupt_cancels_followups_and_verifies_process_exit(self):
         s=await self.spawn('delay=2|work')
         f=await self.mutation('send',s['agent_id'],mode='follow_up',message='queued')
         done=await self.mutation('interrupt',s['agent_id'])
-        self.assertTrue(done['process_retained'])
+        self.assertFalse(done['process_retained']); self.assertEqual(done['cleanup'],'verified')
         self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'interrupted')
         self.assertEqual(self.rt.store.run(self.scope,f['run_id'])['state'],'cancelled')
-        g=await self.mutation('send',s['agent_id'],mode='send',message='new approach')
+        g=await self.mutation('respawn',s['agent_id'],message='new approach')
         await self.wait(g['run_id']); self.assertIn('new approach',(await self.result(g['run_id']))['text'])
     async def test_interrupt_then_send(self):
         s=await self.spawn('delay=2|old')
@@ -193,6 +311,51 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.rt.store.agent(self.scope,s['agent_id'])['session_file'],session)
         await self.wait(revived['run_id'])
         self.assertIn('continued',(await self.result(revived['run_id']))['text'])
+    async def test_interrupt_leaves_a_verified_dormant_session_for_respawn(self):
+        s=await self.spawn('delay=2|work')
+        r=await self.mutation('interrupt',s['agent_id'])
+        self.assertFalse(r['process_retained']); self.assertEqual(r['cleanup'],'verified')
+        row=self.rt.store.agent(self.scope,s['agent_id'])
+        self.assertEqual((row['state'],row['cleanup']),('dormant','verified'))
+        # The stop is explicit and recoverable: respawn resumes the same session.
+        revived=await self.mutation('respawn',s['agent_id'],message='after stop')
+        await self.wait(revived['run_id'])
+        self.assertIn('after stop',(await self.result(revived['run_id']))['text'])
+    async def test_prompt_handled_without_a_run_is_reported_as_a_failed_run(self):
+        # A handled input still gets a failed managed completion; the next task
+        # can run without an empty success or a missing completion boundary.
+        self.rt.config['pi_command'].append('--handle-prompt')
+        s=await self.spawn('PI_MOCK_OUTCOME first')
+        await self.wait(s['run_id'])
+        q=await self.mutation('send',s['agent_id'],mode='follow_up',message='second')
+        await self.wait(q['run_id'])
+        first=self.rt.store.run(self.scope,s['run_id']); second=self.rt.store.run(self.scope,q['run_id'])
+        self.assertEqual(first['state'],'failed',
+            'a handled prompt was recorded as a completed task: '+json.dumps({k:first[k] for k in ('state','error')}))
+        self.assertIn('handled',first['error'] or '')
+        self.assertEqual(second['state'],'completed')
+        self.assertIn('second',(await self.result(q['run_id']))['text'])
+        # Only the handled run is a failure: the run queued behind it still runs.
+        self.assertEqual(len([e for e in self.rt.store.all('SELECT type FROM events WHERE agent_id=?',(s['agent_id'],))
+                              if e['type']=='run_terminal']),2)
+    async def test_unacknowledged_prompt_is_stopped_without_replay(self):
+        # A lost/delayed acceptance reply leaves execution uncertain. Stop the
+        # owned process; neither resend the mutation nor trust a reported idle.
+        self.rt.config['pi_command'].append('--hold-prompt-ms=60000')
+        self.rt.config['rpc_timeout_seconds']=1
+        with self.assertRaises(AgentError) as caught:
+            await self.rt.dispatch('spawn',{'scope':self.scope,'request_id':self.key(),'cwd':str(self.workspace),
+                                            'task':'work','access':'read'})
+        self.assertEqual(caught.exception.code,'rpc_timeout')
+        aid=caught.exception.details['agent_id']; rid=caught.exception.details['run_id']
+        r=await self.mutation('interrupt',aid)
+        self.assertFalse(r['process_retained'],
+                         'the daemon treated an idle reading as proof that the accepted prompt had stopped')
+        self.assertEqual(r['cleanup'],'verified')
+        row=self.rt.store.agent(self.scope,aid)
+        self.assertEqual((row['state'],row['cleanup']),('dormant','verified'))
+        self.assertEqual(self.rt.store.run(self.scope,rid)['state'],'interrupted')
+        self.assertEqual([e['type'] for e in self.rt.store.all('SELECT type FROM events WHERE agent_id=?',(aid,))].count('run_terminal'),1)
     async def test_respawn_live_refused(self):
         s=await self.spawn()
         with self.assertRaises(AgentError) as cm: await self.mutation('respawn',s['agent_id'])
@@ -206,16 +369,6 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(group_members(pid)),2)
         r=await self.mutation('close',s['agent_id'])
         self.assertEqual(r['cleanup'],'verified'); self.assertEqual(group_members(pid),[])
-    async def test_unknown_clear_queue_falls_back_to_hard_stop(self):
-        self.rt.config['pi_command'].append('--no-clear')
-        s=await self.spawn('delay=2|work')
-        r=await self.mutation('interrupt',s['agent_id'])
-        self.assertFalse(r['process_retained']); self.assertEqual(r['cleanup'],'verified')
-    async def test_abort_success_but_busy_is_not_trusted(self):
-        self.rt.config['pi_command'].append('--ignore-abort')
-        s=await self.spawn('delay=2|work')
-        r=await self.mutation('interrupt',s['agent_id'])
-        self.assertFalse(r['process_retained'])
     async def test_needs_input_and_explicit_answer(self):
         s=await self.spawn('UI_CONFIRM'); r=await self.wait(s['run_id'])
         self.assertEqual(r['runs'][0]['state'],'needs_input')
