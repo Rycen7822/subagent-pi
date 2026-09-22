@@ -293,6 +293,31 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         body=''.join(chunks)
         self.assertEqual(hashlib.sha256(body.encode()).hexdigest(),r['result_sha256'])
         self.assertIn('\u2028',body)
+    async def test_wait_result_budget_and_pagination_preserve_exact_hash_without_ack(self):
+        agents=[]
+        for _ in range(6):
+            agent=await self.spawn('BIG'); agents.append(agent)
+            await self.wait(agent['run_id'])
+            await self.mutation('close',agent['agent_id'])
+        page=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[a['run_id'] for a in agents],'mode':'all','timeout_ms':0})
+        self.assertLessEqual(sum(len(r['result'].get('text','').encode()) for r in page['runs']),8192)
+        for run in page['runs']:
+            preview=run['result']; text=preview.get('text',''); more=preview['has_more']; offset=preview['next_offset']
+            while more:
+                continuation=await self.result(run['id'],offset=offset)
+                text+=continuation['text']; more=continuation['has_more']; offset=continuation['next_offset']
+            self.assertEqual(hashlib.sha256(text.encode()).hexdigest(),preview['result_sha256'])
+            self.assertFalse((await self.result(run['id']))['acknowledged'])
+
+    async def test_legacy_mutation_digest_still_replays_without_spawning_again(self):
+        p={'scope':self.scope,'request_id':'old-digest','cwd':str(self.workspace),'task':'simple','access':'read'}
+        created=await self.rt.dispatch('spawn',p)
+        legacy=hashlib.sha256(dumps({'op':'spawn','params':p}).encode()).hexdigest()
+        self.rt.store.execute('UPDATE requests SET digest=? WHERE scope=? AND key=?',(legacy,self.scope,p['request_id']))
+        replay=await self.rt.dispatch('spawn',p)
+        self.assertTrue(replay['replayed']); self.assertEqual(replay['run_id'],created['run_id'])
+        self.assertEqual(len(self.rt.workers),1)
+
     async def test_bounded_inspection_and_stable_cursor(self):
         s=await self.spawn('BIG'); await self.wait(s['run_id'])
         seen=[]; cursor=0

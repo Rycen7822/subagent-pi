@@ -28,6 +28,9 @@ class ClientTimeoutBudget(unittest.TestCase):
         self.assertEqual(call_timeout('spawn',{'timeout_ms':604800000},None),
                          call_timeout('spawn',{},None))
     def test_wait_scales_with_its_own_timeout(self):
+        from subagent_pi.common import DEFAULT_WAIT_MS, MAX_WAIT_MS
+        self.assertEqual(call_timeout('wait',{},None),DEFAULT_WAIT_MS/1000+10)
+        self.assertEqual(call_timeout('wait',{'timeout_ms':MAX_WAIT_MS},None),MAX_WAIT_MS/1000+10)
         self.assertGreater(call_timeout('wait',{'timeout_ms':120000},None),
                            call_timeout('wait',{'timeout_ms':25000},None))
         self.assertEqual(call_timeout('list',{},None),45)
@@ -52,10 +55,15 @@ class PackageTests(unittest.TestCase):
             legacy=json.loads((plugin/'.mcp.json').read_text())['mcpServers']['subagent-pi']
             self.assertEqual(legacy['command'],str(Path(sys.executable).resolve()))
             self.assertEqual(legacy['args'],[str(plugin/'bin/subagent-pi'),'mcp'])
+            from subagent_pi.common import MAX_WAIT_MS
+            self.assertGreater(legacy['tool_timeout_sec'],call_timeout('wait',{'timeout_ms':MAX_WAIT_MS}))
+            self.assertEqual(legacy['env_vars'],['XDG_RUNTIME_DIR'])
+            self.assertFalse((plugin/'plugin.json').exists())  # Native Codex manifest owns the timeout.
+            self.assertTrue((plugin/'.codex-plugin/plugin.json').exists())
             self.assertEqual(server['env']['PI_AGENTS_HOME'],str(home))
             self.assertFalse((plugin/'hooks').exists())
             from scripts.ship_manifest import ship_files
-            shipped={f.relative_to(ROOT) for f in ship_files(ROOT)}
+            shipped={f.relative_to(ROOT) for f in ship_files(ROOT)}-{Path('plugin.json')}
             installed={f.relative_to(plugin) for f in plugin.rglob('*') if f.is_file()}
             self.assertEqual(installed,shipped)
             self.assertFalse((plugin/'node_modules').exists())

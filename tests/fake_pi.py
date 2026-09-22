@@ -164,6 +164,7 @@ async def run(raw_task, rid):
         emit({'type':'tool_execution_start','toolName':'bash','toolCallId':'sleep','args':{'command':'sleep 120','pid':proc.pid}})
         await asyncio.sleep(120)
     if task=='UI_CONFIRM':
+        await asyncio.sleep(float(opts.get('delay',0)))
         f=asyncio.get_running_loop().create_future(); ui['ui-1']=f
         emit({'type':'extension_ui_request','id':'ui-1','method':'confirm','title':'Allow this test operation?','message':'Test-only confirmation'})
         accepted=await f; ui.pop('ui-1',None)

@@ -13,7 +13,7 @@ max_agents_per_scope = 16
 rpc_timeout_seconds = 20
 startup_timeout_seconds = 30
 default_run_timeout_seconds = 1800
-max_wait_seconds = 600
+max_wait_seconds = 3600
 event_max_count_per_agent = 20000
 ```
 
@@ -45,11 +45,11 @@ tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
 # thinking = "medium"
 ```
 
-默认不硬编码任何模型。首先使用 spawn 显式 model，其次 profile model，最后由 Pi 自行选择；启动完成后保存 Pi 报告的 provider/model ID，后续恢复继续使用。它不会固定 API 服务端模型权重，也不会锁定可执行文件的全部依赖字节。
+默认不硬编码任何模型。首先使用 spawn 显式 model，其次 profile model，最后由 Pi 自行选择；启动完成后保存 Pi 报告的 provider/model ID，后续恢复继续使用。`thinking` 同样支持 spawn / CLI `--thinking` 覆盖 profile；未指定时由 Pi 的模型默认/全局设置决定。插件用实际 session.getAvailableThinkingLevels() 校验显式等级，不支持则在提交任务前报错并列出可用项；不会静默钳制。spawn/inspect/list 返回 thinking 与 available_thinking，恢复固定已选等级。它不会固定 API 服务端模型权重，也不会锁定可执行文件的全部依赖字节。
 
 受管子代理默认就是一个正常 Pi 会话：Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes、settings 与上下文文件全部照常加载，然后才在其上继承 Codex 的 skills 与 MCP。Pi 用来定位自己配置目录的 `PI_CODING_AGENT_DIR` 会随 scope 绑定（与 `HOME` 同类的非秘密路径）：CLI/MCP 客户端进程里的取值经 scope 快照传到子进程，daemon 重启后仍按记录恢复；未设置时保持 Pi 默认（`$HOME/.pi/agent`），profile 的 `[profiles.x.env] PI_CODING_AGENT_DIR` 仍然优先。`ambient_extensions` / `ambient_skills` 默认 `true`，是**显式退出开关**（设为 `false` 会重新加上 `--no-extensions` / `--no-skills`）。
 
-`tools` 决定子代理的 **builtin** 工具面，由随插件发布的 `extensions/managed-surface.ts` 在 session_start 按 Pi 报告的来源（`sourceInfo.path = "<builtin:NAME>"`）精确激活/停用：profile 列出的 builtin 生效，未列出的 builtin（包括本插件还不认识的）停用。刻意不使用 `--tools` **也不用** `--exclude-tools`：两者都按**工具名**过滤同一份注册表，会连带剔除 Pi 扩展注册的同名工具（例如扩展用自己的 `bash` 覆盖 builtin）。只有真正限制 builtin 的 profile 才会加载该扩展；扩展文件缺失时该 profile 直接拒绝启动，而不是放出无约束的子代理。扩展/自定义工具保持 Pi 自身判定，本插件不增删。
+`tools` 决定子代理的 **builtin** 工具面，由随插件发布的 `extensions/managed-surface.ts` 在 session_start 按 Pi 报告的来源（`sourceInfo.path = "<builtin:NAME>"`）精确激活/停用：profile 列出的 builtin 生效，未列出的 builtin（包括本插件还不认识的）停用。刻意不使用 `--tools` **也不用** `--exclude-tools`：两者都按**工具名**过滤同一份注册表，会连带剔除 Pi 扩展注册的同名工具（例如扩展用自己的 `bash` 覆盖 builtin）。只有真正限制 builtin 的 profile 才会加载该扩展；扩展文件缺失时该 profile 直接拒绝启动，而不是放出无约束的子代理。扩展/自定义工具保持 Pi 自身判定；插件仅在受管子进程增加 ask_parent，用于向父代理提出阻塞问题。
 
 限制 builtin 的 profile 不会只凭 argv 就宣称生效：扩展会在改动后回读 Pi 的实时注册表并把结果写到 stderr（`subagent-pi-surface applied ...`），daemon 记录为 `tool_surface` 事件，并在缺失或与期望不符时让本次启动失败（`tool_surface_unavailable` / `tool_surface_unapplied`）。
 

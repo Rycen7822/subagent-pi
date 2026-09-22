@@ -71,6 +71,7 @@ async def serve(home: Path):
         os.chmod(sock,0o600)
         loop=asyncio.get_running_loop()
         for sig in (signal.SIGINT,signal.SIGTERM): loop.add_signal_handler(sig,runtime.shutdown_requested.set)
+        runtime.notify()  # Deliver durable pending attention, including restart reconciliation.
         deadline=asyncio.create_task(runtime.deadline_loop())
         async with server:
             await runtime.shutdown_requested.wait()

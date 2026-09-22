@@ -10,11 +10,39 @@ const mark = (text: string) => process.stderr.write(text + "\n");
 
 export default function (pi) {
   globalThis.fetch = async () => { throw new Error("NETWORK_FORBIDDEN"); };
+  if (env.PI_MOCK_STDOUT) {
+    console.log("MOCK_EXTENSION_LOG");
+    pi.on("agent_end", () => process.stdout.write("\x1b]777;notify;pi;MOCK_NOTIFY\x07"));
+  }
+  if (env.PI_MOCK_STARTUP_COMMANDS) {
+    let captured = false, nested = false;
+    pi.registerCommand("mock-capture", { handler: async (args, ctx) => {
+      await sleep(30);
+      if (args !== "capture args" || !ctx.sessionManager.getSessionId() || typeof ctx.navigateTree !== "function")
+        throw new Error("Invalid startup command context");
+      captured = true;
+      mark("MOCK_COMMAND_CAPTURED");
+      pi.sendUserMessage("/mock-nested", { expandPromptTemplates: true });
+    } });
+    pi.registerCommand("mock-nested", { handler: async () => { nested = true; mark("MOCK_COMMAND_NESTED"); } });
+    pi.on("session_start", () => {
+      pi.sendUserMessage("/mock-capture capture args", { expandPromptTemplates: true });
+      if (env.PI_MOCK_STARTUP_COMMANDS === "reject") {
+        pi.sendUserMessage("UNOWNED_STARTUP_INPUT");
+        pi.sendUserMessage("/unknown-command", { expandPromptTemplates: true });
+        pi.sendUserMessage("/mock-nested", { expandPromptTemplates: false });
+      }
+    });
+    pi.on("before_agent_start", () => {
+      if (!captured || !nested) throw new Error("Startup commands were not drained before the task");
+    });
+  }
   if (env.PI_MOCK_FORCE_PROMPT) pi.on("before_agent_start", () => ({ systemPrompt: env.PI_MOCK_FORCE_PROMPT }));
   let calls = 0;
   pi.registerProvider("pi-mock-offline", {
     baseUrl: "http://127.0.0.1:1", apiKey: "offline-test-only", api: "openai-responses",
-    models: [{ id: "mock", name: "Offline Mock", reasoning: false, input: ["text"],
+    models: [{ id: "mock", name: "Offline Mock", reasoning: Boolean(env.PI_MOCK_THINKING),
+      ...(env.PI_MOCK_THINKING ? { thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" } } : {}), input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 1024 }],
     streamSimple(model, context) {
       const stream = createAssistantMessageEventStream();
@@ -30,7 +58,12 @@ export default function (pi) {
         api: model.api, provider: model.provider, model: model.id, stopReason: "stop", timestamp: Date.now(),
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-      setTimeout(() => { stream.push({ type: "done", reason: "stop", message }); stream.end(); }, Number(env.PI_MOCK_STREAM_MS || 30));
+      if (env.PI_MOCK_ASK_PARENT && call === 1) {
+        message.content = [{ type: "toolCall", id: "ask-parent-1", name: "ask_parent", arguments: { question: "Which branch should I use?" } }] as any;
+        message.stopReason = "toolUse";
+      }
+      if (env.PI_MOCK_FAIL) { message.stopReason = "error"; (message as any).errorMessage = "Mock provider failed"; }
+      setTimeout(() => { stream.push({ type: message.stopReason === "error" ? "error" : "done", reason: message.stopReason, message, error: message } as any); stream.end(); }, Number(env.PI_MOCK_STREAM_MS || 30));
       return stream;
     },
   });

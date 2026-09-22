@@ -314,6 +314,8 @@ async def boot_worker(rt, a):
             bootstrap_w=None  # the writer task now owns and closes this end
         try:
             state=await w.rpc('get_state',timeout=rt.config['startup_timeout_seconds'])
+            if state.get('configurationError'):
+                raise AgentError('unsupported_thinking',state['configurationError'])
             actual=state.get('sessionFile')
             if not actual or not Path(actual).is_absolute():
                 raise AgentError('session_mismatch','Pi did not report an absolute persistent session path')
@@ -342,6 +344,10 @@ async def boot_worker(rt, a):
                 await resolve_skills(rt,w,plan)
             # Pin the model Pi actually selected so a later global default
             # change does not silently alter a recovered agent.
+            if isinstance(state.get('thinking'),str):
+                if '--thinking' not in spec['argv']: spec['argv'] += ['--thinking',state['thinking']]
+                spec['thinking']=state['thinking']
+                spec['available_thinking']=state.get('availableThinking',[])
             resolved_model=state.get('model')
             if isinstance(resolved_model,dict) and resolved_model.get('id'):
                 if '--model' not in spec['argv']:

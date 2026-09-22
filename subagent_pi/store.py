@@ -5,7 +5,7 @@ from pathlib import Path
 import sqlite3
 from .common import AgentError, TERMINAL, atomic_write, dumps, now, private_dir
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # Applied in order to reach SCHEMA_VERSION from an older ledger. A fresh database
 # is created at the current version, so these statements never run on it.
 MIGRATIONS = {
@@ -13,6 +13,7 @@ MIGRATIONS = {
         'ALTER TABLE scopes ADD COLUMN codex_source TEXT',
         'ALTER TABLE scopes ADD COLUMN inheritance INTEGER NOT NULL DEFAULT 1'),
     3: ('ALTER TABLE scopes ADD COLUMN base_env TEXT',),
+    4: ('ALTER TABLE scopes ADD COLUMN parent TEXT',),
 }
 
 class Store:
@@ -27,12 +28,14 @@ class Store:
         self.db.executescript('''
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE IF NOT EXISTS scopes(id TEXT PRIMARY KEY,cwd TEXT NOT NULL,label TEXT NOT NULL,created REAL NOT NULL,revision INTEGER NOT NULL DEFAULT 0,
-            codex_home TEXT,codex_source TEXT,inheritance INTEGER NOT NULL DEFAULT 1,base_env TEXT);
+            codex_home TEXT,codex_source TEXT,inheritance INTEGER NOT NULL DEFAULT 1,base_env TEXT,parent TEXT);
         CREATE TABLE IF NOT EXISTS agents(id TEXT PRIMARY KEY,scope TEXT NOT NULL REFERENCES scopes(id),name TEXT NOT NULL,cwd TEXT NOT NULL,state TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 0,session_file TEXT NOT NULL,launch TEXT NOT NULL,created REAL NOT NULL,updated REAL NOT NULL,current_run TEXT,pid INTEGER,identity TEXT,cleanup TEXT NOT NULL DEFAULT 'verified',UNIQUE(scope,name));
         CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL REFERENCES agents(id),scope TEXT NOT NULL REFERENCES scopes(id),state TEXT NOT NULL,task TEXT NOT NULL,created REAL NOT NULL,started REAL,ended REAL,deadline REAL,result_path TEXT,result_sha TEXT,ack INTEGER NOT NULL DEFAULT 0,error TEXT,usage TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS requests(scope TEXT NOT NULL,key TEXT NOT NULL,digest TEXT NOT NULL,op TEXT NOT NULL,state TEXT NOT NULL,response TEXT,created REAL NOT NULL,PRIMARY KEY(scope,key));
         CREATE TABLE IF NOT EXISTS receipts(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,scope TEXT NOT NULL,message TEXT NOT NULL,state TEXT NOT NULL,created REAL NOT NULL,updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,agent_id TEXT NOT NULL,run_id TEXT,generation INTEGER NOT NULL,type TEXT NOT NULL,payload TEXT NOT NULL,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS parent_notifications(id TEXT PRIMARY KEY,scope TEXT NOT NULL REFERENCES scopes(id),run_id TEXT NOT NULL REFERENCES runs(id),kind TEXT NOT NULL,ui_id TEXT,state TEXT NOT NULL DEFAULT 'pending',queued_id TEXT,error TEXT,created REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS parent_notifications_state ON parent_notifications(state,created);
         CREATE INDEX IF NOT EXISTS runs_scope_state ON runs(scope,state,ack,created);
         CREATE INDEX IF NOT EXISTS runs_agent_state ON runs(agent_id,state,created);
         CREATE INDEX IF NOT EXISTS events_agent_seq ON events(agent_id,seq);
@@ -92,15 +95,25 @@ class Store:
         try:
             self.execute("UPDATE runs SET state=?,ended=?,result_path=?,result_sha=?,error=?,usage=? WHERE id=?", (state,now(),str(path),sha,error,dumps(usage or {}),rid))
             self.execute("UPDATE receipts SET state='not_consumed',updated=? WHERE run_id=? AND state IN ('queued','sending')", (now(),rid))
+            self.attention(rid,'terminal')
             self.bump(row['scope'])
             self.execute("COMMIT")
         except BaseException:
             self.execute("ROLLBACK"); raise
+    def attention(self, rid, kind, ui_id=None):
+        row=self.one('SELECT r.scope,s.parent FROM runs r JOIN scopes s ON s.id=r.scope WHERE r.id=?',(rid,))
+        if not row or not row['parent']: return
+        key=hashlib.sha256(dumps([rid,kind,ui_id]).encode()).hexdigest()
+        self.execute('INSERT OR IGNORE INTO parent_notifications(id,scope,run_id,kind,ui_id,created) VALUES(?,?,?,?,?,?)',
+                     (key,row['scope'],rid,kind,ui_id,now()))
+
     def request_begin(self, sid, key, op, params):
-        digest = hashlib.sha256(dumps({'op':op,'params':params}).encode()).hexdigest()
+        payload={'op':op,'params':params}
+        digest = hashlib.sha256(json.dumps(payload,ensure_ascii=False,separators=(',',':'),sort_keys=True,allow_nan=False).encode()).hexdigest()
+        legacy_digest = hashlib.sha256(dumps(payload).encode()).hexdigest()
         row = self.one("SELECT * FROM requests WHERE scope=? AND key=?", (sid,key))
         if row:
-            if row['digest'] != digest: raise AgentError("idempotency_conflict", "request_id already used for different arguments")
+            if row['digest'] not in {digest,legacy_digest}: raise AgentError("idempotency_conflict", "request_id already used for different arguments")
             if row['state'] == 'done': return json.loads(row['response'])
             raise AgentError("request_uncertain", "Operation was started but no durable reply exists; inspect state before retrying", request_id=key)
         self.execute("INSERT INTO requests VALUES(?,?,?,?,?,?,?)", (sid,key,digest,op,'pending',None,now()))

@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from .common import MAX_FRAME, AgentError, dumps, private_dir, read_frame, socket_path
+from .common import MAX_FRAME, DEFAULT_WAIT_MS, AgentError, dumps, private_dir, read_frame, socket_path
 from . import PROTOCOL_VERSION
 
 BASE_TIMEOUT = 45
@@ -35,7 +35,8 @@ def call_timeout(op, params, home=None):
     soon as the worker is up, regardless of how long the task may then run."""
     if op in BOOT_OPS:
         return max(BASE_TIMEOUT, boot_budget(home))
-    return max(BASE_TIMEOUT, (params.get('timeout_ms') or 0)/1000 + 10)
+    ms=params.get('timeout_ms',DEFAULT_WAIT_MS if op=='wait' else 0)
+    return max(BASE_TIMEOUT, (ms or 0)/1000 + 10)
 
 async def request(home,op,params,timeout=45,autostart=True,source=None):
     sock=socket_path(home)

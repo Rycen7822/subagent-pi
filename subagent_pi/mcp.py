@@ -7,7 +7,8 @@ import sys
 from . import __version__
 from .client import call_timeout, request
 from .common import MAX_FRAME, AgentError, dumps
-from .schema import TOOLS, BY_NAME, validate
+from .schema import TOOLS, BY_NAME, validate, validate_op
+from .parent import capture
 
 VERSIONS=('2025-06-18','2025-03-26','2024-11-05')
 
@@ -16,7 +17,7 @@ async def serve_mcp(home):
     protocol=asyncio.StreamReaderProtocol(reader)
     transport,_=await asyncio.get_running_loop().connect_read_pipe(lambda:protocol,sys.stdin.buffer)
     tasks={}; output_lock=asyncio.Lock(); initialized=False
-    bound_scopes={}
+    bound_scopes={}; active_scopes={}
     async def output(value):
         async with output_lock:
             sys.stdout.write(dumps(value)+'\n'); sys.stdout.flush()
@@ -33,26 +34,35 @@ async def serve_mcp(home):
                 initialized=True
                 result={'protocolVersion':version,'capabilities':{'tools':{'listChanged':False}},
                         'serverInfo':{'name':'subagent-pi','version':__version__},
-                        'instructions':'Use pi_context with the actual workspace cwd, then reuse its scope. Tasks run outside the Codex native subagent runtime. Use wait/list to collect results; notifications do not wake Codex. Keep mutation request_id stable for retries.'}
+                        'instructions':'Use pi_context with the actual workspace cwd, this connection then reuses its scope and spawn cwd. Tasks run outside the Codex native subagent runtime. Bound Codex parents receive queued attention on completion, failure, stop or questions. Check parent_notifications in pi_context; unbound callers must use wait. Keep mutation request_id stable for retries.'}
             elif method=='ping': result={}
             elif not initialized: await error(rid,-32002,'Initialize first'); return
             elif method=='tools/list': result={'tools':[{k:v for k,v in t.items() if k!='_op'} for t in TOOLS]}
             elif method=='tools/call':
                 spec=BY_NAME.get(p.get('name'))
                 if not spec: await error(rid,-32602,'Unknown tool'); return
+                meta=p.get('_meta') or {}
+                caller=meta.get('threadId') if isinstance(meta,dict) else None
+                parent=capture(dict(os.environ),caller)
+                caller=parent['thread_id'] if parent else None
                 args=p.get('arguments',{})
                 validate(args,spec['inputSchema'])
                 args=dict(args)
                 if spec['_op']=='scope_open' and not args.get('scope'):
-                    existing=os.environ.get('PI_AGENTS_SCOPE') or bound_scopes.get(args.get('cwd'))
+                    existing=os.environ.get('PI_AGENTS_SCOPE') or bound_scopes.get((caller,args.get('cwd')))
                     if existing: args['scope']=existing
+                elif spec['_op']!='scope_open' and not args.get('scope') and caller in active_scopes:
+                    args['scope']=active_scopes[caller]
+                validate_op(spec['_op'],args)
                 timeout=call_timeout(spec['_op'],args,home)
-                source=None
+                source={'env':{},'parent':parent} if parent else None
                 if spec['_op']=='scope_open':
                     from .inheritance import scope_source_snapshot  # trusted values never pass through the model
-                    source=scope_source_snapshot(home,dict(os.environ))
+                    source=scope_source_snapshot(home,{k:v for k,v in os.environ.items() if k!='CODEX_THREAD_ID'})
+                    source['parent']=parent
                 value=await request(home,spec['_op'],args,timeout=timeout,source=source)
-                if spec['_op']=='scope_open': bound_scopes[args['cwd']]=value['scope']
+                if spec['_op']=='scope_open':
+                    active_scopes[caller]=value['scope']; bound_scopes[(caller,args['cwd'])]=value['scope']
                 result={'content':[{'type':'text','text':dumps(value)}],'isError':False}
             else: await error(rid,-32601,'Method not found'); return
             await output({'jsonrpc':'2.0','id':rid,'result':result})

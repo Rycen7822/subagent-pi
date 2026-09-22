@@ -6,7 +6,7 @@ max_agents_per_scope = 16
 rpc_timeout_seconds = 20
 startup_timeout_seconds = 30
 default_run_timeout_seconds = 1800
-max_wait_seconds = 600
+max_wait_seconds = 3600
 event_max_count_per_agent = 20000
 
 [inheritance]

@@ -3,12 +3,12 @@ import os
 from pathlib import Path
 import shutil
 import tomllib
-from .common import AgentError, text
+from .common import AgentError, MAX_WAIT_MS, text
 
 DEFAULT = {
     'max_resident_agents': 4, 'max_agents_per_scope': 16,
     'rpc_timeout_seconds': 20, 'startup_timeout_seconds': 30,
-    'default_run_timeout_seconds': 1800, 'max_wait_seconds': 600,
+    'default_run_timeout_seconds': 1800, 'max_wait_seconds': MAX_WAIT_MS // 1000,
     'event_max_count_per_agent': 20000,
     'inheritance': {'enabled': True, 'skills': True, 'mcp': True, 'codex_home': None, 'child_env': [], 'mcp_protocol_mode': 'auto'},
     'profiles': {
@@ -80,7 +80,7 @@ def surface_extension_path() -> Path:
     tool surface inside the child."""
     return Path(__file__).resolve().parent.parent/'extensions'/'managed-surface.ts'
 
-def launch_spec(config, profile_name, model, cwd, access):
+def launch_spec(config, profile_name, model, cwd, access, thinking=None):
     if profile_name not in config['profiles']: raise AgentError('profile_not_found',f'Unknown profile: {profile_name}')
     p = config['profiles'][profile_name]
     unknown = set(p) - {'extensions','skills','ambient_extensions','ambient_skills','tools','model','provider','thinking','env'}
@@ -123,6 +123,7 @@ def launch_spec(config, profile_name, model, cwd, access):
     actual_model = model or p.get('model')
     if actual_model: argv += ['--model',text(actual_model,'model',512)]
     if p.get('provider'): argv += ['--provider',text(p['provider'],'provider',128)]
-    if p.get('thinking'): argv += ['--thinking',text(p['thinking'],'thinking',32)]
+    actual_thinking = thinking if thinking is not None else p.get('thinking')
+    if actual_thinking is not None: argv += ['--thinking',text(actual_thinking,'thinking',32)]
     return {'argv':argv,'cwd':cwd,'profile':profile_name,'access':access,'model':actual_model,'env':env,
             'builtins':builtins,'surface':restrict}

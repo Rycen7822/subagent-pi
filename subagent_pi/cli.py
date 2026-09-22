@@ -31,7 +31,7 @@ def parser():
             q.add_argument('--request-id',default=None,help='Stable key for safe retries; generated if omitted')
         if name in {'send','steer','follow-up','inspect','interrupt','close','respawn','resume','answer'}: q.add_argument('agent_id')
         if name=='spawn':
-            q.add_argument('--cwd',default=os.getcwd()); q.add_argument('--name'); q.add_argument('--profile'); q.add_argument('--model')
+            q.add_argument('--cwd',default=os.getcwd()); q.add_argument('--name'); q.add_argument('--profile'); q.add_argument('--model'); q.add_argument('--thinking',help='A level supported by the selected Pi model; defaults to Pi settings')
             q.add_argument('--access',choices=['read','write'],default='write'); q.add_argument('--timeout-seconds',type=int)
             g=q.add_mutually_exclusive_group(required=True); g.add_argument('--task'); g.add_argument('--task-file',help='UTF-8 file, or - for stdin')
         if name in {'send','steer','follow-up','respawn','resume'}:
@@ -39,7 +39,7 @@ def parser():
             if name=='send': q.add_argument('--interrupt',action='store_true')
         if name=='list': q.add_argument('--limit',type=int,default=20)
         if name=='wait':
-            q.add_argument('run_ids',nargs='*'); q.add_argument('--mode',choices=['any','all'],default='any'); q.add_argument('--timeout-ms',type=int,default=25000)
+            q.add_argument('run_ids',nargs='*'); q.add_argument('--mode',choices=['any','all'],default='any'); q.add_argument('--timeout-ms',type=int,help='Maximum wait in milliseconds, not a fixed delay; default 10 minutes, max 1 hour, 0 checks immediately')
         if name=='inspect':
             q.add_argument('--after',type=int,default=0); q.add_argument('--limit',type=int,default=20); q.add_argument('--max-bytes',type=int,default=4096); q.add_argument('--detail',choices=['tools','full'],default='tools')
         if name in {'result','ack'}: q.add_argument('run_id')

@@ -42,6 +42,8 @@ class McpHarness:
         return await request(self.home,'spawn',{'scope':sid,'request_id':'spawn-'+str(self.reqid),'cwd':str(self.workspace),'task':task,'access':'read'})
     async def start_mcp(self):
         env=os.environ.copy(); env['PI_AGENTS_HOME']=str(self.home); env.pop('PI_AGENTS_SCOPE',None)
+        env.pop('CODEX_THREAD_ID',None); env.pop('CODEX_SESSION_ID',None)
+        env.update(getattr(self,'mcp_env',{}))
         self.mcp=await asyncio.create_subprocess_exec(sys.executable,str(ROOT/'bin/subagent-pi'),'mcp',
             stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,env=env,limit=8*1024*1024)
         self.stderr_task=asyncio.create_task(self.mcp.stderr.read())
@@ -62,6 +64,27 @@ class McpHarness:
 
 
 class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
+    async def test_long_wait_wakes_on_later_completion_or_question(self):
+        await self.initialize()
+        await self.tool('pi_context',{'cwd':str(self.workspace)})
+        for task,reason in [('done','completed'),('UI_CONFIRM','needs_input')]:
+            with self.subTest(task=task):
+                run=await self.tool('pi_spawn_agent',{'task':'delay=0.5|'+task,'access':'read','request_id':task})
+                args={'run_ids':[run['run_id']]}
+                if task=='UI_CONFIRM': args['timeout_ms']=3600000
+                waitid=await self.send('tools/call',{'name':'pi_wait_agent','arguments':args})
+                pingid=await self.send('ping')
+                responses={}
+                for _ in range(2):
+                    response=await self.receive(); responses[response['id']]=response
+                self.assertEqual(responses[pingid]['result'],{})
+                result=self.unpack(responses[waitid])
+                self.assertEqual(result['reason'],reason)
+                self.assertFalse(result['timed_out'])
+                if task=='UI_CONFIRM': self.assertEqual(result['questions'][0]['method'],'confirm')
+                else: self.assertIn('Completed: done',result['runs'][0]['result']['text'])
+                await self.tool('pi_close_agent',{'agent_id':run['agent_id'],'request_id':'close-'+task})
+
     async def test_ipc_autostart_single_daemon(self):
         a,b=await asyncio.gather(request(self.home,'ping',{}),request(self.home,'ping',{}))
         self.assertEqual(a['pid'],b['pid'])
@@ -78,13 +101,56 @@ class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
     async def test_mcp_initialize_and_list(self):
         init=await self.initialize(); self.assertEqual(init['result']['protocolVersion'],'2025-06-18')
         result=await self.rpc('tools/list'); tools=result['result']['tools']
-        self.assertEqual(len(tools),12)
+        self.assertEqual(len(tools),11)
         self.assertTrue(all('_op' not in t for t in tools))
     async def test_mcp_scope_reused_per_workspace(self):
         await self.initialize()
         a=await self.tool('pi_context',{'cwd':str(self.workspace)})
         b=await self.tool('pi_context',{'cwd':str(self.workspace)})
         self.assertEqual(a['scope'],b['scope'])
+    async def test_bound_scope_defaults_and_explicit_resume_are_connection_local(self):
+        await self.initialize()
+        first=await self.tool('pi_context',{'cwd':str(self.workspace)})
+        run=await self.tool('pi_spawn_agent',{'task':'bound scope','access':'read','request_id':'bound-spawn'})
+        self.assertEqual(run['scope'],first['scope']); self.assertEqual(run['cwd'],str(self.workspace))
+        retry=await self.tool('pi_spawn_agent',{'scope':first['scope'],'cwd':str(self.workspace),'task':'bound scope','access':'read','request_id':'bound-spawn'})
+        self.assertEqual(retry['run_id'],run['run_id'])
+        done=await self.tool('pi_wait_agent',{'run_ids':[run['run_id']],'timeout_ms':4000})
+        result=done['runs'][0]['result']
+        self.assertEqual(result['text'],'Completed: bound scope')
+        self.assertFalse(result['has_more']); self.assertFalse(done['runs'][0]['ack'])
+        await self.tool('pi_ack_result',{'request_id':'ack-bound','run_id':run['run_id'],'result_sha256':result['result_sha256']})
+        await self.tool('pi_close_agent',{'agent_id':run['agent_id'],'request_id':'stop-bound'})
+        self.mcp.stdin.close(); await self.mcp.wait(); await self.stderr_task
+        await self.initialize()
+        unbound=await self.rpc('tools/call',{'name':'pi_list_agents','arguments':{}})
+        self.assertTrue(unbound['result']['isError'])
+        fresh=await self.tool('pi_context',{'cwd':str(self.workspace)})
+        self.assertNotEqual(fresh['scope'],first['scope'])
+        resumed=await self.tool('pi_context',{'cwd':str(self.workspace),'scope':first['scope']})
+        self.assertEqual(resumed['scope'],first['scope'])
+        self.assertEqual((await self.tool('pi_list_agents',{}))['agents'][0]['id'],run['agent_id'])
+
+    async def test_wait_all_returns_questions_and_stops_without_waiting_for_other_work(self):
+        await self.initialize()
+        await self.tool('pi_context',{'cwd':str(self.workspace)})
+        slow=await self.tool('pi_spawn_agent',{'task':'delay=30|slow','access':'read','request_id':'slow'})
+        asking=await self.tool('pi_spawn_agent',{'task':'UI_CONFIRM','access':'read','request_id':'ask'})
+        remaining=await self.tool('pi_spawn_agent',{'task':'delay=30|remaining','access':'read','request_id':'remaining'})
+        ids=[slow['run_id'],asking['run_id'],remaining['run_id']]
+        alert=await self.tool('pi_wait_agent',{'run_ids':ids,'mode':'all','timeout_ms':3600000})
+        self.assertEqual(alert['reason'],'needs_input'); self.assertFalse(alert['timed_out'])
+        question=alert['questions'][0]
+        self.assertEqual(question['agent_id'],asking['agent_id']); self.assertEqual(question['method'],'confirm')
+        await self.tool('pi_answer_agent',{'agent_id':asking['agent_id'],'ui_request_id':question['id'],'answer':False,'request_id':'answer'})
+        await self.tool('pi_wait_agent',{'run_ids':[asking['run_id']],'timeout_ms':4000})
+        stopped=await self.tool('pi_close_agent',{'agent_id':slow['agent_id'],'request_id':'stop'})
+        self.assertEqual(stopped['cleanup'],'verified')
+        alert=await self.tool('pi_wait_agent',{'run_ids':ids,'mode':'all','timeout_ms':3600000})
+        self.assertEqual(alert['reason'],'failed_or_stopped')
+        self.assertIn(alert['runs'][0]['state'],('cancelled','interrupted'))
+        self.assertEqual(alert['runs'][2]['state'],'running')
+
     async def test_mcp_invalid_arguments_are_tool_errors(self):
         await self.initialize()
         r=await self.rpc('tools/call',{'name':'pi_spawn_agent','arguments':{'task':'missing fields'}})
@@ -100,7 +166,7 @@ class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         await self.initialize()
         sid=(await self.tool('pi_context',{'cwd':str(self.workspace)}))['scope']
         a=await self.tool('pi_spawn_agent',{'scope':sid,'cwd':str(self.workspace),'task':'delay=1|keep-running','access':'read','request_id':'cancel-spawn'})
-        waitid=await self.send('tools/call',{'name':'pi_wait_agent','arguments':{'scope':sid,'run_ids':[a['run_id']],'timeout_ms':5000}})
+        waitid=await self.send('tools/call',{'name':'pi_wait_agent','arguments':{'scope':sid,'run_ids':[a['run_id']],'timeout_ms':3600000}})
         await asyncio.sleep(.05)
         self.mcp.stdin.write((json.dumps({'jsonrpc':'2.0','method':'notifications/cancelled','params':{'requestId':waitid}})+'\n').encode()); await self.mcp.stdin.drain()
         self.assertEqual((await self.rpc('ping'))['result'],{})
@@ -271,6 +337,57 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.05)
         raise AssertionError(f'{text!r} x{count} not observed in {path} within {timeout}s')
 
+    async def test_model_question_reaches_wait_and_answer_returns_to_the_same_task(self):
+        self.write_config(PI_MOCK_ASK_PARENT='"1"',PI_MOCK_CONTEXT='"1"')
+        await self.initialize(); await self.tool('pi_context',{'cwd':str(self.workspace)})
+        spawned=await self.tool('pi_spawn_agent',{'task':'ask before proceeding','request_id':'ask','access':'read'})
+        alert=await self.tool('pi_wait_agent',{'run_ids':[spawned['run_id']],'mode':'all','timeout_ms':8000})
+        self.assertEqual(alert['reason'],'needs_input',alert)
+        question=alert['questions'][0]
+        self.assertEqual(question['title'],'Which branch should I use?')
+        self.assertEqual(question['run_id'],spawned['run_id'])
+        await self.tool('pi_answer_agent',{'agent_id':spawned['agent_id'],'request_id':'answer',
+            'ui_request_id':question['id'],'answer':'Use feature/parent-answer'})
+        done=await self.tool('pi_wait_agent',{'run_ids':[spawned['run_id']],'timeout_ms':8000})
+        self.assertEqual(done['reason'],'completed'); self.assertEqual(done['runs'][0]['result']['text'],'MOCK_REPLY_2')
+        trace=(self.home/'agents'/spawned['agent_id']/'stderr.log').read_text()
+        self.assertIn('Use feature/parent-answer',trace)
+
+    async def test_provider_failure_returns_to_parent_wait(self):
+        self.write_config(PI_MOCK_FAIL='"1"')
+        await self.initialize(); await self.tool('pi_context',{'cwd':str(self.workspace)})
+        spawned=await self.tool('pi_spawn_agent',{'task':'fail offline','request_id':'fail','access':'read'})
+        done=await self.tool('pi_wait_agent',{'run_ids':[spawned['run_id']],'mode':'all','timeout_ms':8000})
+        self.assertEqual(done['reason'],'failed_or_stopped'); self.assertFalse(done['timed_out'])
+        self.assertEqual(done['runs'][0]['state'],'failed'); self.assertIn('Mock provider failed',done['runs'][0]['error'])
+
+    async def test_thinking_uses_model_capabilities_defaults_and_respawn(self):
+        self.write_config(PI_MOCK_THINKING='"1"')
+        settings=self.pi_agent/'settings.json'
+        settings.write_text(json.dumps({'compaction':{'enabled':False},'defaultThinkingLevel':'low'}))
+        before=settings.read_bytes()
+        await self.initialize(); await self.tool('pi_context',{'cwd':str(self.workspace)})
+        unsupported=await self.rpc('tools/call',{'name':'pi_spawn_agent','arguments':{
+            'task':'must never call model','access':'read','request_id':'bad-thinking','thinking':'medium'}})
+        self.assertTrue(unsupported['result']['isError'])
+        error=self.unpack(unsupported)['error']
+        self.assertEqual(error['code'],'unsupported_thinking'); self.assertIn('available:',error['message'])
+        for path in (self.home/'agents').glob('*/stderr.log'):
+            self.assertNotIn('PI_MOCK_REPLY',path.read_text())
+        for requested in (None,'max'):
+            params={'task':'thinking check','access':'read','request_id':f'thinking-{requested}'}
+            if requested: params['thinking']=requested
+            spawned=await self.tool('pi_spawn_agent',params)
+            self.assertEqual(spawned['thinking'],requested or 'low')
+            self.assertEqual(spawned['available_thinking'],['low','high','max'])
+            done=await self.tool('pi_wait_agent',{'run_ids':[spawned['run_id']],'timeout_ms':8000})
+            self.assertEqual(done['runs'][0]['result']['text'],'MOCK_REPLY_1')
+            await self.tool('pi_close_agent',{'agent_id':spawned['agent_id'],'request_id':f'stop-{requested}'})
+            await self.tool('pi_respawn_agent',{'agent_id':spawned['agent_id'],'request_id':f'respawn-{requested}'})
+            state=await self.tool('pi_inspect_agent',{'agent_id':spawned['agent_id']})
+            self.assertEqual(state['agent']['thinking'],requested or 'low')
+        self.assertEqual(settings.read_bytes(),before)
+
     async def test_stock_sdk_completion_and_follow_up(self):
         self.write_config()
         scope,a,q,done,_=await self.lifecycle()
@@ -278,6 +395,41 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1','MOCK_REPLY_2'])
         close=await self.tool('pi_close_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'close'})
         self.assertEqual(close['cleanup'],'verified')
+
+    async def test_startup_commands_finish_before_tasks_without_model_calls(self):
+        self.write_config(PI_MOCK_STARTUP_COMMANDS='"1"')
+        scope,a,q,done,trace=await self.lifecycle()
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1','MOCK_REPLY_2'])
+        self.assertLess(trace.index('MOCK_COMMAND_CAPTURED'),trace.index('MOCK_COMMAND_NESTED'))
+        self.assertLess(trace.index('MOCK_COMMAND_NESTED'),trace.index('PI_MOCK_REPLY 1'))
+        report=await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id'],'limit':100,'max_bytes':16384})
+        self.assertFalse([e for e in report['events'] if e['type']=='extension_error'])
+
+    async def test_startup_commands_do_not_admit_unowned_prompts(self):
+        self.write_config(PI_MOCK_STARTUP_COMMANDS='"reject"',PI_MOCK_CONTEXT='"1"')
+        scope,a,q,done,trace=await self.lifecycle()
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1','MOCK_REPLY_2'])
+        self.assertNotIn('UNOWNED_STARTUP_INPUT',trace)
+        self.assertEqual(trace.count('MOCK_COMMAND_NESTED'),1)
+        report=await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id'],'limit':100,'max_bytes':16384})
+        errors=[e for e in report['events'] if e['type']=='extension_error']
+        self.assertEqual(len(errors),3,errors)
+        self.assertTrue(all('Input rejected' in e['data']['error'] for e in errors))
+
+    async def test_extension_stdout_cannot_corrupt_protocol_events(self):
+        self.write_config(PI_MOCK_STDOUT='"1"')
+        scope,a,q,done,trace=await self.lifecycle()
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1','MOCK_REPLY_2'])
+        self.assertIn('MOCK_EXTENSION_LOG',trace)
+        self.assertEqual(trace.count('\x1b]777;notify;pi;MOCK_NOTIFY\x07'),2)
+        report=await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id'],'limit':100,'max_bytes':16384})
+        kinds=[e['type'] for e in report['events']]
+        self.assertNotIn('protocol_warning',kinds)
+        self.assertEqual(kinds.count('agent_end'),2)
+        self.assertEqual(kinds.count('run_terminal'),2)
 
     async def test_before_settle_work_and_native_continuation(self):
         self.write_config(PI_MOCK_CONTINUE='"1"',PI_MOCK_SETTLE_MS='"100"')
@@ -311,7 +463,11 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
                           PI_MOCK_BLOCK_RESULT='"handled"')
         scope,a,q,done,trace=await self.lifecycle()
         self.assertFalse(done['timed_out'],done)
-        self.assertEqual([r['state'] for r in done['runs']],['failed','completed'])
+        self.assertEqual(done['reason'],'failed_or_stopped')
+        self.assertEqual(done['runs'][0]['state'],'failed')
+        following=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[q['run_id']],'timeout_ms':8000})
+        self.assertEqual(following['runs'][0]['state'],'completed')
+        done['runs'][1]=following['runs'][0]
         self.assertEqual(await self.results(scope,done['runs']),['','MOCK_REPLY_1'])
         first=(await self.payloads(scope,done['runs']))[0]
         self.assertIn('without producing',first['run']['error'])

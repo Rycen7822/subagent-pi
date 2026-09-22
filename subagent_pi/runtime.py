@@ -16,6 +16,7 @@ from .binding import bind_scope_source, doctor
 from .common import (TERMINAL, AgentError, RESIDENT_AGENT_STATES, bounded, crop,
     dumps, group_members, identifier, integer, new_id, now, text)
 from .config import load_config, launch_spec
+from . import parent
 from .store import Store
 from .worker import (RESULT_CAP, boot_worker, message_text, ownership,
     reap_orphan, terminate)
@@ -40,6 +41,7 @@ class Runtime:
         self.shutdown_requested = asyncio.Event()
         self.closing = False
         self.background = set()
+        self.parent_delivery = None
         self._reconcile()
 
     def spawn_task(self,coro):
@@ -54,6 +56,7 @@ class Runtime:
     def _reconcile(self):
         """A new daemon cannot recover old pipes; never claim a live orphan is
         reattached. Every resident row is re-judged from its owner record."""
+        self.store.execute("UPDATE parent_notifications SET state='unknown',error='Daemon restarted during delivery; not retried' WHERE state='sending'")
         for a in self.store.all('SELECT * FROM agents'):
             verdict = ownership(self.home/'agents'/a['id'], a)
             if a['state'] in RESIDENT_AGENT_STATES:
@@ -72,6 +75,8 @@ class Runtime:
         async def wake():
             async with self.changed: self.changed.notify_all()
         self.spawn_task(wake())
+        if not self.closing and (self.parent_delivery is None or self.parent_delivery.done()):
+            self.parent_delivery=self.spawn_task(parent.deliver_pending(self))
 
     def event(self,w,kind,payload):
         self.store.event(w.agent['id'],w.run_id,w.generation,kind,bounded(payload,4096))
@@ -139,6 +144,7 @@ class Runtime:
                 self.store.agent_update(a['id'],state='needs_input')
                 if w.run_id: self.store.execute("UPDATE runs SET state='needs_input' WHERE id=?",(w.run_id,))
                 self.event(w,'needs_input',e)
+                if w.run_id: self.store.attention(w.run_id,'question',str(e['id']))
                 self.store.bump(a['scope']); self.notify()
             return
         if kind=='agent_end':
@@ -292,8 +298,9 @@ class Runtime:
             else:
                 sid=new_id('scope_')
                 self.store.execute('INSERT INTO scopes(id,cwd,label,created) VALUES(?,?,?,?)',(sid,cwd,text(p.get('label','Codex Pi delegation'),'label',160),now()))
+            parent.bind(self,sid,source)
             bind_scope_source(self,sid,p,source)
-            return {'scope':sid,'cwd':cwd, 'outstanding':views.outstanding(self,sid)}
+            return {'scope':sid,'cwd':cwd, 'outstanding':views.outstanding(self,sid),'parent_notifications':parent.status(self,sid)}
         if op=='shutdown':
             if not p.get('force') and any(not w.closed for w in self.workers.values()):
                 raise AgentError('agents_present','Close resident agents first or use daemon stop --force')
@@ -306,8 +313,10 @@ class Runtime:
                     'warning':'Managed Pi runs with your OS-user permissions; no inherited Codex sandbox.'}
             if p.get('inheritance'): report['inheritance']=doctor(self)
             return report
-        sid=identifier(p.get('scope'),'scope'); self.store.scope(sid)
+        sid=identifier(p.get('scope'),'scope'); scope=self.store.scope(sid)
+        if op=='spawn' and 'cwd' not in p: p={**p,'cwd':scope['cwd']}
         if op in {'spawn','send','interrupt','close','respawn','ack','answer'}:
+            parent.bind(self,sid,source,allow_new=False)
             key=identifier(p.get('request_id'),'request_id')
             async with self.request_locks[(sid,key)]:
                 previous=self.store.request_begin(sid,key,op,p)
@@ -323,7 +332,7 @@ class Runtime:
             limit=integer(p.get('limit',20),'limit',1,50)
             rows=self.store.all('SELECT * FROM agents WHERE scope=? ORDER BY created DESC LIMIT ?',(sid,limit))
             total=self.store.one('SELECT COUNT(*) n FROM agents WHERE scope=?',(sid,))['n']
-            return {'scope':sid,'agents':[views.brief_agent(self,a) for a in rows],'total':total,'omitted':max(0,total-len(rows)), 'outstanding':views.outstanding(self,sid,limit)}
+            return {'scope':sid,'agents':[views.brief_agent(self,a) for a in rows],'total':total,'omitted':max(0,total-len(rows)), 'outstanding':views.outstanding(self,sid,limit),'parent_notifications':parent.status(self,sid)}
         if op=='inspect': return views.inspect(self,p)
         if op=='result': return views.result(self,p)
         if op=='wait': return await views.wait(self,p)
@@ -335,7 +344,7 @@ class Runtime:
             async with self.admission:
                 count=self.store.one('SELECT COUNT(*) n FROM agents WHERE scope=?',(sid,))['n']
                 if count>=self.config['max_agents_per_scope']: raise AgentError('scope_limit','Scope agent limit reached; open a new scope for another task')
-                cwd_input=Path(text(p.get('cwd'),'cwd',4096)).expanduser()
+                cwd_input=Path(text(p.get('cwd',self.store.scope(sid)['cwd']),'cwd',4096)).expanduser()
                 if not cwd_input.is_absolute(): raise AgentError('invalid_cwd','cwd must be absolute')
                 cwd=str(cwd_input.resolve())
                 root=Path(self.store.scope(sid)['cwd'])
@@ -344,7 +353,7 @@ class Runtime:
                 access=p.get('access','write')
                 if access not in {'read','write'}: raise AgentError('invalid_argument','access must be read or write')
                 profile=p.get('profile','reader' if access=='read' else 'default')
-                spec=launch_spec(self.config,profile,p.get('model'),cwd,access)
+                spec=launch_spec(self.config,profile,p.get('model'),cwd,access,p.get('thinking'))
                 # Persist environment NAMES only; values are re-read from the operator
                 # config at every boot and never enter the ledger or launch.json.
                 spec={**spec,'env':{},'env_names':sorted(spec.get('env',{}))}
@@ -369,9 +378,10 @@ class Runtime:
                     except AgentError as e:
                         if self.store.run(sid,rid)['state']=='starting':
                             self.store.finish(rid,'failed','',e.message)
-                            self.store.agent_update(aid,state='crashed')
+                            self.store.agent_update(aid,state='crashed'); self.notify()
                         raise AgentError(e.code,e.message,agent_id=aid,run_id=rid)
-                return {'agent_id':aid,'run_id':rid,'scope':sid,'state':self.store.run(sid,rid)['state'],'cwd':cwd}
+                return {'agent_id':aid,'run_id':rid,'scope':sid,'state':self.store.run(sid,rid)['state'],'cwd':cwd,
+                        **views.model_settings(self.store.agent(sid,aid))}
         if op=='ack':
             r=self.store.run(sid,identifier(p.get('run_id'),'run_id'))
             if r['state'] not in TERMINAL: raise AgentError('not_terminal','Cannot acknowledge an active run')

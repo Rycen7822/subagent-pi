@@ -12,6 +12,8 @@ import time
 import uuid
 
 MAX_FRAME = 8 * 1024 * 1024
+DEFAULT_WAIT_MS = 600_000
+MAX_WAIT_MS = 3_600_000
 # Agent states in which a worker may still hold processes or work behind it; the
 # workspace exclusion and crash reconciliation both use exactly this set.
 RESIDENT_AGENT_STATES = ('starting', 'running', 'needs_input', 'idle', 'stopping', 'orphaned')

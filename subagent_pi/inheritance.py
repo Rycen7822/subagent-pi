@@ -592,7 +592,9 @@ def scope_source_snapshot(home: Path, environ: dict) -> dict:
     cfg = load_config(home)
     inh = cfg['inheritance']
     child_env = inh.get('child_env', [])
+    from .parent import capture
+    parent = capture(environ, environ.get('CODEX_THREAD_ID'))
     if not inh.get('enabled', True):
-        return {'env': capture_scope_env(None, environ, extra_names=child_env)}
+        return {'env': capture_scope_env(None, environ, extra_names=child_env), 'parent': parent}
     codex_home, _ = resolve_codex_home(inh, {'CODEX_HOME': environ.get('CODEX_HOME')})
-    return {'env': capture_scope_env(codex_home, environ, extra_names=child_env)}
+    return {'env': capture_scope_env(codex_home, environ, extra_names=child_env), 'parent': parent}

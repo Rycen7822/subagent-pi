@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- 事件等待默认 10 分钟、最长 1 小时；任务完成/提问/异常即时返回，取消等待不取消任务。统一 CLI/MCP/IPC 预算，Codex 安装使用原生清单声明本插件的长调用超时，无需宿主补丁或全局配置修改。
+- 自动绑定 MCP 调用元数据中的父会话；完成/失败/停止/问题通过 codex queue 唤醒仍加载的空闲父会话。通知持久化去重，未知提交不重试，不强行打断或复活已停止的父会话。
+
+- MCP 连接复用 scope/cwd；wait 返回有界结果与问题，失败/停止优先返回；统一停止工具。新增受管 ask_parent 和按 Pi 实际模型校验的 thinking，保留精确 hash ack；父会话可通过 Codex 官方队列自动续跑。
+- 幂等摘要不再受 JSON 字段顺序影响，仍接受旧版本按原字段顺序重试的已存回执。
+- 修复启动期扩展本地命令被误拒绝，以及桌面通知等 stdout 输出破坏 JSON 协议帧的问题；保留无归属模型输入拒绝，不修改 Pi 宿主。
 - 改用插件拥有的 Pi SDK 子进程与串行任务队列，移除全部宿主补丁及能力修订协商。完成事件绑定 run_id，排空 SDK 调用和扩展续跑后才结算。
 - steer 改为同一任务内的有序续跑，保留完整 input/before_agent_start 路径；handled 主输入明确失败，后继任务继续。过期异步输入不能进入新任务。
 - interrupt 统一终止并核验受管进程组；显式 interrupt+新消息在验证清理后启动新 generation。不会修改或终止普通 Pi。
@@ -79,6 +85,10 @@ tightens its previous guarantee.
 
 ## Unreleased
 
+- 自动绑定 MCP 调用元数据中的父会话；完成/失败/停止/问题通过 codex queue 唤醒仍加载的空闲父会话。通知持久化去重，未知提交不重试，不强行打断或复活已停止的父会话。
+
+- MCP 连接复用 scope/cwd；wait 返回有界结果与问题，失败/停止优先返回；统一停止工具。新增受管 ask_parent 和按 Pi 实际模型校验的 thinking，保留精确 hash ack；父会话可通过 Codex 官方队列自动续跑。
+- 幂等摘要不再受 JSON 字段顺序影响，仍接受旧版本按原字段顺序重试的已存回执。
 - GitHub Actions CI：python-core（3.11/3.14）与 integration（真实 Pi 0.85.1 + Node 22.19.0，bridge tests 真实执行 + ZIP/FILES.sha256 校验）；0 模型调用、0 secrets、`contents: read`。
 
 ## 0.2.7 — 2026-09-15

@@ -962,7 +962,7 @@ class RealPiSkillBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence['ok'],'true')
         self.assertEqual(sorted(evidence['builtins'].split(',')),['find','grep','ls','read'])
         self.assertEqual(self.active_tools(probe),
-                         set(evidence['builtins'].split(',')) | {'bash','codex_mcp'})
+                         set(evidence['builtins'].split(',')) | {'bash','codex_mcp','ask_parent'})
         self.closed=True; await self.rt.dispatch('close',{'scope':self.scope,'agent_id':aid,'request_id':'live-override-close-2'})
     async def test_reader_without_an_override_restricts_every_write_builtin(self):
         self.write_probe_extension()

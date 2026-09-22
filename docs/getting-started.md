@@ -23,9 +23,9 @@ export PATH="$HOME/.local/bin:$PATH"
 
 默认安装目录：`~/.local/share/subagent-pi-marketplace/plugins/subagent-pi`。本地目录清单：`~/.local/share/subagent-pi-marketplace/.agents/plugins/marketplace.json`。CLI：`~/.local/bin/subagent-pi`。
 
-脚本生成 portable `plugin.json` / `mcp.json`，同时提供旧式 `.codex-plugin/plugin.json` / `.mcp.json` 回退。Portable 配置使用宿主按插件根目录解析的 `./bin/subagent-pi`，安装时在启动脚本中固定 Python 解释器；旧式配置使用绝对路径。两者均不依赖 MCP 启动 cwd。
+源码包保留通用 `plugin.json` / `mcp.json`；安装到 Codex 时选择 `.codex-plugin/plugin.json` / `.mcp.json` 原生清单，并在安装副本中移除优先级更高的通用 plugin.json。这样可以为本插件设置 `tool_timeout_sec=3630`，避免一小时等待被 Codex 默认五分钟 MCP 超时截断。原生配置使用固定解释器和绝对路径，不依赖启动 cwd；不改 Codex 全局配置或宿主源码。
 
-在 Codex 输入 `/plugins`，安装 Subagent Pi Local 中的 Subagent Pi，再开启新会话。`--register` 不等于已经通过 Codex UI 安装插件。旧版不支持 portable manifest 时依赖兼容清单；宿主能力仍需本机验证。
+在 Codex 输入 `/plugins`，安装 Subagent Pi Local 中的 Subagent Pi，再开启新会话。`--register` 不等于已经安装插件；也可用 `codex plugin add subagent-pi@subagent-pi-local` 完成安装。已运行会话的 MCP 连接不会自动采用新超时。
 
 安装可以不调用 Codex：
 
