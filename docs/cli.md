@@ -29,7 +29,7 @@ subagent-pi codex [-- CODEX_ARGS...]
 ```text
 subagent-pi spawn [--scope ID] [--cwd DIR] [--name NAME]
   [--profile PROFILE] [--model PROVIDER/MODEL] [--access read|write]
-  [--timeout-seconds N] [--request-id KEY]
+  [--idle-timeout-seconds N] [--request-id KEY]
   (--task TEXT | --task-file FILE_OR_DASH)
 
 subagent-pi send AGENT_ID --scope ID (--message TEXT | --message-file FILE_OR_DASH)

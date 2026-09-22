@@ -8,7 +8,7 @@ from .common import AgentError, MAX_WAIT_SECONDS, text
 DEFAULT = {
     'max_resident_agents': 4, 'max_agents_per_scope': 16,
     'rpc_timeout_seconds': 20, 'startup_timeout_seconds': 30,
-    'default_run_timeout_seconds': 1800, 'max_wait_seconds': MAX_WAIT_SECONDS,
+    'default_idle_timeout_seconds': 1800, 'max_wait_seconds': MAX_WAIT_SECONDS,
     'event_max_count_per_agent': 20000,
     'inheritance': {'enabled': True, 'skills': True, 'mcp': True, 'codex_home': None, 'child_env': [], 'mcp_protocol_mode': 'auto'},
     'profiles': {
@@ -32,6 +32,10 @@ def load_config(home: Path):
     file = home/'config.toml'
     if file.exists():
         with file.open('rb') as f: raw = tomllib.load(f)
+        # Existing config values now specify inactivity, never total runtime.
+        if 'default_run_timeout_seconds' in raw:
+            old = raw.pop('default_run_timeout_seconds')
+            raw.setdefault('default_idle_timeout_seconds',old)
         unknown = set(raw) - set(DEFAULT) - {'pi_command'}
         if unknown: raise AgentError('invalid_config', f'Unknown config keys: {sorted(unknown)}')
         for key,value in raw.items():

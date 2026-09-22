@@ -730,6 +730,7 @@ class StoreMigration(unittest.TestCase):
         db=sqlite3.connect(base/'registry.sqlite')
         db.executescript('''
         CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
+        CREATE TABLE runs(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,task TEXT NOT NULL,created REAL NOT NULL,started REAL,ended REAL,deadline REAL,result_path TEXT,result_sha TEXT,ack INTEGER NOT NULL DEFAULT 0,error TEXT,usage TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE scopes(id TEXT PRIMARY KEY,cwd TEXT NOT NULL,label TEXT NOT NULL,created REAL NOT NULL,revision INTEGER NOT NULL DEFAULT 0);
         INSERT INTO meta VALUES('schema','1');
         INSERT INTO scopes(id,cwd,label,created) VALUES('scope_x','/tmp','old',1);
@@ -746,6 +747,7 @@ class StoreMigration(unittest.TestCase):
         db=sqlite3.connect(base/'registry.sqlite')
         db.executescript('''
         CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
+        CREATE TABLE runs(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,task TEXT NOT NULL,created REAL NOT NULL,started REAL,ended REAL,deadline REAL,result_path TEXT,result_sha TEXT,ack INTEGER NOT NULL DEFAULT 0,error TEXT,usage TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE scopes(id TEXT PRIMARY KEY,cwd TEXT NOT NULL,label TEXT NOT NULL,created REAL NOT NULL,revision INTEGER NOT NULL DEFAULT 0,
             codex_home TEXT,codex_source TEXT,inheritance INTEGER NOT NULL DEFAULT 1);
         INSERT INTO meta VALUES('schema','2');

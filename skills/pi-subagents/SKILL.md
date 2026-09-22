@@ -17,7 +17,7 @@ Avoid overlapping writers, including edits performed by the parent. access=read 
 Keep mutation `request_id` stable across identical retries; inspect uncertain outcomes.
 
 Keep exactly one `pi_wait_agent` active for the remaining run IDs; do not poll progress with inspect/list.
-Wait uses `timeout_seconds` (default 600, max 3600, 0 checks immediately); any completion/question/problem returns early, including problems in all mode. Remove returned terminal runs from the next wait; cancelling a wait never stops Pi.
+Tasks have no total deadline; `idle_timeout_seconds` limits model silence (default 1800), paused during tool execution or parent questions. Wait uses `timeout_seconds` (default 600, max 3600, 0 checks immediately); any completion/question/problem returns early, including problems in all mode. Remove returned terminal runs from the next wait; cancelling a wait never stops Pi.
 Inspect only for a user-requested progress report, an error, an uncertain mutation or diagnosis; reuse cursors. Page large results with `pi_agent_result`.
 steer continues the same run after the current SDK call finishes; it cannot redirect an in-flight call. follow_up creates a separate run; send requires idle.
 Queued is not consumed. For an authorized urgent stop use pi_close_agent; interrupt=true explicitly stops and replaces the process, preserving its session but not rolling back effects.

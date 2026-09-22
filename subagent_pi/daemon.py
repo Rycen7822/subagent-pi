@@ -81,7 +81,7 @@ async def serve(home: Path):
         loop=asyncio.get_running_loop()
         for sig in (signal.SIGINT,signal.SIGTERM): loop.add_signal_handler(sig,runtime.shutdown_requested.set)
         runtime.notify()  # Deliver durable pending attention, including restart reconciliation.
-        deadline=asyncio.create_task(runtime.deadline_loop())
+        watchdog=asyncio.create_task(runtime.idle_loop())
         async with server:
             await runtime.shutdown_requested.wait()
         # New mutations stop at socket close. Give admitted operations a bounded drain window.
@@ -89,7 +89,7 @@ async def serve(home: Path):
             _,pending=await asyncio.wait(operations,timeout=35)
             for t in pending: t.cancel()
             await asyncio.gather(*pending,return_exceptions=True)
-        deadline.cancel(); await asyncio.gather(deadline,return_exceptions=True)
+        watchdog.cancel(); await asyncio.gather(watchdog,return_exceptions=True)
         await runtime.shutdown()
         for t in list(clients): t.cancel()
     finally:

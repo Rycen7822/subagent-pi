@@ -1,15 +1,18 @@
 from __future__ import annotations
 import asyncio
+import gc
 import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import stat as statmod
 import subprocess
 import sys
 import tempfile
 import unittest
+import weakref
 from unittest import mock as m
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -338,6 +341,115 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.rt.store.agent(self.scope,s['agent_id'])['session_file'],session)
         await self.wait(revived['run_id'])
         self.assertIn('continued',(await self.result(revived['run_id']))['text'])
+    async def test_closed_workers_are_collected_without_losing_results_or_replay(self):
+        refs=[]; completed=[]
+        for i in range(8):
+            params={'scope':self.scope,'request_id':self.key(),'cwd':str(self.workspace),'task':'BIG','access':'read'}
+            run=await self.rt.dispatch('spawn',params)
+            refs.append(weakref.ref(self.rt.workers[run['agent_id']]))
+            await self.wait(run['run_id'])
+            result=await self.result(run['run_id'])
+            await self.rt.dispatch('ack',{'scope':self.scope,'request_id':self.key(),'run_id':run['run_id'],
+                                          'result_sha256':result['result_sha256']})
+            self.assertEqual((await self.mutation('close',run['agent_id']))['cleanup'],'verified')
+            completed.append((params,run,result['result_sha256']))
+        await self.until(lambda: not self.rt.workers,timeout=2)
+        gc.collect()
+        self.assertTrue(all(ref() is None for ref in refs))
+        self.assertEqual(len(self.rt.agent_locks),0)
+        self.assertEqual(len(self.rt.request_locks),0)
+        for params,run,sha in completed:
+            self.assertEqual((await self.result(run['run_id']))['result_sha256'],sha)
+            replay=await self.rt.dispatch('spawn',params)
+            self.assertTrue(replay['replayed']); self.assertEqual(replay['agent_id'],run['agent_id'])
+        revived=await self.mutation('respawn',completed[0][1]['agent_id'],message='after retirement')
+        await self.wait(revived['run_id'])
+        self.assertEqual((await self.result(revived['run_id']))['text'],'Completed: after retirement')
+
+    async def test_old_exit_cleanup_cannot_retire_a_replacement_worker(self):
+        run=await self.spawn(); await self.wait(run['run_id'])
+        old=self.rt.workers[run['agent_id']]
+        reached=asyncio.Event(); release=asyncio.Event()
+        original=self.rt.worker_exited
+        async def delayed(w,code):
+            if w is old:
+                reached.set(); await release.wait()
+            await original(w,code)
+        with m.patch.object(self.rt,'worker_exited',side_effect=delayed):
+            try:
+                await self.mutation('close',run['agent_id'])
+                await asyncio.wait_for(reached.wait(),3)
+                revived=await self.mutation('respawn',run['agent_id'],message='delay=0.3|replacement')
+                new=self.rt.workers[run['agent_id']]
+                exit_task=old.tasks[2]; release.set()
+                await asyncio.wait_for(exit_task,3)
+                await self.wait(revived['run_id'])
+                self.assertIs(self.rt.workers[run['agent_id']],new)
+                self.assertEqual((await self.result(revived['run_id']))['text'],'Completed: replacement')
+            finally: release.set()
+
+    async def test_lock_waiters_keep_one_identity_and_idle_locks_are_reclaimed(self):
+        for locks in (self.rt.agent_locks,self.rt.request_locks):
+            entered=asyncio.Event(); release=asyncio.Event(); waiting=asyncio.Event()
+            second=asyncio.Event(); release_second=asyncio.Event(); order=[]
+            async def first():
+                async with locks['shared']:
+                    entered.set(); await release.wait()
+            async def cancelled():
+                waiting.set()
+                async with locks['shared']: self.fail('Cancelled waiter entered')
+            async def next_owner():
+                async with locks['shared']:
+                    order.append('second'); second.set(); await release_second.wait()
+            async def last():
+                async with locks['shared']: order.append('last')
+            a=asyncio.create_task(first()); await entered.wait()
+            b=asyncio.create_task(cancelled()); await waiting.wait()
+            c=asyncio.create_task(next_owner()); await asyncio.sleep(0)
+            b.cancel(); await asyncio.gather(b,return_exceptions=True)
+            gc.collect(); release.set(); await second.wait()
+            d=asyncio.create_task(last()); await asyncio.sleep(0)
+            self.assertEqual(order,['second'])
+            release_second.set(); await asyncio.gather(a,c,d)
+            # A retained cancelled Task owns its exception traceback (and lock).
+            # The daemon releases finished tasks; mirror that ownership here.
+            del a,b,c,d
+            gc.collect(); self.assertEqual(order,['second','last'])
+            self.assertEqual(len(locks),0)
+    async def test_rpc_timeout_includes_waiting_for_the_write_lock(self):
+        run=await self.spawn(); await self.wait(run['run_id'])
+        w=self.rt.workers[run['agent_id']]
+        async with w.write_lock:
+            with self.assertRaises(AgentError) as caught:
+                await asyncio.wait_for(w.rpc('get_state',timeout=.1),1)
+            self.assertEqual(caught.exception.code,'rpc_timeout')
+            self.assertEqual(w.pending,{})
+        self.assertFalse((await w.rpc('get_state'))['isStreaming'])
+    async def test_repeated_write_timeouts_do_not_accumulate_buffered_commands(self):
+        run=await self.spawn('delay=30|blocked')
+        w=self.rt.workers[run['agent_id']]
+        transport=w.proc.stdin.transport
+        high=transport.get_write_buffer_limits()[1]
+        os.killpg(w.proc.pid,signal.SIGSTOP)
+        async def timed_out_write():
+            with self.assertRaises(AgentError) as caught:
+                await w.rpc('steer',timeout=.1,message='x'*60000)
+            self.assertEqual(caught.exception.code,'rpc_timeout')
+            self.assertEqual(w.pending,{})
+        try:
+            for _ in range(6):
+                await timed_out_write()
+                if transport.get_write_buffer_size()>high: break
+            size=transport.get_write_buffer_size()
+            self.assertGreater(size,high)
+            for _ in range(4):
+                await timed_out_write()
+                self.assertEqual(transport.get_write_buffer_size(),size)
+        finally:
+            try: await self.mutation('close',run['agent_id'])
+            finally:
+                try: os.killpg(w.proc.pid,signal.SIGCONT)
+                except ProcessLookupError: pass
     async def test_interrupt_leaves_a_verified_dormant_session_for_respawn(self):
         s=await self.spawn('delay=2|work')
         r=await self.mutation('interrupt',s['agent_id'])
@@ -401,12 +513,126 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r['runs'][0]['state'],'needs_input')
         await self.mutation('answer',s['agent_id'],ui_request_id='ui-1',answer=False)
         await self.wait(s['run_id']); self.assertIn('False',(await self.result(s['run_id']))['text'])
-    async def test_deadline_interrupts_not_success(self):
-        loop=asyncio.create_task(self.rt.deadline_loop())
+    async def test_model_silence_times_out_and_cancels_queued_work(self):
+        loop=asyncio.create_task(self.rt.idle_loop())
         try:
-            s=await self.spawn('delay=5|work',timeout_seconds=1)
+            s=await self.spawn('model=silent|delay=5|work',idle_timeout_seconds=1)
+            queued=await self.mutation('send',s['agent_id'],mode='follow_up',message='must not execute')
+            pid=self.rt.workers[s['agent_id']].proc.pid
             r=await self.wait(s['run_id']); self.assertEqual(r['runs'][0]['state'],'timed_out')
+            self.assertIn('No model output or thinking progress',(await self.result(s['run_id']))['run']['error'])
+            self.assertEqual(self.rt.store.run(self.scope,queued['run_id'])['state'],'cancelled')
+            self.assertEqual(group_members(pid),[])
         finally: loop.cancel(); await asyncio.gather(loop,return_exceptions=True)
+
+    async def test_streaming_progress_has_no_total_deadline(self):
+        loop=asyncio.create_task(self.rt.idle_loop())
+        try:
+            for kind in ('text','thinking','toolcall'):
+                with self.subTest(kind=kind):
+                    s=await self.spawn(f'model={kind}|delay=2.2|work',idle_timeout_seconds=1)
+                    done=await self.wait(s['run_id'])
+                    self.assertEqual(done['runs'][0]['state'],'completed',done)
+                    self.assertEqual(self.events(s['agent_id'],'message_update'),[])
+                    await self.mutation('close',s['agent_id'])
+        finally: loop.cancel(); await asyncio.gather(loop,return_exceptions=True)
+
+    async def test_notifications_do_not_hide_a_stalled_model(self):
+        loop=asyncio.create_task(self.rt.idle_loop())
+        try:
+            s=await self.spawn('model=noise|delay=5|work',idle_timeout_seconds=1)
+            self.assertEqual((await self.wait(s['run_id']))['runs'][0]['state'],'timed_out')
+        finally: loop.cancel(); await asyncio.gather(loop,return_exceptions=True)
+
+    async def test_silent_parallel_tools_are_not_model_silence(self):
+        loop=asyncio.create_task(self.rt.idle_loop())
+        try:
+            s=await self.spawn('parallel=1|delay=3|work',idle_timeout_seconds=1)
+            done=await self.wait(s['run_id'])
+            self.assertEqual(done['runs'][0]['state'],'completed',done)
+            self.assertEqual(self.rt.workers[s['agent_id']].active_tools,{})
+        finally: loop.cancel(); await asyncio.gather(loop,return_exceptions=True)
+
+    async def test_tool_exit_restarts_silence_budget(self):
+        s=await self.spawn('delay=1|after_tool=120|work',idle_timeout_seconds=1)
+        w=self.rt.workers[s['agent_id']]
+        await self.until(lambda:w.active_tools)
+        w.last_progress-=3600
+        await self.rt.check_idle()
+        self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'running')
+        await self.until(lambda:not w.active_tools)
+        await self.rt.check_idle()
+        self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'running')
+        w.last_progress-=2
+        await self.rt.check_idle()
+        self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'timed_out')
+
+    async def test_parent_wait_pauses_until_answer_or_ui_close(self):
+        for answered in (True,False):
+            with self.subTest(answered=answered):
+                s=await self.spawn('UI_CONFIRM',idle_timeout_seconds=1)
+                self.assertEqual((await self.wait(s['run_id']))['runs'][0]['state'],'needs_input')
+                w=self.rt.workers[s['agent_id']]
+                w.last_progress-=3600
+                await self.rt.check_idle()
+                self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'needs_input')
+                if answered:
+                    await self.mutation('answer',s['agent_id'],ui_request_id='ui-1',answer=True)
+                    self.assertEqual((await self.wait(s['run_id']))['runs'][0]['state'],'completed')
+                else:
+                    self.rt.on_event(w,{'type':'extension_ui_closed','id':'ui-1'})
+                    await self.rt.check_idle()
+                    self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'running')
+                    w.last_progress-=2
+                    await self.rt.check_idle()
+                    self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'timed_out')
+                await self.mutation('close',s['agent_id'])
+
+    async def test_idle_observation_rechecked_after_control_lock(self):
+        s=await self.spawn('model=silent|delay=120|work',idle_timeout_seconds=1)
+        w=self.rt.workers[s['agent_id']]
+        lock=self.rt.agent_locks[s['agent_id']]
+        async with lock:
+            w.last_progress-=2
+            checking=asyncio.create_task(self.rt.check_idle())
+            await asyncio.sleep(0)
+            self.rt.on_event(w,{'type':'message_update','assistantMessageEvent':{'type':'thinking_delta','delta':'new'}})
+        await checking
+        self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'running')
+
+    async def test_retry_backoff_is_not_silence_and_empty_delta_is_not_progress(self):
+        s=await self.spawn('model=silent|delay=120|work',idle_timeout_seconds=1)
+        w=self.rt.workers[s['agent_id']]
+        self.rt.on_event(w,{'type':'auto_retry_start','delayMs':5000})
+        w.last_progress-=2
+        await self.rt.check_idle()
+        self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'running')
+        self.rt.on_event(w,{'type':'auto_retry_end'})
+        w.last_progress-=2
+        self.rt.on_event(w,{'type':'message_update','assistantMessageEvent':{'type':'thinking_delta','delta':''}})
+        await self.rt.check_idle()
+        self.assertEqual(self.rt.store.run(self.scope,s['run_id'])['state'],'timed_out')
+
+    async def test_v4_ledger_keeps_results_and_does_not_reuse_old_deadlines(self):
+        s=await self.spawn('persisted result'); await self.wait(s['run_id'])
+        before=await self.result(s['run_id'])
+        await self.mutation('close',s['agent_id'])
+        await self.rt.shutdown()
+        import sqlite3
+        with sqlite3.connect(self.home/'registry.sqlite') as db:
+            db.execute('ALTER TABLE runs DROP COLUMN idle_timeout_seconds')
+            db.execute("UPDATE meta SET value='4' WHERE key='schema'")
+            db.execute('UPDATE runs SET deadline=1')
+        self.rt=Runtime(self.home)
+        after=await self.result(s['run_id'])
+        self.assertEqual((after['text'],after['result_sha256']),(before['text'],before['result_sha256']))
+        row=self.rt.store.run(self.scope,s['run_id'])
+        self.assertEqual(row['deadline'],1)  # history retained, not reused
+        self.assertIsNone(row['idle_timeout_seconds'])
+        await self.mutation('respawn',s['agent_id'])
+        queued=await self.mutation('send',s['agent_id'],mode='follow_up',message='new work')
+        self.assertEqual((await self.wait(queued['run_id']))['runs'][0]['state'],'completed')
+        self.assertEqual(self.rt.store.run(self.scope,queued['run_id'])['idle_timeout_seconds'],1800)
     async def test_missing_pi_reports_startup_failure(self):
         self.rt.config['pi_command']=['/definitely/missing/pi']
         with self.assertRaises(AgentError) as cm: await self.spawn()

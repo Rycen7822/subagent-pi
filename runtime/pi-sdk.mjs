@@ -150,7 +150,12 @@ function dialog(method, fields, options) {
   return new Promise(resolve => {
     let timer;
     const cancel = () => finish(undefined);
-    const finish = value => { clearTimeout(timer); options?.signal?.removeEventListener('abort', cancel); dialogs.delete(id); resolve(value); };
+    const finish = value => {
+      if (!dialogs.delete(id)) return;
+      clearTimeout(timer); options?.signal?.removeEventListener('abort', cancel);
+      output({ type: 'extension_ui_closed', id });
+      resolve(value);
+    };
     if (options?.signal?.aborted) { resolve(undefined); return; }
     dialogs.set(id, finish);
     options?.signal?.addEventListener('abort', cancel, { once: true });

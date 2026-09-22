@@ -31,7 +31,7 @@ def boot_budget(home):
 
 def call_timeout(op, params, home=None):
     """Client-side wait for one IPC call, derived from the daemon's own budget.
-    For boot ops the run deadline (timeout_seconds) is irrelevant: the call returns as
+    For boot ops the model inactivity limit is irrelevant: the call returns as
     soon as the worker is up, regardless of how long the task may then run."""
     if op in BOOT_OPS:
         return max(BASE_TIMEOUT, boot_budget(home))

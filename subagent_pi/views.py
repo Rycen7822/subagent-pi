@@ -17,7 +17,8 @@ def brief_agent(rt, a):
     result={k:a[k] for k in ('id','name','scope','cwd','state','generation','current_run','cleanup')}
     result.update(model_settings(a))
     if w and not w.closed:
-        result.update(current_tool=w.current_tool,last_activity=w.last_activity)
+        result.update(current_tool=w.current_tool,active_tools=list(w.active_tools.values()),last_activity=w.last_activity,
+                      idle_seconds=w.idle_seconds(),idle_timeout_seconds=w.idle_timeout_seconds)
         if w.ui: result['pending_input']=list(w.ui.values())[:4]
     return result
 
@@ -45,7 +46,7 @@ def inspect(rt,p):
     current=a['current_run']
     if current:
         run=rt.store.run(p['scope'],current)
-        result['run']={k:run[k] for k in ('id','created','started','ended','deadline')}
+        result['run']={k:run[k] for k in ('id','created','started','ended','idle_timeout_seconds')}
     earliest=rt.store.one('SELECT MIN(seq) n FROM events WHERE agent_id=?',(a['id'],))['n']
     result['history_pruned']=bool(after and earliest and after<earliest-1)
     # Grow the page one event at a time and measure the increment, so the byte
@@ -94,7 +95,7 @@ def result(rt,p):
         try: content=raw.decode('utf-8'); used=len(raw)
         except UnicodeDecodeError: raise AgentError('invalid_offset','Offset must be a UTF-8 boundary returned by this tool')
     usage=json.loads(r['usage'])
-    return {'run':{**brief_run(rt,r),**{k:r[k] for k in ('created','started','ended','deadline')}},'text':content,'result_sha256':r['result_sha'],
+    return {'run':{**brief_run(rt,r),**{k:r[k] for k in ('created','started','ended','idle_timeout_seconds')}},'text':content,'result_sha256':r['result_sha'],
             'offset':offset,'next_offset':offset+used,'has_more':offset+used<size,'total_bytes':size,
             'artifact_path':str(path),'acknowledged':bool(r['ack']),
             'result_truncated':usage.get('result_truncated',False),'usage':usage}

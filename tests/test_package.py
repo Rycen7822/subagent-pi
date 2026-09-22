@@ -8,7 +8,7 @@ import tempfile
 import unittest
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
-from subagent_pi.common import live_identity, crop
+from subagent_pi.common import AgentError, live_identity, crop
 from subagent_pi.client import call_timeout, boot_budget
 from subagent_pi import __version__
 from unittest.mock import patch
@@ -22,11 +22,25 @@ class ClientTimeoutBudget(unittest.TestCase):
         self.assertGreaterEqual(call_timeout('respawn',{},None),budget)
         self.assertGreaterEqual(call_timeout('close',{},None),budget)
         self.assertGreater(budget,45)                  # the old flat 45s was the bug
-    def test_boot_timeout_ignores_run_deadline(self):
-        # timeout_seconds is the RUN deadline, not a boot budget: a one-week run
-        # must not make the spawn call itself wait a week.
-        self.assertEqual(call_timeout('spawn',{'timeout_seconds':604800},None),
+    def test_boot_timeout_ignores_model_inactivity_limit(self):
+        self.assertEqual(call_timeout('spawn',{'idle_timeout_seconds':604800},None),
                          call_timeout('spawn',{},None))
+
+    def test_spawn_exposes_inactivity_not_total_timeout(self):
+        from subagent_pi.schema import validate_op
+        from subagent_pi.cli import parser
+        from subagent_pi.config import load_config
+        validate_op('spawn',{'scope':'scope','request_id':'new','task':'long work','idle_timeout_seconds':60})
+        with self.assertRaises(AgentError):
+            validate_op('spawn',{'scope':'scope','request_id':'old','task':'long work','timeout_seconds':60})
+        args=parser().parse_args(['spawn','--task','work','--idle-timeout-seconds','60'])
+        self.assertEqual(args.idle_timeout_seconds,60)
+        with tempfile.TemporaryDirectory() as path:
+            home=Path(path)
+            (home/'config.toml').write_text('default_run_timeout_seconds=900\n')
+            config=load_config(home)
+            self.assertEqual(config['default_idle_timeout_seconds'],900)
+            self.assertNotIn('default_run_timeout_seconds',config)
     def test_wait_scales_with_its_own_timeout(self):
         from subagent_pi.common import DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS
         self.assertEqual(call_timeout('wait',{},None),DEFAULT_WAIT_SECONDS+10)

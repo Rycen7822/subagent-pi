@@ -133,7 +133,7 @@ def msg(role,body,**extra):
 def response(r,success=True,data=None,error=None):
     emit({'type':'response','id':r.get('id'),'command':r['type'],'success':success,**({'data':data} if data is not None else {}),**({'error':error} if error else {})})
 
-TASK_OPTS={'delay','settle','resume','retry','compact','dupsettled'}
+TASK_OPTS={'delay','settle','resume','retry','compact','dupsettled','model','parallel','after_tool'}
 
 def parse_task(task):
     """Parse test-only key=value| prefixes: turn/post-run delay, continuation and
@@ -163,7 +163,16 @@ async def run(raw_task, rid):
         proc=subprocess.Popen(['sleep','120'])
         emit({'type':'tool_execution_start','toolName':'bash','toolCallId':'sleep','args':{'command':'sleep 120','pid':proc.pid}})
         await asyncio.sleep(120)
-    if task=='UI_CONFIRM':
+    if opts.get('model'):
+        kind=opts['model']
+        end=asyncio.get_running_loop().time()+delay
+        while asyncio.get_running_loop().time()<end:
+            if kind=='noise': emit({'type':'extension_ui_request','method':'notify','message':'still alive'})
+            elif kind!='silent':
+                emit({'type':'message_update','assistantMessageEvent':{'type':kind+'_delta','delta':'x' if kind!='empty' else ''}})
+            await asyncio.sleep(.1)
+        output='Completed: '+task
+    elif task=='UI_CONFIRM':
         await asyncio.sleep(float(opts.get('delay',0)))
         f=asyncio.get_running_loop().create_future(); ui['ui-1']=f
         emit({'type':'extension_ui_request','id':'ui-1','method':'confirm','title':'Allow this test operation?','message':'Test-only confirmation'})
@@ -171,14 +180,19 @@ async def run(raw_task, rid):
         output='confirmed='+str(accepted)
     else:
         emit({'type':'tool_execution_start','toolName':'read','toolCallId':'read-1','args':{'path':'src/example.py','sample':'界'*5000 if task=='BIG' else ''}})
+        if opts.get('parallel'):
+            emit({'type':'tool_execution_start','toolName':'bash','toolCallId':'long-2','args':{'command':'sleep'}})
         await asyncio.sleep(delay/2)
         if task!='NO_CONSUME':
             while queue: msg('user',queue.pop(0))
         emit({'type':'tool_execution_end','toolName':'read','toolCallId':'read-1','isError':False,'result':{'content':[{'type':'text','text':'sample'}]}})
         await asyncio.sleep(delay/2)
+        if opts.get('parallel'):
+            emit({'type':'tool_execution_end','toolName':'bash','toolCallId':'long-2','isError':False,'result':{}})
         if task!='NO_CONSUME':
             while queue: msg('user',queue.pop(0))
         else: queue.clear()
+        if opts.get('after_tool'): await asyncio.sleep(float(opts['after_tool']))
         output=('汉字🙂\u2028\u2029'*3000) if task=='BIG' else 'Completed: '+task
     if compact:
         # Pi compacts by itself: overflow ends the run with willRetry, the

@@ -3,13 +3,14 @@ operation. Process mechanics live in worker.py, scope binding in binding.py and 
 read projections in views.py; this module owns ledger state transitions."""
 from __future__ import annotations
 import asyncio
-from collections import defaultdict
+from weakref import WeakValueDictionary
 import contextlib
 import json
 import os
 from pathlib import Path
 import shutil
 import sys
+import time
 
 from . import __version__, PROTOCOL_VERSION, views
 from .binding import bind_scope_source, doctor
@@ -27,6 +28,14 @@ def delegated_text(value: str, envelope: str) -> str:
     entry point that sends text into a session."""
     return envelope + value if value.lstrip().startswith('/') else value
 
+class LockPool(WeakValueDictionary):
+    """Holders and waiters keep a lock alive; idle keys need no daemon cache."""
+    def __getitem__(self, key):
+        lock = self.get(key)
+        if lock is None:
+            self[key] = lock = asyncio.Lock()
+        return lock
+
 class Runtime:
     def __init__(self, home):
         self.home = home
@@ -34,8 +43,8 @@ class Runtime:
         self.config = load_config(home)
         self.workers = {}
         self.scope_env = {}  # bound snapshots; secret values live here and nowhere else
-        self.agent_locks = defaultdict(asyncio.Lock)
-        self.request_locks = defaultdict(asyncio.Lock)
+        self.agent_locks = LockPool()
+        self.request_locks = LockPool()
         self.admission = asyncio.Lock()
         self.changed = asyncio.Condition()
         self.shutdown_requested = asyncio.Event()
@@ -105,10 +114,16 @@ class Runtime:
             self.event(w,kind,e)
             return
         if kind == 'message_update':
+            update=e.get('assistantMessageEvent',{})
+            if isinstance(update,dict) and update.get('type') in {'text_delta','thinking_delta','toolcall_delta'} and update.get('delta'):
+                w.last_progress=time.monotonic()
             return  # keep text deltas out of SQLite; message_end is canonical
         if kind in {'tool_execution_start','tool_execution_update','tool_execution_end'}:
-            if kind == 'tool_execution_start': w.current_tool=e.get('toolName')
-            if kind == 'tool_execution_end': w.current_tool=None
+            tool_id=e.get('toolCallId') or e.get('toolName')
+            if kind == 'tool_execution_start': w.active_tools[tool_id]=e.get('toolName')
+            if kind == 'tool_execution_end':
+                w.active_tools.pop(tool_id,None)
+                w.last_progress=time.monotonic()
             if kind != 'tool_execution_update': self.event(w,kind,e)
             return
         if kind == 'message_end':
@@ -117,6 +132,7 @@ class Runtime:
             role=m.get('role')
             mt=message_text(m)
             if role=='assistant':
+                w.last_progress=time.monotonic()
                 if mt:
                     w.last_text=crop(mt,RESULT_CAP)
                     w.usage['result_truncated']=len(mt.encode('utf-8'))>RESULT_CAP
@@ -147,6 +163,9 @@ class Runtime:
                 if w.run_id: self.store.attention(w.run_id,'question',str(e['id']))
                 self.store.bump(a['scope']); self.notify()
             return
+        if kind=='extension_ui_closed':
+            self.dismiss_ui(w,str(e.get('id','')))
+            return
         if kind=='agent_end':
             # One low-level run finished. Pi may still retry, compact, run
             # before-settle work or continue with queued input afterwards, so
@@ -159,7 +178,18 @@ class Runtime:
                 self.spawn_task(self.settle(w,w.run_id))
             return
         if kind in {'auto_retry_start','auto_retry_end','auto_compaction_start','auto_compaction_end'}:
+            # A host-scheduled retry delay is not a stalled provider request.
+            delay=e.get('delayMs',0) if kind=='auto_retry_start' else 0
+            w.last_progress=time.monotonic()+max(0,float(delay))/1000
             self.event(w,kind,e)
+
+    def dismiss_ui(self,w,ui_id):
+        if w.ui.pop(ui_id,None) is None: return
+        w.last_progress=time.monotonic()
+        if w.run_id and not w.ui:
+            self.store.agent_update(w.agent['id'],state='running')
+            self.store.execute("UPDATE runs SET state='running' WHERE id=? AND state='needs_input'",(w.run_id,))
+        self.notify()
 
     def assert_writer_exclusive(self, aid, cwd):
         """Only one managed writer may own a cwd subtree at a time (a read label
@@ -181,12 +211,13 @@ class Runtime:
     async def start_run(self,w,rid):
         r=self.store.run(w.agent['scope'],rid)
         if r['state'] not in {'queued','starting'}: return
-        w.run_id=rid; w.last_text=''; w.error=None; w.usage={}; w.stopping=False; w.ui.clear()
-        deadline=r['deadline'] or now()+self.config['default_run_timeout_seconds']
-        self.store.execute("UPDATE runs SET state='running',started=?,deadline=? WHERE id=?",(now(),deadline,rid))
+        w.run_id=rid; w.last_text=''; w.error=None; w.usage={}; w.stopping=False; w.ui.clear(); w.active_tools.clear()
+        w.last_progress=time.monotonic()
+        w.idle_timeout_seconds=r['idle_timeout_seconds'] or self.config['default_idle_timeout_seconds']
+        self.store.execute("UPDATE runs SET state='running',started=? WHERE id=?",(now(),rid))
         self.store.agent_update(w.agent['id'],state='running',current_run=rid)
         self.store.bump(w.agent['scope'])
-        self.event(w,'run_started',{'deadline':deadline})
+        self.event(w,'run_started',{'idle_timeout_seconds':w.idle_timeout_seconds})
         receipt=new_id('msg_')
         self.store.execute('INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?)',(receipt,w.agent['id'],rid,w.agent['scope'],r['task'],'sending',now(),now()))
         try:
@@ -205,8 +236,8 @@ class Runtime:
 
     def add_run(self,a,task,state='queued',timeout=None):
         rid=new_id('run_')
-        self.store.execute('INSERT INTO runs(id,agent_id,scope,state,task,created,deadline) VALUES(?,?,?,?,?,?,?)',
-            (rid,a['id'],a['scope'],state,task,now(),None if timeout is None else now()+timeout))
+        self.store.execute('INSERT INTO runs(id,agent_id,scope,state,task,created,idle_timeout_seconds) VALUES(?,?,?,?,?,?,?)',
+            (rid,a['id'],a['scope'],state,task,now(),timeout or self.config['default_idle_timeout_seconds']))
         self.store.bump(a['scope'])
         return rid
 
@@ -218,7 +249,7 @@ class Runtime:
             state='failed' if w.error else 'completed'
             self.store.finish(rid,state,w.last_text,w.error,w.usage)
             self.event(w,'run_terminal',{'state':state})
-            w.run_id=None; w.ui.clear(); w.current_tool=None
+            w.run_id=None; w.ui.clear(); w.active_tools.clear()
             self.store.agent_update(w.agent['id'],state='idle',current_run=None,cleanup='not_checked')
             self.notify()
             q=self.store.one("SELECT id FROM runs WHERE agent_id=? AND state='queued' ORDER BY created LIMIT 1",(w.agent['id'],))
@@ -265,19 +296,19 @@ class Runtime:
                     cleanup='unknown' if group_members(w.proc.pid) else 'verified')
             self.store.bump(a['scope']); self.notify()
 
-    async def interrupt(self,a,terminal='interrupted'):
+    async def interrupt(self,a,terminal='interrupted',reason='Explicit interruption; filesystem effects may be partial'):
         w=self.require_worker(a)
         w.stopping=True
         self.store.agent_update(a['id'],state='stopping')
         for q in self.store.all("SELECT id FROM runs WHERE agent_id=? AND state='queued'",(a['id'],)):
-            self.store.finish(q['id'],'cancelled','','Cancelled by explicit interruption')
+            self.store.finish(q['id'],'cancelled','','Cancelled because the active agent was stopped')
         # Terminating only this verified process group also cancels input hooks,
         # authentication preflights and extension timers that Pi cannot abort.
         cleanup=await terminate(self,w)
         if w.run_id:
-            self.store.finish(w.run_id,terminal,w.last_text,'Explicit interruption; filesystem effects may be partial',w.usage)
+            self.store.finish(w.run_id,terminal,w.last_text,reason,w.usage)
             self.event(w,'run_terminal',{'state':terminal})
-        w.run_id=None; w.ui.clear(); w.current_tool=None
+        w.run_id=None; w.ui.clear(); w.active_tools.clear()
         self.store.agent_update(a['id'],state='dormant',current_run=None,cleanup=cleanup)
         self.store.bump(a['scope']); self.notify()
         return {'agent_id':a['id'],'state':'dormant','cleanup':cleanup,'process_retained':False}
@@ -370,7 +401,7 @@ class Runtime:
                     if 'UNIQUE' in str(e): raise AgentError('name_conflict','Agent name already exists in this scope')
                     raise
                 a=self.store.agent(sid,aid)
-                rid=self.add_run(a,task,'starting',integer(p.get('timeout_seconds',self.config['default_run_timeout_seconds']),'timeout_seconds',1,604800))
+                rid=self.add_run(a,task,'starting',integer(p.get('idle_timeout_seconds',self.config['default_idle_timeout_seconds']),'idle_timeout_seconds',1,604800))
                 async with self.agent_locks[aid]:
                     try:
                         w=await boot_worker(self,a)
@@ -428,10 +459,8 @@ class Runtime:
                     if item.get('method')=='select' and answer not in item.get('options',[]):
                         raise AgentError('invalid_argument','Answer is not an offered selection')
                     payload['value']=text(answer,'answer',8192)
-                await w.raw(payload); w.ui.pop(ui_id,None)
-                if not w.ui:
-                    self.store.agent_update(aid,state='running' if w.run_id else 'idle')
-                    if w.run_id: self.store.execute("UPDATE runs SET state='running' WHERE id=?",(w.run_id,))
+                await w.raw(payload)
+                self.dismiss_ui(w,ui_id)
                 return {'agent_id':aid,'sent':True,'ui_request_id':ui_id}
             if op=='send':
                 msg=delegated_text(text(p.get('message')),'Delegated instruction (not a slash command):\n')
@@ -464,27 +493,38 @@ class Runtime:
                 return {'agent_id':aid,'name':a['name'],'run_id':rid,'state':self.store.run(sid,rid)['state'],'queue_owner':'daemon'}
         raise AgentError('unknown_operation',f'Unknown mutation: {op}')
 
-    async def deadline_loop(self):
+    async def idle_loop(self):
         while not self.closing:
             await asyncio.sleep(.5)
-            for r in self.store.all("SELECT * FROM runs WHERE state IN ('running','needs_input') AND deadline<?",(now(),)):
-                async with self.agent_locks[r['agent_id']]:
-                    current=self.store.run(r['scope'],r['id'])
-                    if current['state'] not in {'running','needs_input'}: continue
-                    try: await self.interrupt(self.store.agent(r['scope'],r['agent_id']),terminal='timed_out')
-                    except AgentError as exc: print('deadline: '+str(exc),file=sys.stderr)
+            await self.check_idle()
+
+    async def check_idle(self):
+        for w in list(self.workers.values()):
+            rid=w.run_id
+            idle=w.idle_seconds()
+            if idle is None or idle<w.idle_timeout_seconds: continue
+            async with self.agent_locks[w.agent['id']]:
+                # Recheck after waiting: progress, a tool, completion or a new
+                # worker/run must never be stopped by an obsolete observation.
+                if self.workers.get(w.agent['id']) is not w or w.run_id!=rid or w.stopping or w.closed: continue
+                idle=w.idle_seconds()
+                if idle is None or idle<w.idle_timeout_seconds: continue
+                try:
+                    await self.interrupt(self.store.agent(w.agent['scope'],w.agent['id']),terminal='timed_out',
+                        reason=f'No model output or thinking progress for {w.idle_timeout_seconds}s outside tool execution/parent input; filesystem effects may be partial')
+                except AgentError as exc: print('idle timeout: '+str(exc),file=sys.stderr)
 
     async def shutdown(self):
         self.closing=True
-        for a in self.store.all('SELECT * FROM agents'):
-            w=self.workers.get(a['id'])
-            if w and not w.closed:
+        for w in list(self.workers.values()):
+            if not w.closed:
+                a=self.store.agent(w.agent['scope'],w.agent['id'])
                 async with self.agent_locks[a['id']]:
                     try: await self.interrupt(a)
                     except Exception:
                         with contextlib.suppress(Exception): await terminate(self,w)
                     self.store.agent_update(a['id'],state='dormant',current_run=None)
-        tasks=[t for w in self.workers.values() for t in w.tasks]+list(self.background)
+        tasks=list(self.background)
         for t in tasks:
             if not t.done(): t.cancel()
         await asyncio.gather(*tasks,return_exceptions=True)

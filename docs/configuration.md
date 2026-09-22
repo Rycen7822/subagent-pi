@@ -12,7 +12,7 @@ max_resident_agents = 4
 max_agents_per_scope = 16
 rpc_timeout_seconds = 20
 startup_timeout_seconds = 30
-default_run_timeout_seconds = 1800
+default_idle_timeout_seconds = 1800
 max_wait_seconds = 3600
 event_max_count_per_agent = 20000
 ```
@@ -75,11 +75,11 @@ profile 支持 `[profiles.NAME.env]` 的字符串环境覆盖。值在每次启�
 
 ## 三种时限
 
-startup_timeout_seconds 仅控制初始 Pi handshake；rpc_timeout_seconds 控制控制命令回执；default_run_timeout_seconds 控制一项运行的总时限。
+startup_timeout_seconds 控制初始 Pi handshake；rpc_timeout_seconds 覆盖控制命令等待写锁、管道写入与回执的完整时间，UI 回复写入也受限；default_idle_timeout_seconds 控制模型连续无进展时限，默认 1800 秒；任务没有总时长上限。文本、thinking、工具调用参数的非空增量会重新计时，不把原始 thinking 写入账本。工具仍在执行（包括无输出的长命令、阻塞等待工具）或等待父代理回答时暂停检测，最后一个工具结束、问题回答/取消后重新给足时限；并行工具按调用 ID 跟踪。工具本身的超时仍由工具负责，不受此模型静默阈值限制。后台进程已脱离工具调用、扩展未报告执行状态时，插件无法据此证明仍在等待后台工作；不会猜测 PID 或命令内容来豁免。RPC 超时仍表示执行结果不确定，不自动重发；释放控制锁后允许 close/静默超时 终止并核验受管进程。
 
 wait 的 timeout_seconds 以秒计，只限制调用等待，不停止任务。标准 Codex 安装在本插件清单中设置 3630 秒工具超时；其他 MCP 客户端或手工安装需要自行保证外层超时足够长。插件不改全局配置或批准策略。
 
-客户端对 IPC 调用的等待按 daemon 自身预算推导：wait 是 max(45s, timeout_seconds+10s)，其他普通操作为 45s；启动/回收类操作（spawn、respawn、close、interrupt）覆盖 daemon 的启动预算（由 startup_timeout_seconds 推导，默认约 90s），因为一次健康但缓慢的启动不应被报成失败。spawn 的 timeout_seconds 是**运行**时限，不影响该调用本身的等待。
+客户端对 IPC 调用的等待按 daemon 自身预算推导：wait 是 max(45s, timeout_seconds+10s)，其他普通操作为 45s；启动/回收类操作（spawn、respawn、close、interrupt）覆盖 daemon 的启动预算（由 startup_timeout_seconds 推导，默认约 90s），因为一次健康但缓慢的启动不应被报成失败。spawn 的 idle_timeout_seconds 是**模型静默**时限，不影响该调用本身的等待；旧 spawn.timeout_seconds / --timeout-seconds 已移除，wait 的同名参数不变。旧配置 default_run_timeout_seconds 作为默认静默阈值读取（新键优先），不再施加总时长限制。IPC v3 拒绝混用旧 daemon/客户端；正常结束旧任务后再更新连接。历史 deadline 列仅保留旧记录，不参与调度。
 
 模型 HTTP 请求时限、代理、认证和模型流解析交由 Pi。调整 Pi 自身的 httpIdleTimeoutMs 时，不要把它与本插件的 wait 或总运行时限混淆。没有输出不自动代表死进程，插件不以“多久没有 token”作为杀进程条件。
 
@@ -87,4 +87,6 @@ wait 的 timeout_seconds 以秒计，只限制调用等待，不停止任务。�
 
 单条 Pi JSONL 帧最大 8 MiB，超出视为协议/资源错误并停止该 worker。每个 agent 保留最近约 20,000 条规范化事件，最多每 256 条批量裁剪；每条事件内容有界。最终结果最多保存 1 MiB 文本快照，发生截断会返回 result_truncated=true；原始 Pi session 仍由 Pi 保留。stderr 最多保留 512 KiB；不是无限增长日志。
 
-结果、session、请求账本默认不自动 GC，防止清掉未处理证据。长期使用应人工归档已收尾的整个 scope 数据；本版不提供自动清理命令。磁盘耗尽是一个操作失败，不是安全完成。
+已退出 Worker 在读流及退出回调结束后从内存移除，不保留历史结果副本；agent/request 锁只在持有或等待期间保留，回收不依赖定时扫描。活跃/空闲子进程仍占 resident 配额，任务结束后应按需 close；scope 的环境绑定保留供后续显式恢复使用。
+
+磁盘上的结果、session、请求账本默认不自动 GC，防止清掉未处理证据。长期使用应人工归档已收尾的整个 scope 数据；本版不提供自动清理命令。磁盘耗尽是一个操作失败，不是安全完成。

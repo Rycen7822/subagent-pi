@@ -40,8 +40,10 @@ class Worker:
         self.stopping = False
         self.closed = False
         self.ui = {}
-        self.current_tool = None
+        self.active_tools = {}
         self.last_activity = now()
+        self.last_progress = time.monotonic()
+        self.idle_timeout_seconds = runtime.config['default_idle_timeout_seconds']
         self.events_written = 0
         self.tasks = []
         self.write_lock = asyncio.Lock()
@@ -51,8 +53,22 @@ class Worker:
         # Set when the host starts work no daemon run owns (see Runtime.stop_unowned):
         # the worker is being stopped and none of its output may be absorbed.
         self.tainted = None
+    @property
+    def current_tool(self):
+        return next(iter(self.active_tools.values()),None)
+    def idle_seconds(self):
+        # Tool execution and parent input are owned waits, not model silence.
+        if not self.run_id or self.active_tools or self.ui: return None
+        return max(0,time.monotonic()-self.last_progress)
     def start(self):
-        self.tasks = [asyncio.create_task(self.read_stdout()),asyncio.create_task(self.read_stderr()),asyncio.create_task(self.watch_exit())]
+        self.tasks = [self.rt.spawn_task(self.read_stdout()),self.rt.spawn_task(self.read_stderr()),self.rt.spawn_task(self.watch_exit())]
+        for task in self.tasks: task.add_done_callback(self.retire)
+    def retire(self, _task):
+        # Exit reconciliation can await the agent lock while a replacement boots.
+        # Only release this generation after every reader and callback is done.
+        if self.closed and all(task.done() for task in self.tasks):
+            if self.rt.workers.get(self.agent['id']) is self:
+                del self.rt.workers[self.agent['id']]
     async def rpc(self, kind, timeout=None, **params):
         if self.closed or self.proc.returncode is not None:
             raise AgentError('worker_unavailable','Pi process is not connected; inspect then respawn')
@@ -60,21 +76,30 @@ class Worker:
         future = asyncio.get_running_loop().create_future()
         self.pending[rid] = future
         try:
-            await self.raw({'id':rid,'type':kind,**params})
-            response = await asyncio.wait_for(asyncio.shield(future),timeout or self.rt.config['rpc_timeout_seconds'])
+            timeout = timeout or self.rt.config['rpc_timeout_seconds']
+            async with asyncio.timeout(timeout):
+                await self.raw({'id':rid,'type':kind,**params},timeout=timeout)
+                response = await asyncio.shield(future)
             if not response.get('success'):
                 raise AgentError('pi_rejected',crop(str(response.get('error','Pi rejected the command')),2000),command=kind)
             return response.get('data') or {}
         except asyncio.TimeoutError:
             raise AgentError('rpc_timeout','Pi command outcome is uncertain; do not blindly retry',command=kind)
-        except (BrokenPipeError, ConnectionResetError):
-            raise AgentError('worker_unavailable','Pi RPC channel closed')
         finally:
             self.pending.pop(rid,None)
             if not future.done(): future.cancel()
-    async def raw(self, value):
-        async with self.write_lock:
-            self.proc.stdin.write((dumps(value)+'\n').encode()); await self.proc.stdin.drain()
+    async def raw(self, value, timeout=None):
+        try:
+            async with asyncio.timeout(timeout or self.rt.config['rpc_timeout_seconds']):
+                async with self.write_lock:
+                    # A timed-out write may still be buffered. Drain it before
+                    # accepting more bytes so repeated timeouts cannot grow RAM.
+                    await self.proc.stdin.drain()
+                    self.proc.stdin.write((dumps(value)+'\n').encode()); await self.proc.stdin.drain()
+        except asyncio.TimeoutError:
+            raise AgentError('rpc_timeout','Pi command outcome is uncertain; do not blindly retry',command=value.get('type'))
+        except (BrokenPipeError, ConnectionResetError):
+            raise AgentError('worker_unavailable','Pi RPC channel closed')
     async def read_stdout(self):
         try:
             while True:
@@ -93,7 +118,7 @@ class Worker:
         except Exception as exc:
             self.error = f'RPC reader failed: {type(exc).__name__}: {exc}'
             with contextlib.suppress(Exception): self.rt.event(self,'protocol_error',{'message':crop(self.error,1000)})
-            asyncio.create_task(self.rt.fail_worker(self,self.error))
+            self.rt.spawn_task(self.rt.fail_worker(self,self.error))
     async def read_stderr(self):
         path = self.rt.home/'agents'/self.agent['id']/'stderr.log'
         with path.open('ab') as f:

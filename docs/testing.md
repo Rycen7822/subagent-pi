@@ -11,6 +11,8 @@ npm run typecheck
 
 默认使用 fake 子进程验证 MCP/CLI → daemon → guard 的协议、任务身份、回执、持久化、进程清理、故障和恢复。Node 队列测试由 Python 套件调用，覆盖串行归属、异常退出、handled 输入和旧回调不能混入新任务。没有模型请求。
 
+资源回归暂停测试自有进程组制造管道背压，验证 RPC/UI 写入超时后 close 和模型静默检测 仍可完成核验；循环关闭子进程验证 Worker/锁回收、结果与幂等记录保留，以及旧退出回调不能移除替换进程。新增静默回归覆盖 text/thinking/toolcall 增量、无关通知、并行长工具、工具结束后恢复计时、父代理问答和锁等待后的复验；真实 SDK 使用离线流和无输出工具验证超过静默阈值仍可正常完成，静默模型才停止。它们不等同于多日驻留测试。
+
 继承回归覆盖客户端环境绑定、Pi-first 同名 skill、builtin 来源判定、扩展同名工具保留、MCP 私有 bootstrap/receipt、stdio/HTTP 协议协商与错误路径。bridge 测试需要已安装 Pi 提供依赖；缺少时明确 skip。
 
 ## 原版 Pi SDK 进程测试

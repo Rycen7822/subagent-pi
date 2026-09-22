@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 移除任务总时长上限，改用 idle_timeout_seconds / default_idle_timeout_seconds 检测模型静默（默认 30 分钟）；text/thinking/toolcall 增量重置计时，活动工具与父代理问答暂停检测，结束后重新计时。插件内实现，不改 Pi 宿主；IPC v3 与旧连接明确隔离。
+
+- 修复子进程管道背压绕过 RPC 超时、阻塞 close/deadline 的问题；完整 I/O 与 UI 回复写入有界，结果不确定的操作仍不重发。退出 Worker 及闲置 agent/request 锁自动回收，保留磁盘结果、会话与幂等账本；只作用于插件自己的进程。
 - wait 统一使用 timeout_seconds / --timeout-seconds（旧毫秒参数明确拒绝，IPC v2 需更新连接）；默认 10 分钟、最长 1 小时；任务完成/提问/异常即时返回，取消等待不取消任务。统一 CLI/MCP/IPC 预算，Codex 安装使用原生清单声明本插件的长调用超时，无需宿主补丁或全局配置修改。
 - 自动绑定 MCP 调用元数据中的父会话；完成/失败/停止/问题通过 codex queue 唤醒仍加载的空闲父会话。主动 wait 写出响应后抑制重复通知，断连/失败恢复提醒，交付与结果 ack 分离；最多四个父会话独立投递，未知提交不重试。已入队消息无法撤回，不强行打断或复活已停止的父会话。
 

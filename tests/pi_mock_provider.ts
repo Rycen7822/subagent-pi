@@ -38,6 +38,16 @@ export default function (pi) {
     });
   }
   if (env.PI_MOCK_FORCE_PROMPT) pi.on("before_agent_start", () => ({ systemPrompt: env.PI_MOCK_FORCE_PROMPT }));
+  if (env.PI_MOCK_TOOL_MS) pi.registerTool({
+    name: "mock_block", label: "Offline wait", description: "Silent test-only blocking tool",
+    parameters: { type: "object", properties: {} },
+    async execute() {
+      mark("PI_MOCK_TOOL_START");
+      await sleep(Number(env.PI_MOCK_TOOL_MS));
+      mark("PI_MOCK_TOOL_END");
+      return { content: [{ type: "text", text: "finished" }], details: {} };
+    },
+  });
   let calls = 0;
   pi.registerProvider("pi-mock-offline", {
     baseUrl: "http://127.0.0.1:1", apiKey: "offline-test-only", api: "openai-responses",
@@ -62,8 +72,24 @@ export default function (pi) {
         message.content = [{ type: "toolCall", id: "ask-parent-1", name: "ask_parent", arguments: { question: "Which branch should I use?" } }] as any;
         message.stopReason = "toolUse";
       }
+      if (env.PI_MOCK_TOOL_MS && call === 1) {
+        message.content = [{ type: "toolCall", id: "block-1", name: "mock_block", arguments: {} }] as any;
+        message.stopReason = "toolUse";
+      }
       if (env.PI_MOCK_FAIL) { message.stopReason = "error"; (message as any).errorMessage = "Mock provider failed"; }
-      setTimeout(() => { stream.push({ type: message.stopReason === "error" ? "error" : "done", reason: message.stopReason, message, error: message } as any); stream.end(); }, Number(env.PI_MOCK_STREAM_MS || 30));
+      const finish = () => { stream.push({ type: message.stopReason === "error" ? "error" : "done", reason: message.stopReason, message, error: message } as any); stream.end(); };
+      if (env.PI_MOCK_PROGRESS) void (async () => {
+        const kind = env.PI_MOCK_PROGRESS;
+        const partial = { ...message, content: [{ type: kind, [kind]: "" }] };
+        stream.push({ type: "start", partial } as any);
+        for (let elapsed = 0; elapsed < Number(env.PI_MOCK_STREAM_MS); elapsed += 100) {
+          partial.content[0][kind] += "x";
+          stream.push({ type: `${kind}_delta`, contentIndex: 0, delta: "x", partial } as any);
+          await sleep(100);
+        }
+        finish();
+      })();
+      else setTimeout(finish, Number(env.PI_MOCK_STREAM_MS || 30));
       return stream;
     },
   });
@@ -103,8 +129,10 @@ export default function (pi) {
   pi.on("input", async (event, ctx) => {
     if (env.PI_MOCK_CONFIRM && event.text.includes("ASK")) {
       mark("PI_MOCK_CONFIRM_WAIT");
-      const answer = await ctx.ui.confirm("Permission", "Proceed with mock work?");
+      const answer = await ctx.ui.confirm("Permission", "Proceed with mock work?",
+        env.PI_MOCK_CONFIRM_TIMEOUT ? { timeout: Number(env.PI_MOCK_CONFIRM_TIMEOUT) } : undefined);
       mark(`PI_MOCK_CONFIRM_ANSWER ${answer}`);
+      if (env.PI_MOCK_AFTER_CONFIRM_MS) await sleep(Number(env.PI_MOCK_AFTER_CONFIRM_MS));
       if (!answer) return { action: "handled" };
     }
     if (!tokens.some(token => event.text.includes(token))) return;

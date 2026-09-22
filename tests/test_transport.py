@@ -14,7 +14,7 @@ ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.client import request
 from subagent_pi import PROTOCOL_VERSION
-from subagent_pi.common import AgentError, socket_path
+from subagent_pi.common import AgentError, group_members, socket_path
 
 class McpHarness:
     """MCP stdio boundary over a real daemon, shared by the fake-Pi IPC tests and
@@ -65,6 +65,60 @@ class McpHarness:
 
 
 class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
+    async def check_blocked_stdin_cleanup(self,by_idle):
+        config=self.home/'config.toml'
+        config.write_text(config.read_text().replace('rpc_timeout_seconds=8','rpc_timeout_seconds=1'))
+        sid=await self.open_scope()
+        run=await request(self.home,'spawn',{'scope':sid,'request_id':'blocked','task':'model=silent|delay=120|work' if by_idle else 'UI_CONFIRM',
+            'access':'read','idle_timeout_seconds':8 if by_idle else 60})
+        if not by_idle:
+            result=await request(self.home,'wait',{'scope':sid,'run_ids':[run['run_id']],'timeout_seconds':4})
+            self.assertEqual(result['reason'],'needs_input')
+        owner=json.loads((self.home/'agents'/run['agent_id']/'owner.json').read_text())
+        pgid=owner['guard_pid']; os.killpg(pgid,signal.SIGSTOP)
+        try:
+            # Three valid frames exceed the pipe + asyncio write-buffer capacity.
+            for i in range(3):
+                params={'scope':sid,'agent_id':run['agent_id'],'request_id':f'blocked-{i}',
+                        'mode':'steer','message':'x'*60000}
+                with self.assertRaises(AgentError) as error:
+                    await request(self.home,'send',params,timeout=3)
+                self.assertEqual(error.exception.code,'rpc_timeout')
+            # UI replies use raw(), so they need the same bounded write guarantee.
+            if not by_idle:
+                with self.assertRaises(AgentError) as error:
+                    await request(self.home,'answer',{'scope':sid,'agent_id':run['agent_id'],'request_id':'answer',
+                        'ui_request_id':'ui-1','answer':True},timeout=3)
+                self.assertEqual(error.exception.code,'rpc_timeout')
+            if by_idle:
+                # A pending question makes wait return immediately; the loop below
+                # observes terminal state, rather than pretending a question is done.
+                until=asyncio.get_running_loop().time()+8
+                while asyncio.get_running_loop().time()<until:
+                    state=(await request(self.home,'list',{'scope':sid}))['agents'][0]['state']
+                    if state=='dormant': break
+                    await asyncio.sleep(.05)
+                self.assertEqual(state,'dormant')
+            else:
+                closed=await request(self.home,'close',{'scope':sid,'agent_id':run['agent_id'],
+                                                       'request_id':'close'},timeout=5)
+                self.assertEqual(closed['cleanup'],'verified')
+            done=await request(self.home,'wait',{'scope':sid,'run_ids':[run['run_id']],'timeout_seconds':0})
+            self.assertEqual(done['runs'][0]['state'],'timed_out' if by_idle else 'interrupted')
+            self.assertEqual(group_members(pgid),[])
+            # Retrying an uncertain mutation must read its stored error, not send it again.
+            with self.assertRaises(AgentError) as replay:
+                await request(self.home,'send',params,timeout=3)
+            self.assertEqual(replay.exception.code,'rpc_timeout')
+        finally:
+            with contextlib.suppress(ProcessLookupError): os.killpg(pgid,signal.SIGCONT)
+
+    async def test_backpressured_child_can_be_closed_after_rpc_timeout(self):
+        await self.check_blocked_stdin_cleanup(False)
+
+    async def test_backpressured_model_is_stopped_by_inactivity(self):
+        await self.check_blocked_stdin_cleanup(True)
+
     async def test_long_wait_wakes_on_later_completion_or_question(self):
         await self.initialize()
         await self.tool('pi_context',{'cwd':str(self.workspace)})
@@ -451,6 +505,45 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_1','MOCK_REPLY_2'])
         close=await self.tool('pi_close_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'close'})
         self.assertEqual(close['cleanup'],'verified')
+
+    async def test_sdk_thinking_and_silent_tool_outlive_idle_limit(self):
+        self.write_config(PI_MOCK_PROGRESS='"thinking"',PI_MOCK_STREAM_MS='"2200"',PI_MOCK_TOOL_MS='"2200"')
+        await self.initialize()
+        scope=(await self.tool('pi_context',{'cwd':str(self.workspace)}))['scope']
+        a=await self.tool('pi_spawn_agent',{'scope':scope,'access':'read','task':'offline work',
+            'idle_timeout_seconds':1,'request_id':'idle-live'})
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':15})
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual(done['runs'][0]['state'],'completed',done)
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_2'])
+        trace=(self.home/'agents'/a['agent_id']/'stderr.log').read_text()
+        self.assertIn('PI_MOCK_TOOL_END',trace)
+        state=await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']})
+        self.assertEqual(state['agent']['active_tools'],[])
+        self.assertIsNone(state['agent']['idle_seconds'])
+
+    async def test_sdk_silent_model_is_stopped(self):
+        self.write_config(PI_MOCK_STREAM_MS='"30000"')
+        await self.initialize()
+        scope=(await self.tool('pi_context',{'cwd':str(self.workspace)}))['scope']
+        a=await self.tool('pi_spawn_agent',{'scope':scope,'access':'read','task':'offline silence',
+            'idle_timeout_seconds':1,'request_id':'idle-stall'})
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':8})
+        self.assertEqual(done['runs'][0]['state'],'timed_out',done)
+        state=await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']})
+        self.assertEqual(state['agent']['cleanup'],'verified')
+
+    async def test_sdk_ui_timeout_releases_the_watchdog_pause(self):
+        self.write_config(PI_MOCK_CONFIRM='"1"',PI_MOCK_CONFIRM_TIMEOUT='"100"',PI_MOCK_AFTER_CONFIRM_MS='"30000"')
+        await self.initialize()
+        scope=(await self.tool('pi_context',{'cwd':str(self.workspace)}))['scope']
+        a=await self.tool('pi_spawn_agent',{'scope':scope,'access':'read','task':'ASK offline',
+            'idle_timeout_seconds':1,'request_id':'ui-expire'})
+        path=self.home/'agents'/a['agent_id']/'stderr.log'
+        await self.wait_marker(path,'PI_MOCK_CONFIRM_ANSWER false')
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':8})
+        self.assertEqual(done['runs'][0]['state'],'timed_out',done)
+        self.assertEqual(done.get('questions',[]),[])
 
     async def test_startup_commands_finish_before_tasks_without_model_calls(self):
         self.write_config(PI_MOCK_STARTUP_COMMANDS='"1"')
