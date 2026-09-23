@@ -182,6 +182,14 @@ class Handler(BaseHTTPRequestHandler):
               mcp_name_header=self.headers.get('mcp-name'),
               session=self.headers.get('mcp-session-id'),
               has_modern_meta=(MODERN_META_KEY in (params.get('_meta') or {})))
+        if MODE == 'redirect_hanging_body' and method == 'tools/call' and self.path != '/mcp2':
+            self.send_response(307)
+            self.send_header('location','/mcp2')
+            self.end_headers()
+            self.wfile.write(b'partial redirect body'); self.wfile.flush()
+            event('redirect-open-body')
+            time.sleep(30)
+            return
         if STATE['redirect_idx'] < len(REDIRECT_PLAN):
             entry = REDIRECT_PLAN[STATE['redirect_idx']]
             STATE['redirect_idx'] += 1
@@ -226,9 +234,18 @@ class Handler(BaseHTTPRequestHandler):
 
         def reply(payload, sse=False, session=True):
             encoded = json.dumps(payload).encode()
-            data = (b'data: ' + encoded + b'\n\n') if sse else encoded
+            if sse and MODE == 'multiline_sse' and method == 'tools/call':
+                first, second = encoded.split(b', "result"', 1)
+                data = b': comment\r\n\r\ndata: ' + first + b',\r\ndata: "result"' + second + b'\r\n\r\n'
+            else:
+                data = (b'data: ' + encoded + b'\n\n') if sse else encoded
             self._flush_headers('text/event-stream' if sse else 'application/json', len(data), session=session)
-            self.wfile.write(data)
+            if sse and MODE == 'multiline_sse' and method == 'tools/call':
+                cut = len(data) // 2
+                self.wfile.write(data[:cut]); self.wfile.flush(); time.sleep(.01)
+                self.wfile.write(data[cut:])
+            else:
+                self.wfile.write(data)
             try:
                 self.wfile.flush()
             except OSError:
@@ -271,6 +288,8 @@ class Handler(BaseHTTPRequestHandler):
                     event('hdr-check', header=header_key, decoded=decoded, body=node, match=decoded == expect)
             result = {"jsonrpc": "2.0", "id": rid,
                       "result": {"content": [{"type": "text", "text": f"handled {name} {args.get('body') or args.get('query') or ''}"}]}}
+            if MODE == 'wrong_tool_response_id': result['id'] = rid + 999
+            if MODE == 'empty_tool_response': result = {}
             if MODE in ('headers_then_hang', 'hang_body_json', 'modern_hang_json'):
                 encoded = json.dumps(result).encode()
                 if MODE == 'headers_then_hang':
@@ -301,7 +320,7 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(5)
                 reply({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "late"}]}})
                 return
-            reply(result)
+            reply(result, sse=MODE == 'multiline_sse')
         elif rid is not None:
             reply({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "not implemented"}})
         else:

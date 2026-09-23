@@ -144,13 +144,27 @@ class Worker:
             self.surface = parse_surface_line(line)
             self.surface_ready.set()
     async def watch_exit(self):
-        code = await self.proc.wait()
-        with contextlib.suppress(Exception):  # consume a final agent_end before reconciliation
-            await asyncio.wait_for(asyncio.shield(self.tasks[0]),2)
-        self.closed = True
+        # asyncio.Process.wait() also waits for pipe EOF. A Pi descendant can
+        # inherit stdout/stderr after the guard exits, so observe the reaped
+        # leader directly and bound the final event drain.
+        while self.proc.returncode is None:
+            await asyncio.sleep(.05)
+        code = self.proc.returncode
+        readers = self.tasks[:2]
+        _, pending = await asyncio.wait(readers,timeout=2)
+        for task in pending: task.cancel()
+        await asyncio.gather(*pending,return_exceptions=True)
+        # Cancelling a StreamReader task alone leaves its pipe transport open.
+        # No descendant may keep a retired Worker resident through that FD.
+        for fd in (1,2):
+            pipe = self.proc._transport.get_pipe_transport(fd)
+            if pipe: pipe.close()
         for future in list(self.pending.values()):
             if not future.done(): future.set_exception(AgentError('worker_exited',f'Pi guard exited ({code})'))
+        # A dead process is not yet available for replacement: finish its runs
+        # and queue under the agent lock before publishing this handoff flag.
         await self.rt.worker_exited(self,code)
+        self.closed = True
 
 def write_all(fd, data):
     view = memoryview(data)

@@ -4,10 +4,15 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 import uuid
+from unittest import mock
 
+from subagent_pi import parent
 from subagent_pi.client import request
+from subagent_pi.common import dumps, group_members
+from subagent_pi.runtime import Runtime
 from test_transport import McpHarness
 
 
@@ -268,3 +273,95 @@ print('Queued message '+str(uuid.uuid4())+' for thread '+thread+'.')
         self.assertEqual({n['run_id']:n['state'] for n in rows},{watched['run_id']:'observed',other['run_id']:'queued'})
         self.assertEqual(len(self.queued()),1)
         self.assertIn(other['run_id'],self.queued()[0]['message'])
+
+
+class ParentScheduleBounds(unittest.TestCase):
+    def test_busy_parent_backlog_stays_bounded_and_reserved_page_is_skipped(self):
+        with tempfile.TemporaryDirectory(prefix='subagent-pi-parent-page-') as directory:
+            rt=Runtime(Path(directory))
+            sid='scope_page'; aid='pi_page'; thread=str(uuid.uuid4()); codex_home=str(Path(directory)/'codex')
+            binding={'thread_id':thread,'codex_home':codex_home,'command':'/bin/true',
+                     'home':directory,'path':'/bin'}
+            ids=[f'run_{i:03d}' for i in range(140)]
+            try:
+                rt.store.execute('BEGIN')
+                rt.store.execute('INSERT INTO scopes(id,cwd,label,created,parent) VALUES(?,?,?,?,?)',
+                                 (sid,directory,'test',0,dumps(binding)))
+                rt.store.execute('INSERT INTO agents(id,scope,name,cwd,state,session_file,launch,created,updated) '
+                                 'VALUES(?,?,?,?,?,?,?,?,?)',(aid,sid,'test',directory,'idle','session','{}',0,0))
+                for i,rid in enumerate(ids):
+                    rt.store.execute('INSERT INTO runs(id,agent_id,scope,state,task,created) VALUES(?,?,?,?,?,?)',
+                                     (rid,aid,sid,'completed','test',i))
+                    rt.store.execute('INSERT INTO parent_notifications(id,scope,run_id,kind,created) VALUES(?,?,?,?,?)',
+                                     (f'notice_{i:03d}',sid,rid,'terminal',i))
+                rt.store.execute('COMMIT')
+                key=(codex_home,thread); rt.parent_deliveries[key]=object()
+                seen=[]; original=rt.store.all
+                def traced(sql,args=()):
+                    rows=original(sql,args)
+                    if 'parent_notifications n' in sql: seen.append(len(rows))
+                    return rows
+                with mock.patch.object(rt.store,'all',side_effect=traced), \
+                     mock.patch.object(rt.store,'run',wraps=rt.store.run) as run:
+                    parent.schedule(rt)
+                    self.assertLessEqual(max(seen,default=0),64)
+                    self.assertEqual(run.call_count,0)
+
+                del rt.parent_deliveries[key]
+                class UnstartedTask:
+                    def add_done_callback(self,_callback): pass
+                def capture_delivery(coro):
+                    coro.close()  # The test checks selection, not Codex delivery.
+                    return UnstartedTask()
+                seen.clear()
+                with mock.patch.object(rt.store,'all',side_effect=traced), \
+                     mock.patch.object(rt,'spawn_task',side_effect=capture_delivery):
+                    parent.schedule(rt)
+                self.assertLessEqual(sum(seen),64)
+                rt.store.execute("UPDATE parent_notifications SET state='pending' WHERE id='notice_000'")
+                rt.parent_deliveries.clear()
+                rt.parent_waits[object()]=(sid,frozenset(ids[:100]))
+                with mock.patch.object(rt,'spawn_task',side_effect=capture_delivery):
+                    parent.schedule(rt)
+                selected=rt.store.one("SELECT run_id FROM parent_notifications WHERE state='sending'")
+                self.assertEqual(selected['run_id'],ids[100])
+            finally:
+                rt.store.close()
+
+
+class ParentDeliveryProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exited_queue_wrapper_cannot_leave_pipe_holding_child(self):
+        with tempfile.TemporaryDirectory(prefix='parent-queue-group-') as tmp:
+            root=Path(tmp); codex_home=root/'codex'; codex_home.mkdir()
+            child=root/'child.py'
+            child.write_text('''import json,os,time
+from pathlib import Path
+Path(os.environ['CODEX_HOME'],'child.json').write_text(json.dumps({'pid':os.getpid(),'pgid':os.getpgrp()}))
+time.sleep(30)
+''')
+            bindir=root/'bin'; bindir.mkdir()
+            wrapper=bindir/'codex'; wrapper.write_text(
+                '#!'+sys.executable+'\nimport subprocess,sys\n'
+                f'child=subprocess.Popen([sys.executable,{str(child)!r}],stdout=sys.stdout,stderr=sys.stderr)\n')
+            wrapper.chmod(0o755)
+            class StoreStub:
+                saved=None
+                def agent(self,*_args): return {'name':'child'}
+                def execute(self,_sql,values): self.saved=values
+            store=StoreStub()
+            rt=mock.Mock(store=store)
+            notice={'id':'notice-1','scope':'scope-1','kind':'terminal','ui_id':None}
+            run={'agent_id':'agent-1','id':'run-1','state':'completed'}
+            bound={'command':str(wrapper),'home':str(root),'codex_home':str(codex_home),
+                   'path':os.environ.get('PATH',''),'thread_id':str(uuid.uuid4())}
+            pgid=None
+            try:
+                with mock.patch.object(parent,'QUEUE_TIMEOUT_SECONDS',.3):
+                    await asyncio.wait_for(parent.deliver(rt,notice,run,bound),5)
+                child_info=json.loads((codex_home/'child.json').read_text())
+                pgid=child_info['pgid']
+                self.assertEqual(store.saved[0],'unknown')
+                self.assertIn('not retried',store.saved[2])
+                self.assertEqual(group_members(pgid),[])
+            finally:
+                if pgid and group_members(pgid): os.killpg(pgid,9)

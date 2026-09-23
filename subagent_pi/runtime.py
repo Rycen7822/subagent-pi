@@ -90,7 +90,8 @@ class Runtime:
     def event(self,w,kind,payload):
         self.store.event(w.agent['id'],w.run_id,w.generation,kind,bounded(payload,4096))
         w.events_written += 1
-        if w.events_written % 256 == 0:
+        # Short generations still inherit this agent's existing event history.
+        if w.events_written == 1 or w.events_written % 256 == 0:
             cap = self.config['event_max_count_per_agent']
             self.store.execute('DELETE FROM events WHERE agent_id=? AND seq < COALESCE((SELECT seq FROM events WHERE agent_id=? ORDER BY seq DESC LIMIT 1 OFFSET ?),0)',(w.agent['id'],w.agent['id'],cap-1))
 
@@ -156,7 +157,19 @@ class Runtime:
             return
         if kind=='extension_ui_request':
             if e.get('method') in {'select','confirm','input','editor'} and e.get('id'):
-                w.ui[str(e['id'])]=bounded(e,3000)
+                item=bounded(e,3000)
+                if e['method']=='select':
+                    options=e.get('options')
+                    if (isinstance(options,list) and len(options)<=256 and
+                        all(isinstance(option,str) and option and '\x00' not in option and
+                            len(option.encode('utf-8'))<=8192 for option in options) and
+                        sum(len(option.encode('utf-8')) for option in options)<=65536):
+                        # The public event may be shortened, but answer validation
+                        # must use the exact labels Pi offered to the user.
+                        item['options']=options.copy()
+                    else:
+                        item['_options_unavailable']=True
+                w.ui[str(e['id'])]=item
                 self.store.agent_update(a['id'],state='needs_input')
                 if w.run_id: self.store.execute("UPDATE runs SET state='needs_input' WHERE id=?",(w.run_id,))
                 self.event(w,'needs_input',e)
@@ -243,7 +256,9 @@ class Runtime:
 
     async def settle(self,w,rid):
         async with self.agent_locks[w.agent['id']]:
-            if w.run_id!=rid or w.stopping: return
+            a=self.store.one('SELECT generation FROM agents WHERE id=?',(w.agent['id'],))
+            if (self.workers.get(w.agent['id']) is not w or not a or a['generation']!=w.generation
+                    or w.run_id!=rid or w.stopping or w.closed): return
             # Only the SDK transport's identity-bound task completion can enter
             # here. Per-run Pi events and transient idle readings never settle it.
             state='failed' if w.error else 'completed'
@@ -253,9 +268,13 @@ class Runtime:
             self.store.agent_update(w.agent['id'],state='idle',current_run=None,cleanup='not_checked')
             self.notify()
             q=self.store.one("SELECT id FROM runs WHERE agent_id=? AND state='queued' ORDER BY created LIMIT 1",(w.agent['id'],))
-            if q and not self.closing:
+            if q and not self.closing and w.proc.returncode is None:
                 try: await self.start_run(w,q['id'])
                 except AgentError as exc: self.event(w,'start_failed',exc.as_dict())
+
+    def cancel_queued(self,aid,reason):
+        for q in self.store.all("SELECT id FROM runs WHERE agent_id=? AND state='queued'",(aid,)):
+            self.store.finish(q['id'],'cancelled','',reason)
 
     async def stop_unowned(self,w):
         """Terminate a worker whose host started a run no daemon run owns.
@@ -267,6 +286,7 @@ class Runtime:
         async with self.agent_locks[w.agent['id']]:
             a=self.store.one('SELECT * FROM agents WHERE id=?',(w.agent['id'],))
             if not a or a['generation']!=w.generation or w.closed: return
+            self.cancel_queued(a['id'],'Worker stopped after unowned activity; queued task was not retried')
             cleanup=await terminate(self,w)
             self.store.agent_update(a['id'],state='dormant',current_run=None,cleanup=cleanup)
             self.event(w,'worker_stopped',{'reason':'unowned_run','cleanup':cleanup})
@@ -274,7 +294,13 @@ class Runtime:
 
     async def fail_worker(self,w,error):
         async with self.agent_locks[w.agent['id']]:
+            a=self.store.one('SELECT * FROM agents WHERE id=?',(w.agent['id'],))
+            # Reader errors can wait behind an interrupt/respawn. Even terminate
+            # writes cleanup to the ledger, so validate ownership before it too.
+            if (self.workers.get(w.agent['id']) is not w or not a or a['generation']!=w.generation
+                    or w.stopping or w.closed): return
             w.stopping=True
+            self.cancel_queued(w.agent['id'],'Worker protocol failed; queued task was not retried')
             if w.run_id:
                 self.store.finish(w.run_id,'failed',w.last_text,error,w.usage); w.run_id=None
             await terminate(self,w)
@@ -289,8 +315,7 @@ class Runtime:
                 self.store.finish(w.run_id,'interrupted' if w.stopping else 'crashed',w.last_text,
                     w.error or f'Pi guard exited with code {code}; inspect partial changes',w.usage)
                 w.run_id=None
-            for q in self.store.all("SELECT id FROM runs WHERE agent_id=? AND state='queued'",(a['id'],)):
-                self.store.finish(q['id'],'cancelled','','Worker exited; queued task was not automatically retried')
+            self.cancel_queued(a['id'],'Worker exited; queued task was not automatically retried')
             if a['state'] not in {'closed','dormant'}:
                 self.store.agent_update(a['id'],state='crashed',current_run=None,
                     cleanup='unknown' if group_members(w.proc.pid) else 'verified')
@@ -300,8 +325,7 @@ class Runtime:
         w=self.require_worker(a)
         w.stopping=True
         self.store.agent_update(a['id'],state='stopping')
-        for q in self.store.all("SELECT id FROM runs WHERE agent_id=? AND state='queued'",(a['id'],)):
-            self.store.finish(q['id'],'cancelled','','Cancelled because the active agent was stopped')
+        self.cancel_queued(a['id'],'Cancelled because the active agent was stopped')
         # Terminating only this verified process group also cancels input hooks,
         # authentication preflights and extension timers that Pi cannot abort.
         cleanup=await terminate(self,w)
@@ -456,6 +480,8 @@ class Runtime:
                     payload['confirmed']=answer
                 else:
                     if not isinstance(answer,str): raise AgentError('invalid_argument','Answer must be text')
+                    if item.get('_options_unavailable'):
+                        raise AgentError('input_too_large','Pi offered too many or oversized selections to answer safely')
                     if item.get('method')=='select' and answer not in item.get('options',[]):
                         raise AgentError('invalid_argument','Answer is not an offered selection')
                     payload['value']=text(answer,'answer',8192)
@@ -471,7 +497,9 @@ class Runtime:
                     a=self.store.agent(sid,aid)
                     if a['cleanup']!='verified':
                         raise AgentError('cleanup_unconfirmed','Previous worker cleanup could not be verified; inspect before respawn')
-                    w=await boot_worker(self,a); mode='send'
+                    async with self.admission:
+                        w=await boot_worker(self,a)
+                    mode='send'
                 if mode=='steer':
                     if not w.run_id: raise AgentError('agent_idle','Agent is idle; use mode=send. Steering never implicitly respawns.')
                     if len(self.store.all("SELECT id FROM receipts WHERE agent_id=? AND state IN ('sending','queued')",(aid,)))>=20:

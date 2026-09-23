@@ -174,6 +174,184 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.result(n['run_id']))['text'],'Completed: second')
         terminal=[json.loads(e['payload']) for e in self.events(s['agent_id'],'run_terminal')]
         self.assertEqual([e['state'] for e in terminal],['interrupted','completed'])
+    async def test_old_reader_failure_cannot_release_replacement_writer(self):
+        # Hold the control lock with an unanswered steer; queue replacement
+        # before a real oversized stdout frame schedules fail_worker behind it.
+        release=self.root/'release-reader'
+        fake=self.root/'broken-reader.py'
+        source=self.fake.read_text()
+        old="        elif kind=='steer': queue.append(r['message']); response(r)"
+        self.assertEqual(source.count(old),1)
+        fake.write_text(source.replace(old,"""        elif kind=='steer':
+            emit({'type':'extension_error','error':'STEER_ACCEPTED'})
+            while not os.path.exists(%r): await asyncio.sleep(.01)
+            emit({'type':'tool_execution_update','result':'x'*(8*1024*1024+1024)})
+            await asyncio.sleep(120)
+""" % str(release)))
+        self.rt.config['pi_command']=[sys.executable,str(fake)]
+        self.rt.config['rpc_timeout_seconds']=1
+        spawned=await self.spawn('delay=120|OLD',access='write')
+        aid=spawned['agent_id']; old_worker=self.rt.workers[aid]
+        finished=asyncio.Event(); original=self.rt.fail_worker
+        async def observed(w,error):
+            try: await original(w,error)
+            finally: finished.set()
+        with m.patch.object(self.rt,'fail_worker',observed):
+            steering=asyncio.create_task(self.mutation('send',aid,mode='steer',message='STEER'))
+            replacement=None
+            try:
+                await self.until(lambda: self.events(aid,'extension_error'))
+                replacement=asyncio.create_task(self.mutation('send',aid,interrupt=True,message='delay=1|NEW'))
+                await self.until(lambda: self.rt.agent_locks[aid]._waiters)
+                release.touch()
+                with self.assertRaises(AgentError) as caught: await steering
+                self.assertEqual(caught.exception.code,'rpc_timeout')
+                new=await replacement
+                await asyncio.wait_for(finished.wait(),5)
+                current=self.rt.workers[aid]; row=self.rt.store.agent(self.scope,aid)
+                self.assertEqual(current.generation,old_worker.generation+1)
+                self.assertIsNone(current.proc.returncode)
+                self.assertEqual(row['state'],'running')
+                self.assertEqual(row['current_run'],new['run_id'])
+                self.assertEqual(row['cleanup'],'not_checked')
+                self.assertIn('transport limit',old_worker.error)
+                with self.assertRaises(AgentError) as conflict: await self.spawn('MUST_NOT_START',access='write')
+                self.assertEqual(conflict.exception.code,'writer_conflict')
+                self.assertFalse((await self.wait(new['run_id']))['timed_out'])
+                self.assertEqual((await self.result(new['run_id']))['text'],'Completed: NEW')
+                self.assertEqual(self.rt.store.run(self.scope,spawned['run_id'])['state'],'interrupted')
+            finally:
+                for task in (steering,replacement):
+                    if task and not task.done(): task.cancel()
+                await asyncio.gather(*(t for t in (steering,replacement) if t),return_exceptions=True)
+
+    async def test_respawn_cannot_overtake_exit_accounting(self):
+        for completed in (False,True):
+            with self.subTest(completed=completed):
+                release=self.root/f'release-exit-{completed}'
+                fake=self.root/f'exiting-{completed}.py'
+                source=self.fake.read_text().replace("        elif kind=='prompt':", "        elif kind=='prompt':\n            active_rid=r['runId']")
+                old="        elif kind=='steer': queue.append(r['message']); response(r)"
+                self.assertEqual(source.count(old),1)
+                fake.write_text(source.replace(old,"""        elif kind=='steer':
+            emit({'type':'extension_error','error':'STEER_ACCEPTED'})
+            while not Path(%r).exists(): await asyncio.sleep(.01)
+            if %r:
+                msg('assistant','OLD_FINAL',stopReason='stop')
+                emit({'type':'managed_task_end','runId':active_rid})
+            os._exit(0)
+""" % (str(release),completed)))
+                self.rt.config['pi_command']=[sys.executable,str(fake)]
+                spawned=await self.spawn('delay=120|OLD')
+                aid=spawned['agent_id']; old_worker=self.rt.workers[aid]
+                queued=await self.mutation('send',aid,mode='follow_up',message='MUST_NOT_CROSS_GENERATION')
+                steering=asyncio.create_task(self.mutation('send',aid,mode='steer',message='STEER'))
+                replacement=None
+                try:
+                    await self.until(lambda:self.events(aid,'extension_error'))
+                    replacement=asyncio.create_task(self.mutation('respawn',aid,message='delay=1|NEW'))
+                    await self.until(lambda:self.rt.agent_locks[aid]._waiters)
+                    release.touch()
+                    with self.assertRaises(AgentError) as error: await steering
+                    self.assertEqual(error.exception.code,'worker_exited')
+                    new=None
+                    try: new=await replacement
+                    except AgentError as error:
+                        self.assertEqual(error.code,'worker_alive')
+                    await self.until(lambda:all(t.done() for t in old_worker.tasks))
+                    self.assertEqual(self.rt.store.run(self.scope,spawned['run_id'])['state'],'completed' if completed else 'crashed')
+                    self.assertEqual(self.rt.store.run(self.scope,queued['run_id'])['state'],'cancelled')
+                    # Retry only an explicit rejection, with a fresh request id,
+                    # after reconciliation; uncertain RPCs are never replayed.
+                    if new is None: new=await self.mutation('respawn',aid,message='delay=1|NEW')
+                    current=self.rt.workers[aid]
+                    await self.rt.settle(old_worker,spawned['run_id'])
+                    self.assertEqual(self.rt.store.agent(self.scope,aid)['current_run'],new['run_id'])
+                    self.assertEqual(current.run_id,new['run_id'])
+                    self.assertFalse((await self.wait(new['run_id']))['timed_out'])
+                    self.assertEqual((await self.result(new['run_id']))['text'],'Completed: NEW')
+                    await self.mutation('close',aid)
+                finally:
+                    release.touch()
+                    for task in (steering,replacement):
+                        if task and not task.done(): task.cancel()
+                    await asyncio.gather(*(t for t in (steering,replacement) if t),return_exceptions=True)
+
+    async def test_reader_failure_cancels_queue_before_exposing_closed_worker(self):
+        spawned=await self.spawn('delay=120|OLD')
+        aid=spawned['agent_id']; w=self.rt.workers[aid]
+        queued=await self.mutation('send',aid,mode='follow_up',message='MUST_NOT_RESUME')
+        entered=asyncio.Event(); release=asyncio.Event()
+        original=worker.terminate
+        async def delayed_terminate(rt,current):
+            entered.set(); await release.wait()
+            return await original(rt,current)
+        with m.patch('subagent_pi.runtime.terminate',delayed_terminate):
+            failing=asyncio.create_task(self.rt.fail_worker(w,'reader failed'))
+            replacing=None
+            try:
+                await entered.wait()
+                replacing=asyncio.create_task(self.mutation('respawn',aid,message='delay=1|NEW'))
+                await self.until(lambda:self.rt.agent_locks[aid]._waiters)
+                release.set(); await failing
+                new=await replacing
+                self.assertEqual(self.rt.store.run(self.scope,queued['run_id'])['state'],'cancelled')
+                self.assertEqual(self.rt.store.run(self.scope,spawned['run_id'])['state'],'failed')
+                self.assertFalse((await self.wait(new['run_id']))['timed_out'])
+            finally:
+                release.set()
+                for task in (failing,replacing):
+                    if task and not task.done(): task.cancel()
+                await asyncio.gather(*(t for t in (failing,replacing) if t),return_exceptions=True)
+
+    async def test_replacement_and_spawn_share_the_resident_limit(self):
+        self.rt.config['max_resident_agents']=1
+        spawned=await self.spawn('delay=120|OLD')
+        aid=spawned['agent_id']; gate=asyncio.Event(); release=asyncio.Event(); competing_fork=asyncio.Event()
+        original=asyncio.create_subprocess_exec
+        async def delayed_fork(*args,**kwargs):
+            if any(str(arg).endswith('/'+aid+'/launch.json') for arg in args):
+                gate.set(); await release.wait()
+            else: competing_fork.set()
+            return await original(*args,**kwargs)
+        with m.patch('asyncio.create_subprocess_exec',delayed_fork):
+            replacement=asyncio.create_task(self.mutation('send',aid,interrupt=True,message='delay=120|NEW'))
+            competing=None
+            try:
+                await asyncio.wait_for(gate.wait(),5)
+                competing=asyncio.create_task(self.spawn('delay=120|COMPETING'))
+                try: await asyncio.wait_for(competing_fork.wait(),.2)
+                except TimeoutError: pass
+                release.set()
+                outcomes=await asyncio.gather(replacement,competing,return_exceptions=True)
+                live=[w for w in self.rt.workers.values() if not w.closed and w.proc.returncode is None]
+                self.assertLessEqual(len(live),1)
+                self.assertIsInstance(outcomes[0],dict)
+                self.assertIsInstance(outcomes[1],AgentError)
+                self.assertEqual(outcomes[1].code,'capacity_exceeded')
+            finally:
+                release.set()
+                for task in (replacement,competing):
+                    if task and not task.done():task.cancel()
+                await asyncio.gather(*(t for t in (replacement,competing) if t),return_exceptions=True)
+
+    async def test_reader_failure_after_interrupt_keeps_the_terminal_state(self):
+        spawned=await self.spawn('delay=120|running')
+        w=self.rt.workers[spawned['agent_id']]
+        await self.mutation('interrupt',spawned['agent_id'])
+        before=self.rt.store.agent(self.scope,spawned['agent_id'])
+        await self.rt.fail_worker(w,'late reader failure')
+        self.assertEqual(self.rt.store.agent(self.scope,spawned['agent_id']),before)
+        self.assertEqual(self.rt.store.run(self.scope,spawned['run_id'])['state'],'interrupted')
+
+    async def test_current_reader_failure_still_stops_its_worker(self):
+        spawned=await self.spawn('delay=120|running')
+        w=self.rt.workers[spawned['agent_id']]
+        await self.rt.fail_worker(w,'reader failed')
+        self.assertEqual(self.rt.store.run(self.scope,spawned['run_id'])['state'],'failed')
+        self.assertEqual(self.rt.store.agent(self.scope,spawned['agent_id'])['state'],'crashed')
+        self.assertFalse(group_members(w.proc.pid))
+
     async def test_duplicate_settled_does_not_start_the_follow_up_twice(self):
         s=await self.spawn('dupsettled=1|work')
         q=await self.mutation('send',s['agent_id'],mode='follow_up',message='next')
@@ -502,17 +680,63 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_crash_not_completed(self):
         s=await self.spawn('CRASH'); r=await self.wait(s['run_id'])
         self.assertEqual(r['runs'][0]['state'],'crashed')
+    async def test_event_retention_survives_short_worker_generations(self):
+        s=await self.spawn()
+        self.assertFalse((await self.wait(s['run_id']))['timed_out'])
+        self.rt.config['event_max_count_per_agent']=100
+        agent=self.rt.store.agent(self.scope,s['agent_id'])
+        for generation in range(30):
+            current=worker.Worker(self.rt,{**agent,'generation':agent['generation']+generation+1},None)
+            for event in range(10): self.rt.event(current,'synthetic',{'event':event})
+        count=self.rt.store.one('SELECT count(*) AS n FROM events WHERE agent_id=?',(s['agent_id'],))['n']
+        self.assertLessEqual(count,109)
     async def test_close_kills_owned_descendants(self):
         s=await self.spawn('SPAWN_CHILD'); await asyncio.sleep(.15)
         pid=self.rt.workers[s['agent_id']].proc.pid
         self.assertGreaterEqual(len(group_members(pid)),2)
         r=await self.mutation('close',s['agent_id'])
         self.assertEqual(r['cleanup'],'verified'); self.assertEqual(group_members(pid),[])
+    async def test_exited_guard_reconciles_even_if_descendant_keeps_pipes_open(self):
+        s=await self.spawn('SPAWN_CHILD')
+        aid=s['agent_id']; w=self.rt.workers[aid]; pgid=w.proc.pid
+        queued=await self.mutation('send',aid,mode='follow_up',message='MUST_NOT_RUN')
+        owner_file=self.home/'agents'/aid/'owner.json'
+        try:
+            await self.until(lambda: len(group_members(pgid))>=3)
+            owner=json.loads(owner_file.read_text())
+            os.kill(owner['pi_pid'],signal.SIGKILL)
+            await self.until(lambda: w.proc.returncode is not None)
+            await self.until(lambda: self.rt.store.run(self.scope,s['run_id'])['state']=='crashed',timeout=3)
+            self.assertEqual(self.rt.store.run(self.scope,queued['run_id'])['state'],'cancelled')
+            self.assertEqual(self.rt.store.agent(self.scope,aid)['cleanup'],'unknown')
+            await self.until(lambda: w.closed and all(t.done() for t in w.tasks),timeout=3)
+            self.assertNotIn(aid,self.rt.workers)
+        finally:
+            if group_members(pgid): os.killpg(pgid,signal.SIGKILL)
+            await asyncio.wait_for(w.tasks[2],5)
     async def test_needs_input_and_explicit_answer(self):
         s=await self.spawn('UI_CONFIRM'); r=await self.wait(s['run_id'])
         self.assertEqual(r['runs'][0]['state'],'needs_input')
         await self.mutation('answer',s['agent_id'],ui_request_id='ui-1',answer=False)
         await self.wait(s['run_id']); self.assertIn('False',(await self.result(s['run_id']))['text'])
+    async def test_select_answers_keep_original_option_identity(self):
+        s=await self.spawn('UI_CONFIRM'); await self.wait(s['run_id'])
+        w=self.rt.workers[s['agent_id']]
+        long_option='a'*245
+        options=[long_option,*[f'option-{i}' for i in range(1,13)]]
+        self.rt.on_event(w,{'type':'extension_ui_request','id':'select-1',
+                            'method':'select','options':options,'title':'Choose'})
+        self.assertEqual(w.ui['select-1']['options'],options)
+        with self.assertRaises(AgentError):
+            await self.mutation('answer',s['agent_id'],ui_request_id='select-1',answer=long_option[:170])
+        with m.patch.object(w,'raw',new_callable=m.AsyncMock) as send:
+            await self.mutation('answer',s['agent_id'],ui_request_id='select-1',answer=options[-1])
+            self.assertEqual(send.await_args.args[0]['value'],options[-1])
+        self.rt.on_event(w,{'type':'extension_ui_request','id':'select-2',
+                            'method':'select','options':options,'title':'Choose'})
+        with m.patch.object(w,'raw',new_callable=m.AsyncMock) as send:
+            await self.mutation('answer',s['agent_id'],ui_request_id='select-2',answer=long_option)
+            self.assertEqual(send.await_args.args[0]['value'],long_option)
     async def test_model_silence_times_out_and_cancels_queued_work(self):
         loop=asyncio.create_task(self.rt.idle_loop())
         try:

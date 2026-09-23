@@ -14,7 +14,7 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readSync, closeSync, writeSync } from "node:fs";
+import { readSync, closeSync, writeSync, readFileSync, readdirSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 
 interface ServerCfg {
@@ -140,6 +140,7 @@ interface Bootstrap {
 }
 
 const MAX_PAYLOAD = 8 * 1024 * 1024;
+const MAX_STDIN_BUFFER = 8 * 1024 * 1024;
 const MAX_RESULT_TEXT = 256 * 1024;
 const MAX_LINE = 1024 * 1024;
 const MAX_SCHEMA_BYTES = 64 * 1024;
@@ -209,7 +210,49 @@ function readBootstrap(): { payload?: Bootstrap; error?: string } {
   return result;
 }
 
-interface JsonRpcResponse { id?: number | string | null; result?: unknown; error?: { code: number; message: string; data?: unknown } }
+interface JsonRpcResponse { jsonrpc?: string; id?: number | string | null; result?: unknown; error?: { code: number; message: string; data?: unknown } }
+
+type ProcessIdentity = { pid: number; startTime: string };
+function procStat(pid: number): { ppid: number; state: string; startTime: string } | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/);
+    if (!fields[19]) return null;
+    return { state: fields[0], ppid: Number(fields[1]), startTime: fields[19] };
+  } catch { return null; }
+}
+function descendantsOf(root: ProcessIdentity): ProcessIdentity[] {
+  if (process.platform !== "linux" || procStat(root.pid)?.startTime !== root.startTime) return [];
+  const children = new Map<number, ProcessIdentity[]>();
+  try {
+    for (const name of readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      const candidate = Number(name);
+      const stat = procStat(candidate);
+      if (!stat || stat.state === "Z") continue;
+      const list = children.get(stat.ppid) ?? [];
+      list.push({ pid: candidate, startTime: stat.startTime });
+      children.set(stat.ppid, list);
+    }
+  } catch { return []; }
+  const found: ProcessIdentity[] = [];
+  const seen = new Set<number>([root.pid]);
+  const queue = [root.pid];
+  for (let i = 0; i < queue.length; i++) {
+    for (const child of children.get(queue[i]) ?? []) {
+      if (seen.has(child.pid)) continue;
+      seen.add(child.pid);
+      found.push(child);
+      queue.push(child.pid);
+    }
+  }
+  return procStat(root.pid)?.startTime === root.startTime ? found : [];
+}
+function signalIfSame(proc: ProcessIdentity, signal: NodeJS.Signals): void {
+  const current = procStat(proc.pid);
+  if (current?.startTime !== proc.startTime || current.state === "Z") return;
+  try { process.kill(proc.pid, signal); } catch { /* already gone or inaccessible */ }
+}
 
 function toToolMeta(raw: unknown, mirrorHeaders: boolean): ToolMeta | null {
   if (typeof raw !== "object" || raw === null) return null;
@@ -287,6 +330,7 @@ abstract class McpConnection {
 
 class StdioConnection extends McpConnection {
   private proc: ChildProcess | null = null;
+  private procStartTime: string | null = null;
   private buffer = "";
   private nextId = 1;
   private pending = new Map<number, (error: Error | null, result?: unknown) => void>();
@@ -340,6 +384,7 @@ class StdioConnection extends McpConnection {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.proc = child;
+    if (child.pid) this.procStartTime = procStat(child.pid)?.startTime ?? null;
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => this.onData(chunk));
     child.stderr?.resume(); // drain without retaining server output or secrets
@@ -372,7 +417,13 @@ class StdioConnection extends McpConnection {
     if (!child.stdin?.writable) {
       throw new Error("stdio transport is broken; reconnect required");
     }
-    child.stdin.write(JSON.stringify(frame) + "\n");
+    const line = JSON.stringify(frame) + "\n";
+    if (child.stdin.writableLength + Buffer.byteLength(line) > MAX_STDIN_BUFFER) {
+      const reason = "stdio outbound buffer limit reached; the call may or may not have reached the server";
+      this.close(reason);
+      throw new Error(reason);
+    }
+    child.stdin.write(line);
   }
 
   private onData(chunk: string): void {
@@ -394,7 +445,8 @@ class StdioConnection extends McpConnection {
         const id = typeof msg.id === "number" ? msg.id : undefined;
         const finish = id === undefined ? undefined : this.pending.get(id);
         if (finish) {
-          finish(msg.error ? new RpcError(msg.error.code, msg.error.message, msg.error.data) : null, msg.result);
+          try { finish(null, rpcResult(msg, id as number)); }
+          catch (err) { finish(err as Error); }
         } else if (msg.id === undefined) {
           const method = (msg as unknown as { method?: string }).method;
           if (method === "notifications/tools/list_changed") this.invalidateCatalog(); // no model wakeup
@@ -427,12 +479,17 @@ class StdioConnection extends McpConnection {
         finish(new CancelledError(true));
         try { this.sendFrame({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }); } catch { /* best-effort */ }
       };
-      const timer = setTimeout(() => finish(new Error(`${method} timed out after ${timeoutSec}s`)), timeoutSec * 1000);
+      const timer = setTimeout(() => {
+        finish(new Error(`${method} timed out after ${timeoutSec}s`));
+        // A server that stopped reading can retain timed-out frames in Node's
+        // pipe forever. Discard that connection; never replay the mutation.
+        if (this.proc?.stdin?.writableLength) this.close();
+      }, timeoutSec * 1000);
       this.pending.set(id, finish);
       try {
         this.sendFrame({ jsonrpc: "2.0", id, method, params: wireParams });
       } catch (err) {
-        finish(new Error(`failed to send ${method}: ${(err as Error).message.slice(0, 200)}`));
+        if (this.pending.has(id)) finish(new Error(`failed to send ${method}: ${(err as Error).message.slice(0, 200)}`));
         return;
       }
       if (opts.signal?.aborted) onAbort();
@@ -477,14 +534,34 @@ class StdioConnection extends McpConnection {
     return await this.request("tools/call", { name, arguments: args ?? {} }, timeoutSec, { signal });
   }
 
-  close(): void {
+  close(reason = "connection closed"): void {
     const child = this.proc;
+    // Capture the owned tree BEFORE asking an entry wrapper to exit. Descendants
+    // can be reparented immediately; the worker's own process group remains intact.
+    const root = child?.pid && this.procStartTime ? { pid: child.pid, startTime: this.procStartTime } : null;
+    const descendants = root ? descendantsOf(root) : [];
     this.closed = true;
     this.proc = null;
-    this.failPending("connection closed");
+    this.failPending(reason);
     if (child) {
-      try { child.stdin?.end(); } catch { /* ignore */ }
-      try { child.kill("SIGTERM"); } catch { /* ignore */ }
+      try { child.stdin?.destroy(); } catch { /* ignore */ }
+      try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* ignore */ }
+      for (const proc of descendants) signalIfSame(proc, "SIGTERM");
+      if (root) signalIfSame(root, "SIGTERM");
+      else try { child.kill("SIGTERM"); } catch { /* ignore */ }
+      // A misbehaving MCP server must not survive failed initialization or
+      // shutdown indefinitely. Keep ownership until exit, then release it.
+      if (child.pid && (descendants.length || child.exitCode === null && child.signalCode === null)) {
+        const kill = setTimeout(() => {
+          for (const proc of descendants) signalIfSame(proc, "SIGKILL");
+          if (child.exitCode === null && child.signalCode === null) {
+            if (root) signalIfSame(root, "SIGKILL");
+            else try { child.kill("SIGKILL"); } catch { /* already gone */ }
+          }
+        }, 1000);
+        kill.unref();
+        if (!descendants.length) child.once("exit", () => clearTimeout(kill));
+      }
     }
   }
 }
@@ -544,6 +621,22 @@ class RpcError extends Error {
     super(`server error ${code}: ${message.slice(0, 300)}`);
     this.name = "RpcError";
   }
+}
+function rpcResult(value: unknown, id: number): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid JSON-RPC response");
+  const msg = value as JsonRpcResponse;
+  const hasResult = Object.hasOwn(msg, "result");
+  const hasError = Object.hasOwn(msg, "error");
+  if (msg.jsonrpc !== "2.0" || msg.id !== id || hasResult === hasError) {
+    throw new Error("invalid JSON-RPC response: version, id or result/error mismatch");
+  }
+  if (hasError) {
+    if (!msg.error || typeof msg.error.code !== "number" || typeof msg.error.message !== "string") {
+      throw new Error("invalid JSON-RPC response: malformed error");
+    }
+    throw new RpcError(msg.error.code, msg.error.message, msg.error.data);
+  }
+  return msg.result;
 }
 /** HTTP-level failure carrying the parsed JSON-RPC error body, when one existed. */
 class HttpRpcError extends Error {
@@ -612,12 +705,17 @@ class HttpConnection extends McpConnection {
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   }
 
+  private async discard(response: Response): Promise<void> {
+    try { await response.body?.cancel(); } catch { /* already consumed or closed */ }
+  }
+
   private async parseSse(response: Response, id: number): Promise<unknown> {
     const reader = response.body?.getReader();
     if (!reader) throw new Error("empty event-stream response");
     const decoder = new TextDecoder();
     let buffer = "";
     let total = 0;
+    let dataLines: string[] = [];
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -627,18 +725,20 @@ class HttpConnection extends McpConnection {
         buffer += decoder.decode(value, { stream: true });
         let idx: number;
         while ((idx = buffer.indexOf("\n")) >= 0) {
-          const line = buffer.slice(0, idx).trim();
+          const raw = buffer.slice(0, idx);
+          const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
           buffer = buffer.slice(idx + 1);
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          let msg: JsonRpcResponse;
-          try {
-            msg = JSON.parse(data) as JsonRpcResponse;
-          } catch { continue; } // keepalive/comment-ish line
-          if (msg.id === id) {
-            if (msg.error) throw new RpcError(msg.error.code, msg.error.message);
-            return msg.result;
+          if (line.startsWith("data:")) {
+            const data = line.slice(5);
+            dataLines.push(data.startsWith(" ") ? data.slice(1) : data);
+          } else if (!line && dataLines.length) {
+            const data = dataLines.join("\n");
+            dataLines = [];
+            if (data === "[DONE]") continue;
+            let msg: JsonRpcResponse;
+            try { msg = JSON.parse(data) as JsonRpcResponse; }
+            catch { continue; }
+            if (msg && typeof msg === "object" && msg.id === id) return rpcResult(msg, id);
           }
         }
       }
@@ -680,6 +780,7 @@ class HttpConnection extends McpConnection {
         // is never replayed automatically — its outcome stays unknown.
         if (response.status === 404 && this.mode === "legacy" && this.sessionId && method !== "initialize") {
           this.stale = true;
+          await this.discard(response);
           throw new StaleSessionError(`MCP session expired (HTTP 404)${sent ? "; the sent request's outcome is unknown" : ""}; the next explicit operation re-initializes`);
         }
         throw await this.classifyHttpError(response);
@@ -688,12 +789,10 @@ class HttpConnection extends McpConnection {
         const session = response.headers.get("mcp-session-id");
         if (session) this.sessionId = session;
       }
-      if (id === null) return null; // notification accepted; nothing to wait for
+      if (id === null) { await this.discard(response); return null; } // notification accepted; nothing to wait for
       const contentType = response.headers.get("content-type") ?? "";
       if (contentType.includes("text/event-stream")) return await this.parseSse(response, id);
-      const msg = await this.readBoundedJson(response, MAX_RESULT_TEXT) as JsonRpcResponse;
-      if (msg.error) throw new RpcError(msg.error.code, msg.error.message);
-      return msg.result;
+      return rpcResult(await this.readBoundedJson(response, MAX_RESULT_TEXT), id);
     } catch (err) {
       // classify by WHO aborted; sent requests keep an outcome-unknown wording
       if (opts.signal?.aborted) {
@@ -780,22 +879,26 @@ class HttpConnection extends McpConnection {
     for (let hop = 0; ; hop++) {
       const response = await fetch(current, { ...hopInit, redirect: "manual" });
       if (![301, 302, 303, 307, 308].includes(response.status)) return response;
-      const location = response.headers.get("location");
-      if (!location) throw new Error(`HTTP ${response.status} redirect without Location from ${redactUrl(current)}`);
-      const next = new URL(location, current);
-      if (next.origin !== originalOrigin) {
-        throw new Error(`refusing cross-origin redirect to ${redactUrl(next.toString())}; no headers or body were sent`);
+      try {
+        const location = response.headers.get("location");
+        if (!location) throw new Error(`HTTP ${response.status} redirect without Location from ${redactUrl(current)}`);
+        const next = new URL(location, current);
+        if (next.origin !== originalOrigin) {
+          throw new Error(`refusing cross-origin redirect to ${redactUrl(next.toString())}; no headers or body were sent`);
+        }
+        if (visited.has(next.toString())) throw new Error(`redirect loop at ${redactUrl(next.toString())}`);
+        visited.add(next.toString());
+        if (hop >= MAX_REDIRECTS) throw new Error(`too many redirects (>${MAX_REDIRECTS})`);
+        if (response.status !== 307 && response.status !== 308) {
+          const headers = { ...(hopInit.headers as Record<string, string>) };
+          delete headers["content-type"];
+          delete headers["content-length"];
+          hopInit = { ...hopInit, method: "GET", body: undefined, headers };
+        }
+        current = next.toString();
+      } finally {
+        await this.discard(response);
       }
-      if (visited.has(next.toString())) throw new Error(`redirect loop at ${redactUrl(next.toString())}`);
-      visited.add(next.toString());
-      if (hop >= MAX_REDIRECTS) throw new Error(`too many redirects (>${MAX_REDIRECTS})`);
-      if (response.status !== 307 && response.status !== 308) {
-        const headers = { ...(hopInit.headers as Record<string, string>) };
-        delete headers["content-type"];
-        delete headers["content-length"];
-        hopInit = { ...hopInit, method: "GET", body: undefined, headers };
-      }
-      current = next.toString();
     }
   }
 

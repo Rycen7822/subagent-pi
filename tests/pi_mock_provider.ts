@@ -1,5 +1,5 @@
 /** Offline provider for real SDK/MCP tests. All network requests fail. */
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 const env = process.env;
@@ -41,8 +41,25 @@ export default function (pi) {
   if (env.PI_MOCK_TOOL_MS) pi.registerTool({
     name: "mock_block", label: "Offline wait", description: "Silent test-only blocking tool",
     parameters: { type: "object", properties: {} },
-    async execute() {
+    async execute(_id, _params, _signal, onUpdate, ctx) {
       mark("PI_MOCK_TOOL_START");
+      if (env.PI_MOCK_QUEUE_FLOOD) {
+        while (!existsSync(env.PI_MOCK_TOOL_RELEASE!)) await sleep(10);
+        for (let i = 0; i < 300; i++) pi.sendUserMessage(`QUEUED_${i}`);
+      }
+      if (env.PI_MOCK_TOOL_RELEASE) {
+        while (!existsSync(env.PI_MOCK_TOOL_RELEASE)) await sleep(10);
+        const before = { rss: process.memoryUsage().rss, bytes: process.stdout.writableLength };
+        for (let i = 0; i < 2048; i++) {
+          const text = "x".repeat(16384);
+          if (env.PI_MOCK_TOOL_CRITICAL) ctx.ui.notify(text, "info");
+          else onUpdate({ content: [{ type: "text", text }], details: { i } });
+          await sleep(1);
+        }
+        writeFileSync(env.PI_MOCK_TOOL_REPORT!, JSON.stringify({ before,
+          after: { rss: process.memoryUsage().rss, bytes: process.stdout.writableLength } }));
+        if (!env.PI_MOCK_TOOL_CRITICAL) await ctx.ui.confirm("After progress", "Continue?");
+      }
       await sleep(Number(env.PI_MOCK_TOOL_MS));
       mark("PI_MOCK_TOOL_END");
       return { content: [{ type: "text", text: "finished" }], details: {} };

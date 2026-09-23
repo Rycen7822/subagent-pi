@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from .common import MAX_FRAME, DEFAULT_WAIT_SECONDS, AgentError, dumps, private_dir, read_frame, socket_path
+from .common import MAX_FRAME, DEFAULT_WAIT_SECONDS, AgentError, dumps, private_dir, read_frame, socket_path, close_writer
 from . import PROTOCOL_VERSION
 
 BASE_TIMEOUT = 45
@@ -38,7 +38,7 @@ def call_timeout(op, params, home=None):
     seconds=params.get('timeout_seconds',DEFAULT_WAIT_SECONDS) if op=='wait' else 0
     return max(BASE_TIMEOUT, (seconds or 0) + 10)
 
-async def request(home,op,params,timeout=45,autostart=True,source=None,on_result=None):
+async def connect_daemon(home,autostart):
     sock=socket_path(home)
     async def connect(): return await asyncio.open_unix_connection(str(sock),limit=MAX_FRAME)
     try: reader,writer=await connect()
@@ -59,24 +59,31 @@ async def request(home,op,params,timeout=45,autostart=True,source=None,on_result
             except (FileNotFoundError,ConnectionRefusedError):
                 if time.monotonic()>until: raise AgentError('daemon_start_failed',f'Cannot start daemon; inspect {log}')
                 await asyncio.sleep(.05)
+    return reader,writer
+
+async def request(home,op,params,timeout=45,autostart=True,source=None,on_result=None):
+    writer=None
     try:
-        frame={'v':PROTOCOL_VERSION,'op':op,'params':params}
-        if op=='wait' and on_result is not None: frame['wait_delivery']=True
-        if source is not None: frame['source']=source
-        writer.write((dumps(frame)+'\n').encode()); await writer.drain()
-        response=await asyncio.wait_for(read_frame(reader),timeout)
-        if not response: raise AgentError('connection_lost','No response; mutation may have committed. Retry the same request_id.')
-        if not response.get('ok'): raise AgentError(**response.get('error',{'code':'protocol_error','message':'Invalid reply'}))
-        if on_result is not None:
-            await on_result(response['result'])
-            if op=='wait':
-                # Confirm only after the adapter wrote the result to its caller.
-                # Failed confirmation must not emit a second MCP response.
-                with contextlib.suppress(OSError):
+        # One budget covers connect, request backpressure and the response.
+        # A client timeout never retries or cancels a daemon-owned mutation.
+        async with asyncio.timeout(timeout):
+            reader,writer=await connect_daemon(home,autostart)
+            frame={'v':PROTOCOL_VERSION,'op':op,'params':params}
+            if op=='wait' and on_result is not None: frame['wait_delivery']=True
+            if source is not None: frame['source']=source
+            writer.write((dumps(frame)+'\n').encode()); await writer.drain()
+            response=await read_frame(reader)
+            if not response: raise AgentError('connection_lost','No response; mutation may have committed. Retry the same request_id.')
+            if not response.get('ok'): raise AgentError(**response.get('error',{'code':'protocol_error','message':'Invalid reply'}))
+            if on_result is not None: await on_result(response['result'])
+        if op=='wait' and on_result is not None:
+            # Output has succeeded. A failed delivery receipt must never turn it
+            # into a second response; the daemon can restore pending attention.
+            with contextlib.suppress(OSError,TimeoutError):
+                async with asyncio.timeout(min(timeout,1)):
                     writer.write(b'{"received":true}\n'); await writer.drain()
         return response['result']
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise AgentError('client_timeout','Client stopped waiting. Pi was NOT cancelled; query state or retry the SAME mutation request_id.')
     finally:
-        writer.close()
-        with contextlib.suppress(Exception): await writer.wait_closed()
+        if writer is not None: await close_writer(writer)

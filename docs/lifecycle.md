@@ -10,15 +10,15 @@ agent 状态包括 starting、running、needs_input、idle、stopping、dormant�
 
 插件的 SDK 子进程拥有任务内输入队列。一个 run 可以包含多次 SDK prompt，以及 Pi 自己在 prompt 内完成的工具调用、重试、自动压缩和 before-settle 续跑。插件逐项 await SDK 调用，队列排空才发出携带 run_id 的 `managed_task_end`；Pi 的 `agent_end` / `agent_settled` 只描述宿主活动，不能结算任务。
 
-扩展的 `pi.sendUserMessage` 及会触发执行的 `pi.sendMessage` 接入该队列；SDK 的公开 ExtensionRuntime action bindings 仅在受管子进程内绑定，未修改 AgentSession、原型或安装文件。输入按接受顺序串行执行，包含 input hook、认证及 before_agent_start，所以不会出现并发预处理抢占底层 run。每次用户消息续跑走完整 SDK prompt 路径，重新应用当前扩展的提示与工具规则；custom message 续跑沿用 SDK 的 sendCustomMessage 语义。
+扩展的 `pi.sendUserMessage` 及会触发执行的 `pi.sendMessage` 接入该队列；SDK 的公开 ExtensionRuntime action bindings 仅在受管子进程内绑定，未修改 AgentSession、原型或安装文件。输入按接受顺序串行执行，包含 input hook、认证及 before_agent_start，所以不会出现并发预处理抢占底层 run。队列最多积压 256 条、8 MiB；扩展超过上限时专属子进程退出，daemon 记录崩溃并取消后继任务。每次用户消息续跑走完整 SDK prompt 路径，重新应用当前扩展的提示与工具规则；custom message 续跑沿用 SDK 的 sendCustomMessage 语义。
 
 每条任务链用 AsyncLocalStorage 保留归属。任务结束后的异步输入会被拒绝并记录诊断，不能混入后继任务；没有活动任务时扩展不能自动启动模型任务。启动阶段显式启用命令展开的、已注册的本地 slash command 会在接收任务前串行执行完毕，仅调用命令 handler，不回退到模型 prompt。扩展自己创建其他 SDK session 或独立进程不受此队列管理，扩展仍是受信任的代码，插件不是沙箱。
 
-受管子进程在加载 SDK 和扩展前保留专用 JSON 输出函数，将普通 `process.stdout.write`（含 console 输出和终端通知）转到 stderr 诊断日志，避免与协议帧粘连。此绑定仅作用于插件自己的子进程；普通 Pi 不受影响。扩展直接写底层文件描述符等绕过 Node stream 的行为不属于该隔离保证。
+受管子进程在加载 SDK 和扩展前保留专用 JSON 输出函数，将普通 `process.stdout.write`（含 console 输出和终端通知）转到 stderr 诊断日志，避免协议帧粘连。SDK 协议待写字节（含 Node 缓冲）上限 8 MiB，额外排队最多 256 帧；背压期间可合并/丢弃临时进度，结果、问题、RPC 与任务边界保持顺序。关键帧无法容纳或等待 drain 超过 45 秒时，子进程以 74 退出，由 daemon 记录崩溃并取消队列，不假装送达。这是输出通道保护，不限制任务总时长或正常等待工具/回答的时长。普通 Pi 不受影响；扩展直接写底层文件描述符绕过 Node stream 的行为不属于此保证。
 
 主输入被 handled 且整条任务没有 assistant 结果时记为 failed，并继续排队的后继任务。SDK 异常同样产生明确终态。消息被接受不等于已经执行；正常完成不依赖 sleep、空闲轮询或 deadline。
 
-daemon 结算时校验 generation、run_id 和 stopping，终态幂等。迟到/重复完成不能结束另一个 run。结果包括该任务链的最后 assistant 文本和累计 usage，读取不确认结果，ack 必须绑定精确 SHA-256。
+daemon 在 agent 锁内校验当前 Worker 身份、generation、run_id 和 stopping，终态幂等。迟到/重复完成不能结束另一个 run。结果包括该任务链的最后 assistant 文本和累计 usage，读取不确认结果，ack 必须绑定精确 SHA-256。
 
 ## Spawn
 
@@ -50,13 +50,13 @@ steer 回执的 execution=after_current_sdk_call 表示调度方式，不是已�
 
 interrupt 取消 daemon 排队任务，并终止、核验插件自己拥有的进程组。这也停止输入 hook、认证预处理和扩展计时器；不会靠 Pi 的瞬时 idle 声称停止成功。返回 `process_retained=false`、state=dormant，cleanup 如实报告 verified/unknown。不会向普通 Pi 会话发信号。
 
-session 和结果保留；单独 interrupt 后需显式 respawn。`pi_send_input(interrupt=true, message=...)` 明确要求替换工作：只有旧进程清理 verified 后才启动新 generation 执行该新消息，不重放旧任务。清理无法确认则拒绝替换。
+session 和结果保留；单独 interrupt 后需显式 respawn。`pi_send_input(interrupt=true, message=...)` 明确要求替换工作：只有旧进程清理 verified 后才启动新 generation 执行该新消息，不重放旧任务。清理无法确认则拒绝替换；新建、恢复和中断替换共用容量准入锁，不允许并发启动突破驻留上限。
 
 ## Close 与 respawn
 
 MCP 只列出 pi_close_agent 作为停止工具；旧 pi_interrupt_agent 与 CLI interrupt 仍兼容。close 先 TERM 再 KILL 并核验受管进程组，保留会话和结果。无法确认归属/清理时阻止恢复，不对猜测 PID 发信号。
 
-respawn 要求旧 writer 已消失且会话存在；agent_id 不变、generation 增加。可附加新消息，不附加则恢复为 idle。CLI resume 是其别名。已存活的 idle agent 使用 send。
+respawn 要求旧 writer 已消失、退出结算已完成且会话存在；agent_id 不变、generation 增加。自然退出尚在结算时明确返回 worker_alive，不在内部自动重试。进程退出后最多等待 2 秒读取末尾事件；即使后代仍持有输出管道，旧 run 和队列也会结算，残留进程组的 cleanup 仍如实为 unknown。所有停止路径在允许换代前将旧队列取消；旧完成回调既不能改写新进程，也不能在死进程上推进队列。可附加新消息，不附加则恢复为 idle。CLI resume 是其别名。已存活的 idle agent 使用 send。
 
 受管会话不允许扩展切换、fork、reload 或导航到其他 session；关闭/恢复是唯一替换入口。Pi 配置、技能、provider、工具和普通生命周期扩展仍加载，TUI 专用界面按 headless 模式处理。
 
@@ -67,6 +67,8 @@ respawn 要求旧 writer 已消失且会话存在；agent_id 不变、generation
 `questions` 带 agent_id、run_id、问题 id、正文和选择项，供 `pi_answer_agent` 使用；模型可调用仅在受管子进程注册的 `ask_parent`，暂停工具执行直到显式回答。回答不会自动批准其他请求。标准安装使用 Codex 原生清单，为本插件设置 3630 秒 MCP 超时，覆盖一小时等待及传输余量；其他 MCP 客户端或手动使用通用清单时，仍需保证外层工具超时足够长。
 
 wait 的每个终态结果最多预读 2 KiB，整页文本共用 8 KiB 预算；`has_more` 时从 next_offset 调 result。读结果不 ack，仍需精确 hash 确认。时间戳等轨迹细节留在 inspect 和 result，默认 run 摘要不重复输出。
+
+IPC 的连接、请求写入和响应读取共用调用预算；已写出结果后的交付回执最多等 1 秒，连接关闭最多再等 1 秒，不会因回执失败重复返回结果。daemon 响应写入和交付确认共用 10 秒预算。MCP stdout 非阻塞串行写入，单帧最多等 45 秒；半帧输出被取消或写失败时关闭该连接，避免后续 JSON 拼接损坏。上述传输失败不取消后台任务，不自动重发操作。
 
 父会话身份来自 Codex 每次 MCP 调用的 `_meta.threadId`（CLI 则读自身 CODEX_THREAD_ID），不接受模型参数指定父代理。scope 默认值按父会话隔离；绑定后不能静默改指另一个父会话。其他会话仍可用显式 scope 读取旧结果，创建新任务需使用自己的 scope。parent_notifications 在 context/list 返回绑定及最近投递状态。
 

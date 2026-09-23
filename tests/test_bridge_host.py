@@ -190,6 +190,70 @@ class BridgeHostTests(BridgeHostCase):
         self.assertIn('timed out', err['message'])
         # Exactly one request reached the server: no retry, no duplicate.
         self.assertEqual(len(self.h.calls(srv['log'])), 1)
+    def test_stdio_rejects_matching_id_without_rpc_result(self):
+        srv = self.h.start_stdio(mode='invalid_call_response')
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
+            {'action':'call','server':'local','tool':'echo','args':{'text':'x'},'confirm':True},
+        ])['results'][0]
+        self.assertEqual(out['kind'],'error',out)
+        self.assertIn('invalid JSON-RPC response',out['message'])
+        self.assertEqual(len([e for e in self.h.events(srv['events']) if e['event']=='invalid-call-response-sent']),1)
+    def test_stdio_stalled_reader_does_not_keep_timed_out_writes(self):
+        srv = self.h.start_stdio(mode='stall_stdin_after_list')
+        cfg = stdio_cfg(server_env=srv['env'], tool_timeout_sec=1)
+        call = {'action':'call','server':'local','tool':'echo',
+                'args':{'text':'x'*(1024*1024)},'confirm':True}
+        try:
+            out = self.h.run_host([cfg], [dict(call,name='first'),dict(call,name='second')], timeout=15)
+            self.assertEqual([r['kind'] for r in out['results']],['error','error'])
+            starts = [e['pid'] for e in self.h.events(srv['events']) if e['event']=='server-start']
+            self.assertGreaterEqual(len(starts),2,'a blocked stdin must close and reconnect after timeout')
+        finally:
+            for e in self.h.events(srv['events']):
+                if e['event']=='server-start':
+                    try: os.kill(e['pid'],9)
+                    except ProcessLookupError: pass
+    def test_stdio_outbound_buffer_has_a_hard_limit(self):
+        srv = self.h.start_stdio(mode='stall_stdin_after_list')
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
+            {'action':'call','server':'local','tool':'echo','confirm':True,
+             'args':{'text':'x'*(8*1024*1024)}},
+        ], timeout=15)
+        self.assertEqual(out['results'][0]['kind'],'error')
+        self.assertIn('outbound buffer limit',out['results'][0]['message'])
+        self.assertEqual(self.h.calls(srv['log']),[])
+    def test_stdio_close_kills_server_that_ignores_term(self):
+        srv = self.h.start_stdio(mode='ignore_term_no_init')
+        try:
+            out = self.h.run_host([stdio_cfg(server_env=srv['env'], startup_timeout_sec=1)], [
+                {'action':'describe','server':'local','tool':'echo','name':'catalog'}, {'waitMs':1800},
+            ], timeout=10)
+            self.assertEqual(out['results'][0]['kind'],'error')
+            starts = [e['pid'] for e in self.h.events(srv['events']) if e['event']=='server-start']
+            self.assertEqual(len(starts),1)
+            with self.assertRaises(ProcessLookupError): os.kill(starts[0],0)
+        finally:
+            for e in self.h.events(srv['events']):
+                if e['event']=='server-start':
+                    try: os.kill(e['pid'],9)
+                    except ProcessLookupError: pass
+    def test_stdio_close_reaps_wrapped_server_descendant(self):
+        srv = self.h.start_stdio(mode='ignore_term_after_eof')
+        cfg = stdio_cfg(server_env=srv['env'],args=[str(HERE/'fake_mcp_wrapper.py')])
+        try:
+            out = self.h.run_host([cfg], [
+                {'action':'call','server':'local','tool':'echo','args':{'text':'x'},'confirm':True},
+                {'shutdown':True},{'waitMs':1800},
+            ],timeout=10)
+            self.assertEqual(out['results'][0]['kind'],'result',out)
+            pids = [e['pid'] for e in self.h.events(srv['events']) if e['event']=='server-start']
+            self.assertEqual(len(pids),1)
+            with self.assertRaises(ProcessLookupError): os.kill(pids[0],0)
+        finally:
+            for e in self.h.events(srv['events']):
+                if e['event']=='server-start':
+                    try: os.kill(e['pid'],9)
+                    except ProcessLookupError: pass
     def test_stdio_exit_mid_call(self):
         srv = self.h.start_stdio(mode='die_after_init')
         out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
@@ -539,6 +603,26 @@ class HttpExchangeLifecycleTests(BridgeHostCase):
         self.assertEqual(err['kind'], 'error')
         self.assertIn('timed out', err['message'])
         self.assertEqual(len(self.h.calls(srv['log'])), 1)
+
+    def test_http_json_requires_matching_rpc_response(self):
+        for mode in ('wrong_tool_response_id','empty_tool_response'):
+            with self.subTest(mode=mode):
+                srv = self.h.start_http(mode=mode)
+                out = self.h.run_host([self.http_cfg(srv,protocol_mode='legacy_2025_06_18')], [
+                    {'action':'call','server':'web','tool':'search','args':{'query':'x'},'confirm':True},
+                ],access='write')['results'][0]
+                self.assertEqual(out['kind'],'error',out)
+                self.assertIn('invalid JSON-RPC response',out['message'])
+                self.assertEqual(len(self.h.calls(srv['log'])),1)
+
+    def test_http_multiline_sse_event_returns_one_result(self):
+        srv = self.h.start_http(mode='multiline_sse')
+        out = self.h.run_host([self.http_cfg(srv,protocol_mode='legacy_2025_06_18')], [
+            {'action':'call','server':'web','tool':'search','args':{'query':'x'},'confirm':True},
+        ],access='write')['results'][0]
+        self.assertEqual(out['kind'],'result',out)
+        self.assertIn('handled search x',out['text'])
+        self.assertEqual(len(self.h.calls(srv['log'])),1)
 
     def test_user_cancellation_ends_body_wait(self):
         srv = self.h.start_http(mode='hang_body_json')
@@ -1284,6 +1368,16 @@ class RedirectTests(BridgeHostCase):
         self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
         self.assertEqual(self.h.calls(a['log']), ['search:{"query": "x"}'])  # executed exactly once, not replayed
         self.assertEqual(len([e for e in self.h.events(a['events']) if e['event'] == 'redirect-sent']), 1)
+
+    def test_redirect_with_unfinished_body_releases_each_socket(self):
+        a = self.h.start_http('redirect_hanging_body')
+        actions = [{'action':'call','server':'web','tool':'search','args':{'query':str(i)},
+                    'name':f'call-{i}'} for i in range(4)]
+        actions += [{'waitMs':200},{'socketCount':True,'name':'open-sockets'}]
+        out = self.h.run_host([self.http_cfg(a,protocol_mode='legacy_2025_06_18')],actions,access='write')['results']
+        self.assertEqual([r['kind'] for r in out[:4]],['result']*4)
+        self.assertEqual(len(self.h.calls(a['log'])),4)
+        self.assertLess(out[-1]['sockets'],3,'discarded redirect bodies retained live sockets')
 
     def test_second_hop_cross_origin_is_rejected(self):
         b = self.h.start_http('modern')

@@ -1,13 +1,12 @@
 from __future__ import annotations
 import asyncio
-import contextlib
 import fcntl
 import json
 import os
 from pathlib import Path
 import signal
 import sys
-from .common import MAX_FRAME, AgentError, check_peer, dumps, private_dir, read_frame, socket_path
+from .common import MAX_FRAME, AgentError, check_peer, dumps, private_dir, read_frame, socket_path, close_writer
 from .runtime import Runtime
 from . import parent
 from .schema import validate_op
@@ -64,18 +63,18 @@ async def serve(home: Path):
                 except Exception as e:
                     print(f'IPC operation failed: {type(e).__name__}: {e}',file=sys.stderr)
                     reply={'ok':False,'error':{'code':'internal_error','message':'Runtime failure. Inspect the ledger before retrying.'}}
-                writer.write((dumps(reply)+'\n').encode()); await writer.drain()
-                if reply['ok'] and track_delivery:
-                    receipt=await asyncio.wait_for(read_frame(reader),10)
-                    if receipt=={'received':True}: delivered=value
+                async with asyncio.timeout(10):
+                    writer.write((dumps(reply)+'\n').encode()); await writer.drain()
+                    if reply['ok'] and track_delivery:
+                        receipt=await read_frame(reader)
+                        if receipt=={'received':True}: delivered=value
             except (OSError,asyncio.TimeoutError,ValueError):
                 pass  # No delivery receipt: pending attention becomes eligible again.
             finally:
                 if disconnected: disconnected.cancel()
                 parent.release_wait(runtime,reservation,delivered)
                 clients.discard(current)
-                writer.close()
-                with contextlib.suppress(Exception): await writer.wait_closed()
+                await close_writer(writer)
         server=await asyncio.start_unix_server(handle,str(sock),limit=MAX_FRAME)
         os.chmod(sock,0o600)
         loop=asyncio.get_running_loop()

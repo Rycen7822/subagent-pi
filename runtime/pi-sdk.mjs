@@ -8,12 +8,15 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { TaskQueue } from './task-queue.mjs';
+import { createProtocolOutput } from './protocol-output.mjs';
 
 // Only this writer owns the protocol pipe. Extension console/terminal output is
 // diagnostic data, even when it contains JSON or lacks a trailing newline.
-const protocolWrite = process.stdout.write.bind(process.stdout);
+const output = createProtocolOutput(process.stdout, { fail(error) {
+  process.stderr.write(`subagent-pi protocol: ${error.message}\n`);
+  process.exit(74); // Let the daemon record a crash; never fake delivery or replay.
+} });
 process.stdout.write = process.stderr.write.bind(process.stderr);
-const output = (value) => protocolWrite(JSON.stringify(value) + '\n');
 const [sdkPath, ...argv] = process.argv.slice(2);
 const sdk = await import(pathToFileURL(sdkPath).href);
 // Validate explicit thinking against the loaded model, not parseArgs' global list.
@@ -31,7 +34,13 @@ if (args.messages.length || args.fileArgs.length || args.diagnostics.some(d => d
   throw new Error('Managed child accepts tasks only through its protocol; invalid Pi command arguments');
 }
 if (args.offline) process.env.PI_OFFLINE = '1';
-const report = (error) => output({ type: 'extension_error', originRunId: queue.context.getStore()?.id, error: String(error?.error ?? error) });
+const report = (error) => {
+  output({ type: 'extension_error', originRunId: queue.context.getStore()?.id, error: String(error?.error ?? error) });
+  if (error?.code === 'managed_queue_full') {
+    process.stderr.write(`subagent-pi: ${error.message}\n`);
+    process.exit(74); // The daemon records a crash; no queued input is silently lost.
+  }
+};
 const unsupported = async () => { throw new Error('Session replacement/reload is not supported in a managed child; close and respawn explicitly'); };
 let session, resources;
 let startupCommands = [];

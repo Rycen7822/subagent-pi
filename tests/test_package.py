@@ -214,7 +214,7 @@ class DevSetupStaging(unittest.TestCase):
 class SdkTransport(unittest.TestCase):
     def test_task_ownership_contract(self):
         if not shutil.which('node'): self.skipTest('Node.js not installed')
-        done=subprocess.run(['node','--test',str(ROOT/'tests/task-queue.test.mjs')],capture_output=True,text=True)
+        done=subprocess.run(['node','--test',str(ROOT/'tests/task-queue.test.mjs'),str(ROOT/'tests/protocol-output.test.mjs')],capture_output=True,text=True)
         self.assertEqual(done.returncode,0,done.stdout+done.stderr)
 
     def test_stock_pi_command_resolves_only_to_plugin_files(self):

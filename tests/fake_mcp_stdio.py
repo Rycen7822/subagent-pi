@@ -8,11 +8,14 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import signal
 import sys
 import threading
 import time
 
 MODE = os.environ.get('FAKE_MCP_MODE', 'normal')  # normal|no_answer|die_after_init|die_during_call|close_stdin_after_init|close_stdin_after_list|close_after_call|slow
+if MODE in ('ignore_term_no_init','ignore_term_after_eof'):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 CLOSE_AFTER_CALL = os.environ.get('FAKE_MCP_CLOSE_AFTER_CALL') == '1'
 CALL_LOG = os.environ.get('FAKE_MCP_CALL_LOG')
 EVENTS = os.environ.get('FAKE_MCP_EVENTS')
@@ -187,6 +190,8 @@ for raw in sys.stdin:
                         "serverInfo": {"name": "fake-stdio", "version": "1.0"}})
     elif method == 'initialize':
         event('initialize-received')
+        if MODE == 'ignore_term_no_init':
+            while True: time.sleep(1)
         reply(req, {"protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {"listChanged": True}},
                     "serverInfo": {"name": "fake-stdio", "version": "1.0"}})
@@ -208,6 +213,8 @@ for raw in sys.stdin:
         _meta = req.get('params', {}).get('_meta') or {}
         event('tools-list-received', count=list_count + 1,
               modern_meta=_meta.get('io.modelcontextprotocol/protocolVersion'))
+        if MODE == 'ignore_term_no_list':
+            while True: time.sleep(1)
         page = tools_page(req.get('params', {}).get('cursor'))
         if MODE == 'close_stdin_after_list':
             # Deterministic EPIPE: the catalog answer goes out first, so the
@@ -226,6 +233,9 @@ for raw in sys.stdin:
             else:
                 page = {'tools': TOOLS_MUTATED}  # after list_changed
         reply(req, page)
+        if MODE == 'stall_stdin_after_list':
+            event('stdin-stalled')
+            while True: time.sleep(1)
         if DIE_AFTER_LIST_MS:
             # die AFTER the catalog answer is flushed: the client caches a live
             # catalog, then the process disappears (e.g. during a confirm wait)
@@ -238,8 +248,15 @@ for raw in sys.stdin:
         if MODE == 'die_during_call':
             event('call-received-die')
             sys.exit(7)
+        if MODE == 'invalid_call_response':
+            event('invalid-call-response-sent')
+            print(json.dumps({'id':rid}),flush=True)
+            continue
         handle_call(req, params.get('name'), params.get('arguments') or {})
     elif method == 'notifications/cancelled':
         event('cancelled-notification-received')
     elif rid is not None:
         print(json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "not implemented"}}), flush=True)
+if MODE == 'ignore_term_after_eof':
+    event('stdin-ended-still-alive')
+    while True: time.sleep(1)

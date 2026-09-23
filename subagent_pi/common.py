@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -33,6 +34,15 @@ class AgentError(Exception):
         self.code, self.message, self.details = code, message, details
     def as_dict(self):
         return {"code": self.code, "message": self.message, **self.details}
+
+async def close_writer(writer):
+    """Flush a one-shot IPC connection briefly, then release it even on cancel."""
+    try:
+        with contextlib.suppress(OSError,TimeoutError):
+            writer.close()
+            async with asyncio.timeout(1): await writer.wait_closed()
+    finally:
+        writer.transport.abort()
 
 def dumps(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)

@@ -100,6 +100,13 @@ for (const step of actions) {
     continue;
   }
   if (step.waitMs) { await new Promise((r) => setTimeout(r, step.waitMs)); continue; }
+  if (step.shutdown) { for (const cb of handlers['session_shutdown'] ?? []) cb(); continue; }
+  if (step.socketCount) {
+    results.push({ kind: 'snapshot', step: step.name, sockets: process._getActiveHandles().filter(
+      (handle) => handle.constructor?.name === 'Socket' && handle.remoteAddress === '127.0.0.1',
+    ).length });
+    continue;
+  }
   await runStep(step);
 }
 await Promise.allSettled(launched.splice(0)); // never leave a step unsettled

@@ -58,3 +58,30 @@ test('SDK rejection discards its queued continuations and releases the owner', a
   assert.match((await done.promise).error, /SDK failed/);
   assert.deepEqual(seen, ['first']); assert.equal(queue.active, undefined);
 });
+
+test('accepted extension inputs have both count and byte limits', async () => {
+  async function blockedQueue() {
+    const started = gate(), release = gate(), done = gate();
+    const queue = new TaskQueue(async input => {
+      if (input === 'root') { started.resolve(); await release.promise; }
+    }, done.resolve);
+    queue.start('owner', 'root'); await started.promise;
+    return { queue, release, done };
+  }
+  const count = await blockedQueue();
+  count.queue.context.run(count.queue.active, () => {
+    for (let i = 0; i < 256; i++) count.queue.enqueue('x');
+    assert.throws(() => count.queue.enqueue('extra'), /capacity/);
+  });
+  count.release.resolve(); await count.done.promise;
+  assert.equal(count.queue.active, undefined);
+
+  const bytes = await blockedQueue();
+  bytes.queue.context.run(bytes.queue.active, () => {
+    const chunk = 'x'.repeat(3 * 1024 * 1024);
+    bytes.queue.enqueue(chunk); bytes.queue.enqueue(chunk);
+    assert.throws(() => bytes.queue.enqueue(chunk), /capacity/);
+  });
+  bytes.release.resolve(); await bytes.done.promise;
+  assert.equal(bytes.queue.active, undefined);
+});

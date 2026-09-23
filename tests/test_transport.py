@@ -1,12 +1,17 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import array
+import fcntl
+import termios
 import json
 import os
 import re
 from pathlib import Path
 import signal
 import shutil
+import socket
+import struct
 import sys
 import tempfile
 import unittest
@@ -65,6 +70,65 @@ class McpHarness:
 
 
 class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
+    async def test_stdout_backpressure_does_not_block_stdin_eof(self):
+        await self.initialize()
+        output=self.mcp.stdout._transport
+        output.pause_reading()
+        try:
+            for _ in range(40): await self.send('tools/list')
+            # A separate file marker is unnecessary: the parent keeps the output
+            # paused through EOF. The child must exit even when no bytes drain.
+            self.mcp.stdin.close()
+            end=asyncio.get_running_loop().time()+3
+            while self.mcp.returncode is None and asyncio.get_running_loop().time()<end:
+                await asyncio.sleep(.02)
+            self.assertEqual(self.mcp.returncode,0,'MCP blocked writing stdout after stdin EOF')
+        finally:
+            output.resume_reading()
+            await self.mcp.stdout.read()
+
+    async def fill_stdout_pipe(self):
+        await self.initialize()
+        output=self.mcp.stdout._transport
+        fd=output.get_extra_info('pipe').fileno()
+        capacity=fcntl.fcntl(fd,fcntl.F_SETPIPE_SZ,4096)
+        output.pause_reading()
+        rid=await self.send('tools/list')
+        size=array.array('i',[0]); end=asyncio.get_running_loop().time()+3
+        while asyncio.get_running_loop().time()<end:
+            fcntl.ioctl(fd,termios.FIONREAD,size,True)
+            if size[0]==capacity: return output,rid
+            await asyncio.sleep(.01)
+        output.resume_reading()
+        self.fail('stdout pipe did not fill')
+
+    async def test_cancel_partial_response_closes_connection_without_another_frame(self):
+        output,rid=await self.fill_stdout_pipe()
+        try:
+            await self.send('notifications/cancelled',{'requestId':rid})
+            await self.send('ping',rid='must-not-append')
+            end=asyncio.get_running_loop().time()+3
+            while self.mcp.returncode is None and asyncio.get_running_loop().time()<end:
+                await asyncio.sleep(.01)
+            self.assertEqual(self.mcp.returncode,0,'MCP could not process cancellation with stdout full')
+        finally:
+            output.resume_reading()
+            self.mcp.stdin.close()
+            remaining=await self.mcp.stdout.read()
+        self.assertNotIn(b'must-not-append',remaining)
+        self.assertFalse(remaining.endswith(b'\n'),'cancelled partial output unexpectedly got a second frame')
+
+    async def test_cancel_waiting_output_leaves_current_frame_and_connection_intact(self):
+        output,rid=await self.fill_stdout_pipe()
+        try:
+            pending=await self.send('ping')
+            await self.send('notifications/cancelled',{'requestId':pending})
+            last=await self.send('ping')
+        finally: output.resume_reading()
+        self.assertEqual((await self.receive())['id'],rid)
+        self.assertEqual((await self.receive())['id'],last)
+        self.assertEqual((await self.rpc('ping'))['result'],{})
+
     async def check_blocked_stdin_cleanup(self,by_idle):
         config=self.home/'config.toml'
         config.write_text(config.read_text().replace('rpc_timeout_seconds=8','rpc_timeout_seconds=1'))
@@ -579,6 +643,80 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('protocol_warning',kinds)
         self.assertEqual(kinds.count('agent_end'),2)
         self.assertEqual(kinds.count('run_terminal'),2)
+
+    async def sdk_output_backpressure(self,critical):
+        release=self.root/'release-tool'; report=self.root/'output-buffer.json'
+        self.write_config(PI_MOCK_TOOL_MS='"10"',PI_MOCK_TOOL_RELEASE=json.dumps(str(release)),
+            PI_MOCK_TOOL_REPORT=json.dumps(str(report)),**({'PI_MOCK_TOOL_CRITICAL':'"1"'} if critical else {}))
+        scope,a,trace=await self.start_case()
+        await self.wait_marker(trace,'PI_MOCK_TOOL_START')
+        queued=await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],
+            'mode':'follow_up','message':'NEXT','request_id':'follow'})
+        # SO_PEERCRED identifies only this harness's private daemon. Pause its
+        # reader without touching global Pi/Codex or creating paid model calls.
+        _,writer=await asyncio.open_unix_connection(str(socket_path(self.home)))
+        pid,_,_=struct.unpack('3i',writer.get_extra_info('socket').getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+        writer.close(); await writer.wait_closed()
+        owner=json.loads((self.home/'agents'/a['agent_id']/'owner.json').read_text())
+        os.kill(pid,signal.SIGSTOP)
+        try:
+            release.touch()
+            if critical:
+                node=Path('/proc')/str(owner['pi_pid'])
+                end=asyncio.get_running_loop().time()+10
+                while node.exists() and asyncio.get_running_loop().time()<end: await asyncio.sleep(.02)
+                self.assertFalse(node.exists(),'critical output overload did not stop the owned SDK child')
+                self.assertFalse(report.exists(),'critical output was silently buffered or discarded')
+            else:
+                await self.wait_marker(report,'after')
+                metrics=json.loads(report.read_text())
+                self.assertLess(metrics['after']['bytes'],8*1024*1024,'SDK stdout buffer exceeded its cap')
+        finally: os.kill(pid,signal.SIGCONT)
+        alert=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':8})
+        if critical:
+            self.assertEqual(alert['runs'][0]['state'],'crashed')
+            self.assertIn('capacity exceeded',trace.read_text())
+            result=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[queued['run_id']],'timeout_seconds':8})
+            self.assertEqual(result['runs'][0]['state'],'cancelled')
+        else:
+            self.assertEqual(alert['reason'],'needs_input')
+            question=alert['questions'][0]
+            self.assertEqual(question['title'],'After progress')
+            await self.tool('pi_answer_agent',{'scope':scope,'agent_id':a['agent_id'],
+                'ui_request_id':question['id'],'answer':True,'request_id':'answer'})
+            result=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id'],queued['run_id']],
+                'mode':'all','timeout_seconds':8})
+            self.assertFalse(result['timed_out'])
+            self.assertEqual(await self.results(scope,result['runs']),['MOCK_REPLY_2','MOCK_REPLY_3'])
+        closed=await self.tool('pi_close_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'close'})
+        self.assertEqual(closed['cleanup'],'verified')
+
+    async def test_sdk_output_backpressure_keeps_questions_results_and_followups(self):
+        await self.sdk_output_backpressure(False)
+
+    async def test_sdk_critical_output_overflow_is_a_crash_not_a_completion(self):
+        await self.sdk_output_backpressure(True)
+
+    async def test_sdk_extension_input_overflow_crashes_and_cancels_follow_up(self):
+        release=self.root/'queue-release'
+        self.write_config(PI_MOCK_TOOL_MS='"1"',PI_MOCK_QUEUE_FLOOD='"1"',
+                          PI_MOCK_TOOL_RELEASE=json.dumps(str(release)))
+        await self.initialize()
+        scope=(await self.tool('pi_context',{'cwd':str(self.workspace)}))['scope']
+        a=await self.tool('pi_spawn_agent',{'scope':scope,'task':'offline first',
+            'access':'read','request_id':'queue-flood-spawn'})
+        queued=await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],
+            'mode':'follow_up','message':'must not run','request_id':'queue-flood-follow'})
+        release.touch()
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id'],queued['run_id']],
+            'timeout_seconds':8,'mode':'all'})
+        self.assertFalse(done['timed_out'],done)
+        self.assertEqual([r['state'] for r in done['runs']],['crashed','cancelled'])
+        stderr=(self.home/'agents'/a['agent_id']/'stderr.log').read_text()
+        self.assertIn('input queue capacity exceeded',stderr)
+        close=await self.tool('pi_close_agent',{'scope':scope,'agent_id':a['agent_id'],
+            'request_id':'queue-flood-close'})
+        self.assertEqual(close['cleanup'],'verified')
 
     async def test_before_settle_work_and_native_continuation(self):
         self.write_config(PI_MOCK_CONTINUE='"1"',PI_MOCK_SETTLE_MS='"100"')

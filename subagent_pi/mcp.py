@@ -11,6 +11,10 @@ from .schema import TOOLS, BY_NAME, validate, validate_op
 from .parent import capture
 
 VERSIONS=('2025-06-18','2025-03-26','2024-11-05')
+OUTPUT_TIMEOUT=45
+
+class OutputClosed(Exception):
+    """The stdio connection cannot safely carry another JSON frame."""
 
 async def serve_mcp(home):
     reader=asyncio.StreamReader(limit=MAX_FRAME)
@@ -18,12 +22,40 @@ async def serve_mcp(home):
     transport,_=await asyncio.get_running_loop().connect_read_pipe(lambda:protocol,sys.stdin.buffer)
     tasks={}; output_lock=asyncio.Lock(); initialized=False
     bound_scopes={}; active_scopes={}
+    loop=asyncio.get_running_loop(); fd=sys.stdout.fileno()
+    was_blocking=os.get_blocking(fd); os.set_blocking(fd,False)
+    output_closed=False
     async def output(value):
+        nonlocal output_closed
         async with output_lock:
-            sys.stdout.write(dumps(value)+'\n'); sys.stdout.flush()
+            if output_closed: raise OutputClosed()
+            # Write directly to the nonblocking fd: at most one frame is held,
+            # with no background thread or unbounded transport write buffer.
+            data=memoryview((dumps(value)+'\n').encode())
+            try:
+                async with asyncio.timeout(OUTPUT_TIMEOUT):
+                    while data:
+                        try: data=data[os.write(fd,data):]
+                        except BlockingIOError:
+                            ready=loop.create_future()
+                            def writable():
+                                if not ready.done(): ready.set_result(None)
+                            loop.add_writer(fd,writable)
+                            try: await ready
+                            finally: loop.remove_writer(fd)
+            except (OSError,TimeoutError,asyncio.CancelledError) as exc:
+                # Cancellation may leave a partial frame. Retire this connection
+                # instead of appending another response to that partial JSON.
+                output_closed=True; transport.close(); reader.feed_eof()
+                if isinstance(exc,asyncio.CancelledError): raise
+                raise OutputClosed() from exc
     async def error(rid,code,message):
         await output({'jsonrpc':'2.0','id':rid,'error':{'code':code,'message':message}})
     async def dispatch(msg):
+        try: await respond(msg)
+        except (OutputClosed,asyncio.CancelledError):
+            pass  # Disconnect/cancel never cancels a daemon-owned mutation.
+    async def respond(msg):
         nonlocal initialized
         rid=msg.get('id'); method=msg.get('method'); p=msg.get('params') or {}
         try:
@@ -75,13 +107,12 @@ async def serve_mcp(home):
             if method=='tools/call':
                 await output({'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':dumps({'error':e.as_dict()})}],'isError':True}})
             else: await error(rid,-32602,e.message)
-        except asyncio.CancelledError:
-            return  # cancelling the client wait never cancels the daemon-owned mutation
+        except OutputClosed: raise
         except Exception as e:
             print(f'MCP: {type(e).__name__}: {e}',file=sys.stderr)
             await error(rid,-32603,'Internal error; check the local daemon log')
     try:
-        while True:
+        while not output_closed:
             try: line=await reader.readline()
             except ValueError: await error(None,-32700,'Frame too large'); break
             if not line: break
@@ -101,7 +132,10 @@ async def serve_mcp(home):
             if rid in tasks: await error(rid,-32600,'Duplicate in-flight request id'); continue
             t=asyncio.create_task(dispatch(msg)); tasks[rid]=t
             t.add_done_callback(lambda _,key=rid:tasks.pop(key,None))
+    except OutputClosed:
+        pass
     finally:
         transport.close()
         for task in list(tasks.values()): task.cancel()
         await asyncio.gather(*list(tasks.values()),return_exceptions=True)
+        os.set_blocking(fd,was_blocking)
