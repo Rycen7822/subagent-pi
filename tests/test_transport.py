@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 import signal
 import shutil
+import sqlite3
 import socket
 import struct
 import sys
@@ -510,6 +511,69 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
             if path.exists() and path.read_text().count(text)>=count: return path.read_text()
             await asyncio.sleep(.05)
         raise AssertionError(f'{text!r} x{count} not observed in {path} within {timeout}s')
+
+    async def test_managed_context_uses_codex_scope_and_refreshes_on_new_boot(self):
+        self.write_config(PI_MOCK_WIRE='"1"')
+        other=self.root/'other-workspace'; other.mkdir()
+        (self.pi_agent/'AGENTS.md').write_text('GLOBAL_PI_CONTEXT_MARKER')
+        (self.workspace/'AGENTS.md').write_text('PARENT_AGENTS_MUST_NOT_LOAD')
+        (other/'AGENTS.md').write_text('CHILD_AGENTS_MUST_NOT_LOAD')
+        instructions=self.workspace/'SUBAGENT-PI.md'
+        instructions.write_text('SUBAGENT_CONTEXT_V1')
+        await self.initialize()
+        scope=(await self.tool('pi_context',{'cwd':str(self.workspace)}))['scope']
+
+        async def start(request_id):
+            agent=await self.tool('pi_spawn_agent',{'scope':scope,'cwd':str(other),
+                'task':'offline context probe','access':'read','request_id':request_id})
+            done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[agent['run_id']],
+                'mode':'all','timeout_seconds':10})
+            self.assertEqual(done['runs'][0]['state'],'completed',done)
+            return agent
+
+        def latest_wire(agent):
+            log=(self.home/'agents'/agent['agent_id']/'stderr.log').read_text()
+            lines=[line for line in log.splitlines() if line.startswith('PI_MOCK_WIRE ')]
+            self.assertTrue(lines,log)
+            return json.loads(lines[-1].split(' ',2)[2])
+
+        first=await start('context-first')
+        self.assertEqual(first['cwd'],str(other))
+        first_wire=latest_wire(first)
+        initial=first_wire['forced']
+        self.assertIn('GLOBAL_PI_CONTEXT_MARKER',initial,first_wire)
+        self.assertIn('SUBAGENT_CONTEXT_V1',initial)
+        self.assertNotIn('PARENT_AGENTS_MUST_NOT_LOAD',initial)
+        self.assertNotIn('CHILD_AGENTS_MUST_NOT_LOAD',initial)
+
+        instructions.write_text('SUBAGENT_CONTEXT_V2')
+        second=await start('context-second')
+        fresh=latest_wire(second)['forced']
+        self.assertIn('SUBAGENT_CONTEXT_V2',fresh)
+        self.assertNotIn('SUBAGENT_CONTEXT_V1',fresh)
+
+        await self.tool('pi_close_agent',{'scope':scope,'agent_id':first['agent_id'],'request_id':'context-close'})
+        # Simulate an agent whose durable launch snapshot predates this policy.
+        with sqlite3.connect(self.home/'registry.sqlite') as db:
+            old=json.loads(db.execute('SELECT launch FROM agents WHERE id=?',(first['agent_id'],)).fetchone()[0])
+            context_path=str(ROOT/'extensions/managed-context.ts')
+            index=old['argv'].index(context_path)
+            del old['argv'][index-1:index+1]
+            old['argv'].remove('--no-context-files')
+            db.execute('UPDATE agents SET launch=? WHERE id=?',(json.dumps(old),first['agent_id']))
+        resumed=await self.tool('pi_respawn_agent',{'scope':scope,'agent_id':first['agent_id'],
+            'message':'offline resumed context probe','request_id':'context-respawn'})
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[resumed['run_id']],
+            'mode':'all','timeout_seconds':10})
+        self.assertEqual(done['runs'][0]['state'],'completed',done)
+        updated=latest_wire(first)['forced']
+        self.assertIn('GLOBAL_PI_CONTEXT_MARKER',updated)
+        self.assertIn('SUBAGENT_CONTEXT_V2',updated)
+        self.assertNotIn('SUBAGENT_CONTEXT_V1',updated)
+        self.assertNotIn('CHILD_AGENTS_MUST_NOT_LOAD',updated)
+        launch=json.loads((self.home/'agents'/first['agent_id']/'launch.json').read_text())['argv']
+        self.assertEqual(launch.count('--no-context-files'),1)
+        self.assertEqual(launch.count(context_path),1)
 
     async def test_model_question_reaches_wait_and_answer_returns_to_the_same_task(self):
         self.write_config(PI_MOCK_ASK_PARENT='"1"',PI_MOCK_CONTEXT='"1"')

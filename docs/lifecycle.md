@@ -22,7 +22,7 @@ daemon 在 agent 锁内校验当前 Worker 身份、generation、run_id 和 stop
 
 ## Spawn
 
-`pi_context` 建立 workspace 根；同一 MCP 连接后续可省略 scope，spawn 的 cwd 默认作用域根；显式 cwd 必须是其自身或子目录的绝对路径。新的 MCP 连接不会按 cwd 猜测旧 scope，需显式恢复。guard 启动插件自己的 Node SDK 入口，它加载所选 Pi 安装旁的 SDK。SessionManager 创建独立持久会话，后续恢复沿用同一路径。
+`pi_context` 绑定父 Codex 的 workspace；同一 MCP 连接后续可省略 scope，spawn 的 cwd 默认该目录，也可显式指定另一个现有目录的绝对路径。子代理指令始终读取 scope 目录的 `SUBAGENT-PI.md`，与子代理 cwd 无关；新建与 respawn 重新读取。新的 MCP 连接不会按 cwd 猜测旧 scope，需显式恢复。guard 启动插件自己的 Node SDK 入口，它加载所选 Pi 安装旁的 SDK。SessionManager 创建独立持久会话，后续恢复沿用同一路径。
 
 默认最多 4 个 resident agent，每个 scope 最多 16 个历史 agent。writer 独占同一或嵌套 cwd，跨 scope 检查；parent Codex 不受此锁约束。
 

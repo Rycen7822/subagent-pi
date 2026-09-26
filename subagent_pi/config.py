@@ -84,6 +84,19 @@ def surface_extension_path() -> Path:
     tool surface inside the child."""
     return Path(__file__).resolve().parent.parent/'extensions'/'managed-surface.ts'
 
+def context_extension_path() -> Path:
+    return Path(__file__).resolve().parent.parent/'extensions'/'managed-context.ts'
+
+def managed_context_argv(argv):
+    """Apply the current context policy to new AND persisted pre-upgrade launches."""
+    extension = context_extension_path()
+    if not extension.is_file():
+        raise AgentError('invalid_config',f'Managed context extension is missing: {extension}')
+    result = list(argv)
+    if '--no-context-files' not in result: result.append('--no-context-files')
+    if str(extension) not in result: result += ['--extension',str(extension)]
+    return result
+
 def launch_spec(config, profile_name, model, cwd, access, thinking=None):
     if profile_name not in config['profiles']: raise AgentError('profile_not_found',f'Unknown profile: {profile_name}')
     p = config['profiles'][profile_name]
@@ -99,7 +112,7 @@ def launch_spec(config, profile_name, model, cwd, access, thinking=None):
     env = p.get('env',{})
     if not isinstance(env,dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in env.items()):
         raise AgentError('invalid_config','profile env must contain string values')
-    argv = [executable,*config['pi_command'][1:],'--mode','rpc']
+    argv = managed_context_argv([executable,*config['pi_command'][1:],'--mode','rpc'])
     # Pi's own configuration (extensions, packages, skills, prompts, settings,
     # MCP-capable extensions) loads by default; --no-extensions/--no-skills exist
     # only as an explicit per-profile opt-out.

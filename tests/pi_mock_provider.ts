@@ -1,6 +1,6 @@
 /** Offline provider for real SDK/MCP tests. All network requests fail. */
 import { existsSync, writeFileSync } from "node:fs";
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 
 const env = process.env;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -78,7 +78,7 @@ export default function (pi) {
       const texts = context.messages.map(entry => textOf(entry.content)).filter(Boolean);
       if (env.PI_MOCK_WIRE === "1") {
         mark(`PI_MOCK_WIRE ${call} ${JSON.stringify({ texts,
-          forced: context.systemPrompt || textOf(context.messages.find(entry => entry.role === "system")?.content) })}`);
+          forced: context.systemPrompt || getCurrentSystemPrompt(context.messages) })}`);
       }
       if (env.PI_MOCK_CONTEXT === "1") mark(`PI_MOCK_CONTEXT ${call} ${texts.join(" | ")}`);
       const message = { role: "assistant", content: [{ type: "text", text: `MOCK_REPLY_${call}` }],

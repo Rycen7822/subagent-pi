@@ -21,11 +21,13 @@ import sys
 
 p=argparse.ArgumentParser(add_help=False)
 p.add_argument('--hold-eof',action='store_true'); p.add_argument('--session'); p.add_argument('--session-dir'); p.add_argument('--mode')
-p.add_argument('--skill',action='append'); p.add_argument('--extension',action='append'); p.add_argument('--exclude-tools'); p.add_argument('--no-extensions',action='store_true'); p.add_argument('--no-skills',action='store_true')
+p.add_argument('--skill',action='append'); p.add_argument('--extension',action='append'); p.add_argument('--exclude-tools'); p.add_argument('--no-extensions',action='store_true'); p.add_argument('--no-skills',action='store_true'); p.add_argument('--no-context-files',action='store_true')
 p.add_argument('--handle-prompt',action='store_true')
 p.add_argument('--hold-prompt-ms',type=int,default=0)
 p.add_argument('--no-managed-protocol',action='store_true')
 a,_=p.parse_known_args()
+if a.no_context_files and any(Path(path).name=='managed-context.ts' for path in a.extension or []):
+    print('subagent-pi-context ready',file=sys.stderr,flush=True)
 MARK_OUTCOME='PI_MOCK_OUTCOME'
 path=Path(a.session) if a.session else Path(a.session_dir)/'test-session.jsonl'; current=None; queue=[]; ui={}
 

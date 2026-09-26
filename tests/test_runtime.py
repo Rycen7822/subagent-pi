@@ -452,8 +452,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AgentError): await self.rt.dispatch('inspect',{'scope':other,'agent_id':s['agent_id']})
     async def test_scope_cwd_validation(self):
         with self.assertRaises(AgentError): await self.rt.dispatch('scope_open',{'scope':self.scope,'cwd':str(self.root)})
-    async def test_spawn_outside_scope_rejected(self):
-        with self.assertRaises(AgentError): await self.spawn(cwd=str(self.root))
+    async def test_spawn_outside_scope_uses_explicit_cwd(self):
+        other=self.root/'other-workspace'; other.mkdir()
+        spawned=await self.spawn(cwd=str(other))
+        self.assertEqual(spawned['cwd'],str(other))
     async def test_writer_conflict(self):
         await self.spawn('delay=2|writer',access='write')
         with self.assertRaises(AgentError) as cm: await self.spawn('writer2',access='write')

@@ -514,6 +514,8 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(self.codex/'skills'/'alpha'),skill_paths)
         self.assertIn(str(self.workspace/'.agents'/'skills'/'projskill'),skill_paths)
         self.assertIn(str(BRIDGE),argv)
+        self.assertIn('--no-context-files',argv)
+        self.assertIn(str(ROOT/'extensions/managed-context.ts'),argv)
         # No --tools: that allowlist would drop the tools Pi's own extensions register.
         self.assertNotIn('--tools',argv)
         self.assertNotIn('--no-tools',argv)
@@ -670,6 +672,14 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         aid=s['agent_id']
         await self.mutation_close(aid)
         first=json.loads((self.home/'agents'/aid/'launch.json').read_text())['argv']
+        # Existing sessions created before this policy still have their old
+        # persisted argv. Boot must add context isolation without mutating it.
+        legacy=json.loads(self.rt.store.agent(self.scope,aid)['launch'])
+        context_path=str(ROOT/'extensions/managed-context.ts')
+        index=legacy['argv'].index(context_path)
+        del legacy['argv'][index-1:index+1]
+        legacy['argv'].remove('--no-context-files')
+        self.rt.store.agent_update(aid,launch=json.dumps(legacy))
         # Source change: skill removed; respawn must reflect it, not accumulate flags.
         shutil.rmtree(self.codex/'skills'/'alpha')
         await self.rt.dispatch('respawn',{'scope':self.scope,'agent_id':aid,'request_id':self.key()})
@@ -683,7 +693,10 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(third.count('--model'),1)
         self.assertLessEqual(third.count('--skill'),second.count('--skill'))
         self.assertIn(str(BRIDGE),third)
-        self.assertEqual(third.count('--extension'),2)  # surface + bridge, never accumulating
+        self.assertEqual(second.count('--no-context-files'),1)
+        self.assertEqual(third.count('--no-context-files'),1)
+        self.assertEqual(third.count(context_path),1)
+        self.assertEqual(third.count('--extension'),3)  # context + surface + bridge, never accumulating
         await self.mutation_close(aid)
     async def test_disabled_inheritance_leaves_original_path(self):
         # Per-scope management switch: an explicit scope_open with inheritance=false.
@@ -1084,6 +1097,7 @@ class RealPiParserProbe(unittest.TestCase):
         if js is None: self.skipTest('pi dist/cli/args.js not found')
         script=("const {parseArgs}=require(process.argv[1]);const r=parseArgs(process.argv.slice(2));"
                 "console.log(JSON.stringify({tools:r.tools,noTools:r.noTools,noExtensions:r.noExtensions,"
+                "noContextFiles:r.noContextFiles,"
                 "noSkills:r.noSkills,excludeTools:r.excludeTools,extensions:r.extensions,skills:r.skills}))")
         out=subprocess.run(['node','-e',script,str(js),*argv[1:]],capture_output=True,text=True,timeout=30)
         self.assertEqual(out.returncode,0,out.stderr)
@@ -1097,11 +1111,13 @@ class RealPiParserProbe(unittest.TestCase):
         self.assertIsNone(parsed.get('noTools'))
         self.assertIsNone(parsed.get('noExtensions'))
         self.assertIsNone(parsed.get('noSkills'))
+        self.assertTrue(parsed['noContextFiles'])
         # --exclude-tools is name-based over the same registry: an extension that
         # registers a tool named `bash` would be filtered out with the built-in.
         # The built-in surface is applied and verified inside Pi instead.
         self.assertIsNone(parsed.get('excludeTools'))
-        self.assertTrue(parsed['extensions'][0].endswith('extensions/managed-surface.ts'))
+        self.assertIn(str(ROOT/'extensions/managed-context.ts'),parsed['extensions'])
+        self.assertIn(str(SURFACE),parsed['extensions'])
     def test_reader_argv_does_not_exclude_anything_by_name(self):
         spec=self.spec('reader','read')
         parsed=self.probe(spec['argv'])
@@ -1127,6 +1143,8 @@ class RealPiParserProbe(unittest.TestCase):
             for argv in (self.spec(profile,'write')['argv'] if profile=='default' else self.spec(profile,'read')['argv'],):
                 self.assertNotIn('--no-extensions',argv)
                 self.assertNotIn('--no-skills',argv)
+                self.assertIn('--no-context-files',argv)
+                self.assertIn(str(ROOT/'extensions/managed-context.ts'),argv)
     def test_ambient_opt_out_keeps_the_explicit_flags(self):
         config=self.config()
         config['profiles']['isolated']={'tools':['read'],'ambient_extensions':False,'ambient_skills':False}

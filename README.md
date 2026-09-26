@@ -8,7 +8,7 @@
 
 受管子进程使用 **原版 Pi 0.87.0 的 SDK**，无需修改或补丁化 Pi。插件拥有串行输入队列及任务完成协议；steer 在当前 SDK 调用完成后有序续跑，仍归属原任务。interrupt 终止并核验自己的子进程，保留 session 供恢复。正常交互式 Pi 不受影响，详见 `docs/lifecycle.md`。
 
-受管子代理首先是一个正常 Pi 会话：Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes、settings 与上下文照常加载（SDK 的 settings 更新仅在子进程内存中保存）（`ambient_extensions`/`ambient_skills` 默认 `true`，可显式关掉）；Pi 的配置目录沿用打开 scope 的客户端进程里的 `PI_CODING_AGENT_DIR`（未设置即 Pi 默认 `$HOME/.pi/agent`，跨 daemon 重启保持）。在此之上按需继承你的 Codex 全局 skills（`~/.codex/skills`）与 MCP（`~/.codex/config.toml` 的 `mcp_servers`）：只读原文件、原位引用、内存中传递，不落盘、不迁移；普通 `pi` 不受影响。
+受管子代理加载 Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes 与 settings（SDK 的 settings 更新仅在子进程内存中保存）；`ambient_extensions`/`ambient_skills` 默认 `true`。上下文文件单独处理：保留 Pi 配置目录的全局 `AGENTS.md`，不加载子代理工作目录及其父目录的 `AGENTS.md`；改为读取打开 scope 的 Codex 工作目录下的 `SUBAGENT-PI.md`。新建与 respawn 时重新读取，即使子代理在另一个 cwd 执行也一样。Pi 配置目录沿用打开 scope 的客户端进程里的 `PI_CODING_AGENT_DIR`（未设置即 Pi 默认 `$HOME/.pi/agent`，跨 daemon 重启保持）。在此之上按需继承 Codex 全局 skills（`~/.codex/skills`）与 MCP（`~/.codex/config.toml` 的 `mcp_servers`）；普通 `pi` 不受影响。
 
 同名 skills 由 Pi 自己在加载边界裁决：Pi 已加载的同名 skill 保留，Codex 版本不会被注册；每次 boot 都会把结果记进 `inheritance_skills` 事件（跳过的 Codex 路径 + 保留的 Pi 路径）。MCP 不按 server 名去重，因为 Pi 没有 MCP 体系、也不提供 server 注册表（只保证 `(server, tool)` 寻址：不同 server 的同名工具互不冲突）。`access=read` 只约束本插件控制的 builtin 与 MCP 暴露面，不声称"只具备只读工具"、也不是 OS 沙箱。详见 `docs/inheritance.md`。
 

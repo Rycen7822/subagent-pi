@@ -6,7 +6,7 @@ description: Delegate bounded work to persistent subagent-pi; steer, inspect, in
 # Pi Subagents
 
 Use the Pi MCP tools for normal control; use the CLI for diagnostics.
-Open or resume `pi_context` with the actual absolute workspace cwd, this MCP connection then reuses its scope and spawn cwd.
+Open or resume `pi_context` with the actual absolute Codex workspace cwd; children read its `SUBAGENT-PI.md` and Pi's global AGENTS.md, even when spawn cwd points elsewhere. A new spawn or respawn reloads that file.
 Never infer the workspace from the MCP server or daemon working directory.
 
 Follow the user's delegation policy; do not add automatic review stages.

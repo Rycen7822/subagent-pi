@@ -21,6 +21,7 @@ BOOTSTRAP_MAX = 4 * 1024 * 1024
 # built-in restriction that was never applied.
 SURFACE_TIMEOUT_SECONDS = 10.0
 SURFACE_PREFIX = 'subagent-pi-surface '
+CONTEXT_READY = 'subagent-pi-context ready'
 
 def message_text(message):
     content = message.get('content',[])
@@ -49,6 +50,7 @@ class Worker:
         self.write_lock = asyncio.Lock()
         self.surface = None          # parsed report from extensions/managed-surface.ts
         self.surface_ready = asyncio.Event()
+        self.context_ready = asyncio.Event()
         self.surface_buf = b''
         # Set when the host starts work no daemon run owns (see Runtime.stop_unowned):
         # the worker is being stopped and none of its output may be absorbed.
@@ -138,6 +140,9 @@ class Worker:
         self.surface_buf = parts.pop()[-4096:]
         for raw in parts:
             line = raw.decode('utf-8','replace')
+            if line == CONTEXT_READY:
+                self.context_ready.set()
+                continue
             if not line.startswith(SURFACE_PREFIX): continue
             words = line.split()
             if words[1:2] != ['applied']: continue
@@ -288,6 +293,7 @@ async def boot_worker(rt, a):
     bootstrap payload, and only report success after Pi confirms the managed
     session and the bridge reports readiness for this exact generation."""
     from .binding import child_env, inheritance_plan
+    from .config import managed_context_argv
 
     aid=a['id']
     if len([w for w in rt.workers.values() if not w.closed]) >= rt.config['max_resident_agents']:
@@ -303,11 +309,12 @@ async def boot_worker(rt, a):
         raise AgentError('session_unavailable','Previous Pi session is missing or empty; create a new agent explicitly')
     generation=a['generation']+1
     first_launch = a['generation']==0
+    base_argv=managed_context_argv(spec['argv'])
     if first_launch:
         private_dir(directory/'sessions')
-        argv=[*spec['argv'],'--session-dir',str(directory/'sessions')]
+        argv=[*base_argv,'--session-dir',str(directory/'sessions')]
     else:
-        argv=[*spec['argv'],'--session',str(session)]
+        argv=[*base_argv,'--session',str(session)]
     # Inherited skills/extensions are rebuilt from original sources on every boot;
     # the persisted launch spec and argv stay untouched.
     plan=inheritance_plan(rt,a,spec,generation)
@@ -328,6 +335,7 @@ async def boot_worker(rt, a):
         rt.store.agent_update(aid,state='starting',generation=generation,cleanup='pending')
         guard=Path(__file__).with_name('worker_guard.py')
         guard_env=child_env(rt,a['scope'],spec)
+        guard_env['PI_AGENTS_SCOPE_CWD']=rt.store.scope(a['scope'])['cwd']
         if spec.get('surface'):
             # Consumed and deleted by extensions/managed-surface.ts in the child;
             # an empty value means "no built-in tools at all".
@@ -370,6 +378,11 @@ async def boot_worker(rt, a):
             if state.get('subagentProtocol') != 1:
                 raise AgentError('unsupported_transport',
                     'The child must use subagent-pi SDK transport; stock Pi RPC and host patches are not supported')
+            try:
+                await asyncio.wait_for(w.context_ready.wait(),SURFACE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                raise AgentError('context_unavailable',
+                    'Managed Pi did not load its context extension; inspect the agent stderr log') from None
             if spec.get('surface'):
                 await verify_surface(rt,w)
             if plan['payload'] is not None:

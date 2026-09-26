@@ -402,9 +402,8 @@ class Runtime:
                 cwd_input=Path(text(p.get('cwd',self.store.scope(sid)['cwd']),'cwd',4096)).expanduser()
                 if not cwd_input.is_absolute(): raise AgentError('invalid_cwd','cwd must be absolute')
                 cwd=str(cwd_input.resolve())
-                root=Path(self.store.scope(sid)['cwd'])
-                if not Path(cwd).is_dir() or not Path(cwd).is_relative_to(root):
-                    raise AgentError('invalid_cwd','Spawn cwd must exist inside the scope root')
+                if not Path(cwd).is_dir():
+                    raise AgentError('invalid_cwd','Spawn cwd must be an existing directory')
                 access=p.get('access','write')
                 if access not in {'read','write'}: raise AgentError('invalid_argument','access must be read or write')
                 profile=p.get('profile','reader' if access=='read' else 'default')

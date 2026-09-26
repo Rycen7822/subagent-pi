@@ -28,7 +28,7 @@ A scope's Codex source resolves from explicit `codex_home`, then the opening cli
 
 ## Pi resources and built-in tools
 
-Ambient loading includes global/project extensions and packages, skills, prompt templates, themes, settings and context files. `PI_CODING_AGENT_DIR` selects the same Pi configuration directory as the opening client; unset retains Pi's default. Profile environment overrides take precedence.
+Ambient loading includes global/project extensions and packages, skills, prompt templates, themes and settings. Managed children disable Pi's automatic context-file discovery, then load Pi's global context file from its agent directory (using Pi's normal `AGENTS.override.md` / `AGENTS.md` / `CLAUDE.md` precedence) and only `<scope cwd>/SUBAGENT-PI.md` for project instructions. They do not load `AGENTS.md` or `CLAUDE.md` from the child cwd or its ancestors. A new spawn or respawn reads the files again; a resident child retains its boot snapshot. The scope cwd is the Codex workspace supplied to `pi_context`, independent of an explicit child cwd. `PI_CODING_AGENT_DIR` selects the same Pi configuration directory as the opening client; unset retains Pi's default. Profile environment overrides take precedence.
 
 A profile's `tools` controls only Pi's built-ins. `extensions/managed-surface.ts` identifies them through `sourceInfo.path = "<builtin:NAME>"`, activates allowed built-ins and deactivates the rest. Extension/custom tools retain Pi's activation state, including extensions that shadow a built-in name. Name-based `--tools` or `--exclude-tools` filtering would also remove those extension tools and is not used for this policy.
 
