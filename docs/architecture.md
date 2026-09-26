@@ -15,28 +15,26 @@ Python 3.11+ 与 Node 标准库，加载用户已安装的 Pi SDK，无额外模
 
 ## 核心模块
 
-common.py：JSONL、UTF-8 边界、私有目录、原子写、Linux 进程身份。
-store.py：SQLite WAL/FULL、请求幂等、结果事务、事件索引。
-config.py：用户配置、profile、确定化启动 argv。
-worker_guard.py：session writer 租约和双进程身份。
-runtime.py：agent/run 状态机与 op 路由，账本状态迁移的唯一所有者。
-worker.py：单个 SDK 子进程的 JSONL 通道、启动交接 fd、回执读取与进程组归属（`ownership` 是 reaping/恢复/terminate 共用的唯一判定）。
-binding.py：scope 绑定、子进程环境、每次启动重建的 Codex 继承计划。
-views.py：brief/inspect/result/wait 的有界只读投影，不修改状态、不确认结果。
-daemon.py / client.py：本地 IPC、单实例锁、断线语义。
-schema.py：MCP 与 IPC 共用 schema 和校验。
-mcp.py / cli.py：两个薄入口，不各自维护任务状态。
+| 边界 | 所有者 |
+| --- | --- |
+| CLI、MCP → 本地 IPC | `cli.py` / `mcp.py` 共用 `schema.py`、`client.py`；`daemon.py` 持有单实例锁和断线语义 |
+| agent/run 与投递状态 | `runtime.py`；prompt/steer 共用投递入口，RPC 回执不覆盖已经观察到的消费 |
+| 持久状态 | `store.py`：SQLite WAL/FULL、幂等请求、结果事务与通知记录；`views.py` 只提供有界读取 |
+| 子进程 | `worker.py`：JSONL、启动交接与 readiness；`worker_guard.py`：session 租约；`ownership()` 统一判断退出/恢复/清理 |
+| 启动配置与继承 | `config.py` 生成 argv；`binding.py` 绑定 scope 并重建启动计划；`inheritance.py` 解析来源、技能与环境快照 |
+| MCP 配置规则 | `mcp_config.py`：字段兼容、工具权限、超时与凭证引用解析；不启动进程、不读取环境 |
+| MCP 扩展 | `extensions/codex-mcp-bridge.ts`：私有管道 bootstrap、工具授权、连接生命周期与 readiness |
+| MCP wire | `extensions/mcp/connection.ts`：共享协议、catalog 与 header schema；`stdio.ts` / `http.ts` 分别拥有进程和 HTTP 交换 |
+| Pi SDK | `runtime/pi-sdk.mjs`：资源、公开 action、UI 与协议；`task-queue.mjs`：串行输入与异步归属；`protocol-output.mjs`：有界输出 |
+| 受管 Pi 上下文 | `managed-context.ts` 保留 Pi 全局指令，启动时读取父 scope 的 `SUBAGENT-PI.md`；`managed-surface.ts` 按来源限制内建工具 |
 
-依赖方向固定为 runtime → {worker, binding, views} → {common, store, inheritance}；机制模块不反向引用 runtime，因此它们可脱离 Runtime 实例单独测试。
-
-runtime/pi-sdk.mjs：资源加载、公开 SDK action 绑定、headless UI 与 JSONL 协议。
-runtime/task-queue.mjs：单个任务的串行输入、异步归属和完成；不复制 Pi 的 agent loop。
+机制模块不反向依赖 Runtime；MCP wire 不依赖 Pi 扩展 API。每个连接拥有自己的配置、catalog 与未完成请求；HTTP 的 JSON/SSE 共用有界读流与关闭路径。SDK 队列将输入和其字节数放在同一项，任务归属由 AsyncLocalStorage 保持。HTTP 与 stdio 保留各自的协商/降级规则；工具调用失败后均不自动重放。运行设置只在受管 SDK 子进程内存中修改，不改 Pi 宿主。
 
 ## 数据结构
 
 scopes、agents、runs、requests、receipts、events 是独立表。执行终态不等于 ack。agent generation 用于过滤旧实例事件。操作 request_id 在 scope 内唯一，参数不同不能重用。
 
-账本 schema 版本由 `store.py` 的 `MIGRATIONS` 注册表按序号递进升级（当前 3）；比当前版本更新的数据库直接拒绝启动，不猜测、不降级。scopes.base_env 只保存非密级的基础环境键（PATH/HOME 等），使 worker 在 daemon 重启后仍能启动；其余绑定值只存在于内存。
+账本 schema 版本由 `store.py` 的 `MIGRATIONS` 注册表按序号递进升级（当前 5）；比当前版本更新的数据库直接拒绝启动，不猜测、不降级。scopes.base_env 只保存非密级的基础环境键（PATH/HOME 等），使 worker 在 daemon 重启后仍能启动；其余绑定值只存在于内存。
 
 最终结果文件先原子写+fsync，再提交 terminal 数据库记录。后台事件是有界规范化投影，不反复保存 streaming partial 的不断增长全文。原始 Pi session 由 Pi 自己管理，不自行修改其消息树。
 

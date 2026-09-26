@@ -221,6 +221,21 @@ class Runtime:
         if not w or w.closed or w.tainted: raise AgentError('worker_unavailable','No connected Pi worker; use respawn after checking orphan state')
         return w
 
+    async def deliver_input(self,w,kind,message,**params):
+        receipt=new_id('msg_')
+        self.store.execute('INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?)',
+            (receipt,w.agent['id'],w.run_id,w.agent['scope'],message,'sending',now(),now()))
+        try:
+            await w.rpc(kind,message=message,**params)
+        except AgentError as exc:
+            if kind=='steer':
+                self.store.execute("UPDATE receipts SET state=?,updated=? WHERE id=?",
+                    ('not_consumed' if exc.code=='pi_rejected' else 'unknown',now(),receipt))
+            raise
+        # Consumption may precede the RPC reply; acknowledgement must not undo it.
+        self.store.execute("UPDATE receipts SET state='queued',updated=? WHERE id=? AND state='sending'",(now(),receipt))
+        return receipt
+
     async def start_run(self,w,rid):
         r=self.store.run(w.agent['scope'],rid)
         if r['state'] not in {'queued','starting'}: return
@@ -231,11 +246,8 @@ class Runtime:
         self.store.agent_update(w.agent['id'],state='running',current_run=rid)
         self.store.bump(w.agent['scope'])
         self.event(w,'run_started',{'idle_timeout_seconds':w.idle_timeout_seconds})
-        receipt=new_id('msg_')
-        self.store.execute('INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?)',(receipt,w.agent['id'],rid,w.agent['scope'],r['task'],'sending',now(),now()))
         try:
-            # Deliberate natural-language envelope avoids executing a slash command as a task.
-            await w.rpc('prompt',message=r['task'],runId=rid)
+            return await self.deliver_input(w,'prompt',r['task'],runId=rid)
         except AgentError as e:
             if e.code=='pi_rejected':
                 self.store.finish(rid,'failed','',e.message)
@@ -244,8 +256,6 @@ class Runtime:
                 self.notify()
             # Timeouts are uncertain: retain the run and wait for events rather than re-executing.
             raise
-        self.store.execute("UPDATE receipts SET state='queued',updated=? WHERE id=? AND state='sending'",(now(),receipt))
-        return receipt
 
     def add_run(self,a,task,state='queued',timeout=None):
         rid=new_id('run_')
@@ -503,12 +513,7 @@ class Runtime:
                     if not w.run_id: raise AgentError('agent_idle','Agent is idle; use mode=send. Steering never implicitly respawns.')
                     if len(self.store.all("SELECT id FROM receipts WHERE agent_id=? AND state IN ('sending','queued')",(aid,)))>=20:
                         raise AgentError('queue_full','Too many unconsumed steering messages')
-                    receipt=new_id('msg_')
-                    self.store.execute('INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?)',(receipt,aid,w.run_id,sid,msg,'sending',now(),now()))
-                    try: await w.rpc('steer',message=msg)
-                    except AgentError as e:
-                        self.store.execute("UPDATE receipts SET state=?,updated=? WHERE id=?",('not_consumed' if e.code=='pi_rejected' else 'unknown',now(),receipt)); raise
-                    self.store.execute("UPDATE receipts SET state='queued',updated=? WHERE id=? AND state='sending'",(now(),receipt))
+                    receipt=await self.deliver_input(w,'steer',msg)
                     return {'agent_id':aid,'name':a['name'],'run_id':w.run_id,'receipt_id':receipt,
                             'execution':'after_current_sdk_call',
                             'delivery':self.store.one('SELECT state FROM receipts WHERE id=?',(receipt,))['state']}

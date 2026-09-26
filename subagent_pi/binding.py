@@ -5,9 +5,9 @@ import json
 from pathlib import Path
 
 from .common import AgentError, BASE_ENV_KEYS, dumps, text
-from .inheritance import (CODEX_MCP_BASELINE, SERVER_POLICY_KEYS, SERVER_RESOLVED_KEYS, Diagnostic,
-    collect_skills, parse_mcp_servers, policy_filter, read_codex_config, referenced_env_names,
-    resolve_codex_home, resolve_environment)
+from .inheritance import collect_skills, read_codex_config, referenced_env_names, resolve_codex_home
+from .mcp_config import (CODEX_MCP_BASELINE, SERVER_POLICY_KEYS, SERVER_RESOLVED_KEYS, Diagnostic,
+    parse_mcp_servers, policy_filter, resolve_environment)
 
 def child_env(rt, sid, spec):
     """Base environment for the guard/Pi child, built from the scope's bound

@@ -171,12 +171,6 @@ class Worker:
         await self.rt.worker_exited(self,code)
         self.closed = True
 
-def write_all(fd, data):
-    view = memoryview(data)
-    while view:
-        written = os.write(fd, view)
-        view = view[written:]
-
 def close_quietly(fd):
     """The fd owner closes exactly once; a second close or an already-gone pipe is
     never an error here."""
@@ -212,15 +206,15 @@ async def resolve_skills(rt, w, plan):
     registered = {}
     for entry in data.get('commands') or []:
         if not isinstance(entry,dict) or entry.get('source') != 'skill': continue
-        name = str(entry.get('name') or '')
-        name = name[len('skill:'):] if name.startswith('skill:') else name
+        name = str(entry.get('name') or '').removeprefix('skill:')
         info = entry.get('sourceInfo') if isinstance(entry.get('sourceInfo'),dict) else {}
         path = info.get('path') or entry.get('path')
         if name and isinstance(path,str): registered[name] = {'path':path,'real':_skill_file(path)}
     by_real = {e['real']: n for n,e in registered.items()}
-    records = []
+    records, ours = [], set()
     for path in plan['skills']:
         real = _skill_file(path)
+        ours.add(real)
         if real in by_real:
             records.append({'path':path,'name':by_real[real],'state':'loaded'})
             continue
@@ -230,7 +224,6 @@ async def resolve_skills(rt, w, plan):
             records.append({'path':path,'name':name,'state':'skipped','kept':kept['path']})
         else:
             records.append({'path':path,'name':name,'state':'not_loaded'})
-    ours = {_skill_file(p) for p in plan['skills']}
     pi_owned = [{'name':n,'path':e['path']} for n,e in registered.items() if e['real'] not in ours]
     rt.store.event(aid,None,generation,'inheritance_skills',
         bounded({'source':plan.get('source'),'inherited':records,'pi_skills':pi_owned},4096))
@@ -416,10 +409,8 @@ async def boot_worker(rt, a):
             await terminate(rt,w)
             raise
     finally:
-        close_quietly(bootstrap_r)
-        close_quietly(bootstrap_w)
-        close_quietly(receipt_r)
-        close_quietly(receipt_w)
+        for fd in (bootstrap_r, bootstrap_w, receipt_r, receipt_w):
+            close_quietly(fd)
 
 async def write_bootstrap(rt, fd, agent_id, generation, data):
     """Write the payload from a worker thread. The thread owns the fd and closes
@@ -428,12 +419,11 @@ async def write_bootstrap(rt, fd, agent_id, generation, data):
     a reused descriptor)."""
     def _write_and_close():
         try:
-            write_all(fd, data)
+            with os.fdopen(fd, 'wb') as pipe:
+                pipe.write(data)
             return 'ok'
         except OSError:
             return 'broken'
-        finally:
-            close_quietly(fd)
     try:
         status = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, _write_and_close), 30)
         if status == 'broken':  # store writes stay on the event-loop thread (sqlite is single-thread bound)

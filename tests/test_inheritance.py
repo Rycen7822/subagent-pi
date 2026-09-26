@@ -21,8 +21,8 @@ ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.common import AgentError, dumps, socket_path
 from subagent_pi.config import PI_BUILTIN_TOOLS, load_config, launch_spec
-from subagent_pi.inheritance import (CODEX_MCP_BASELINE, capture_scope_env, collect_skills, parse_mcp_servers,
-    policy_filter, referenced_env_names, resolve_codex_home, resolve_environment)
+from subagent_pi.inheritance import capture_scope_env, collect_skills, referenced_env_names, resolve_codex_home
+from subagent_pi.mcp_config import CODEX_MCP_BASELINE, parse_mcp_servers, policy_filter, resolve_environment
 from subagent_pi.runtime import Runtime
 from subagent_pi.store import SCHEMA_VERSION, Store
 from subagent_pi.worker import write_bootstrap

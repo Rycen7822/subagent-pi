@@ -15,7 +15,7 @@ assert portable['version']==legacy['version']==__version__
 # Every declared version must agree: an installed copy reports the CLI version, so
 # a stale bridge or pyproject version would make the plugin lie about itself.
 assert f'version = "{__version__}"' in (root/'pyproject.toml').read_text(), 'pyproject version is stale'
-assert f'version: "{__version__}"' in (root/'extensions/codex-mcp-bridge.ts').read_text(), 'bridge clientInfo version is stale'
+assert f'version: "{__version__}"' in (root/'extensions/mcp/connection.ts').read_text(), 'bridge clientInfo version is stale'
 assert portable['$schema'].endswith('/plugin.schema.json')
 assert 'hooks' not in portable.get('extensions',{}).get('com.openai',{})
 assert not (root/'hooks').exists()

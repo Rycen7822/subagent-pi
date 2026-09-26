@@ -99,9 +99,8 @@ def schedule(rt):
         busy=tuple(rt.parent_deliveries)
         blocked=''.join(" AND NOT (json_extract(s.parent,'$.codex_home')=? AND json_extract(s.parent,'$.thread_id')=?)" for _ in busy)
         busy_args=[value for home,thread in busy for value in (home,thread)]
-        after=(f' AND ({priority}>? OR ({priority}=? AND (n.created>? OR (n.created=? AND n.id>?))))'
-               if cursor else '')
-        args=busy_args+([cursor[0],cursor[0],cursor[1],cursor[1],cursor[2]] if cursor else [])
+        after=f' AND ({priority},n.created,n.id)>(?,?,?)' if cursor else ''
+        args=busy_args+list(cursor or ())
         notices=rt.store.all(
             f'SELECT n.*,s.parent,r.agent_id,r.ack,r.state AS run_state,{priority} AS priority '
             'FROM parent_notifications n JOIN scopes s ON s.id=n.scope '

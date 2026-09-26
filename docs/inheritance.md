@@ -71,7 +71,7 @@ All proxy operations serialize through one in-memory chain and Pi's sequential t
 
 ## Supported configuration
 
-`subagent_pi/inheritance.py:MCP_FIELD_COMPAT` defines the accepted field surface. Unknown execution/auth fields fail the server with a named reason; required failures block boot, optional failures exclude that server.
+`subagent_pi/mcp_config.py:MCP_FIELD_COMPAT` defines the accepted field surface. Unknown execution/auth fields fail the server with a named reason; required failures block boot, optional failures exclude that server.
 
 | Fields | Handling |
 |---|---|

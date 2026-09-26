@@ -136,6 +136,7 @@ class ShipManifest(unittest.TestCase):
         m=self.ship()
         for needed in ['subagent_pi/runtime.py','subagent_pi/worker.py','subagent_pi/views.py',
                        'subagent_pi/binding.py','runtime/pi-sdk.mjs','runtime/task-queue.mjs','bin/subagent-pi','extensions/codex-mcp-bridge.ts',
+                       'subagent_pi/mcp_config.py','extensions/mcp/connection.ts','extensions/mcp/stdio.ts','extensions/mcp/http.ts',
                        'plugin.json','docs/architecture.md','skills/pi-subagents/SKILL.md',
                        '.github/workflows/ci.yml','scripts/ship_manifest.py']:
             self.assertFalse(m.excluded(ROOT/needed,ROOT),f'{needed} would be missing')
