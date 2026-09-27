@@ -75,7 +75,11 @@ def split_codex_cwd(tail):
 def source_snapshot(home):
     """Trusted client-side env snapshot for scope binding; never model-visible."""
     from .inheritance import scope_source_snapshot
-    return scope_source_snapshot(home, dict(os.environ))
+    from .parent import capture
+    environ = dict(os.environ)
+    source = scope_source_snapshot(home, environ)
+    source['parent'] = capture(environ, environ.get('CODEX_THREAD_ID'))
+    return source
 
 def guide(args):
     files={p.stem:p for p in DOC_ROOT.glob('*.md')}

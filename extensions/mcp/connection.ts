@@ -32,6 +32,7 @@ export interface ToolMeta {
   inputSchema?: unknown;
   headerPlan: HeaderPlan;
 }
+export interface ToolCatalog { tools: ToolMeta[]; truncated: boolean }
 // x-mcp-header (MCP 2026-07-28): a tool may declare that a plain
 // string/integer/boolean argument is mirrored into an HTTP header. The plan is
 // computed once from the inputSchema at discovery and kept in memory only.
@@ -149,8 +150,7 @@ function toToolMeta(raw: unknown, mirrorHeaders: boolean): ToolMeta | null {
 
 export abstract class McpConnection {
   constructor(protected cfg: ServerCfg) {}
-  toolsCache: ToolMeta[] | null = null;
-  catalogTruncated = false;
+  private toolsCache: ToolCatalog | null = null;
   protected mirrorHeaders: boolean = false;  // HTTP-only: stdio tools ignore x-mcp-header entirely
   private catalogEpoch = 0; // bump on list_changed so an in-flight crawl never repopulates an invalidated cache
   protected invalidateCatalog(): void {
@@ -171,35 +171,35 @@ export abstract class McpConnection {
     return this.request("tools/call", { name, arguments: args ?? {} }, timeoutSec, { signal });
   }
   abstract close(): void;
-  async ensureTools(signal?: AbortSignal): Promise<ToolMeta[]> {
-    // Cached in memory; catalogTruncated records a bound-stopped crawl instead of
-    // presenting a partial catalog as complete. Invalidated on list_changed.
+  async ensureTools(signal?: AbortSignal): Promise<ToolCatalog> {
+    // Keep tools and completeness together across cache hits and invalidation.
     if (this.toolsCache) return this.toolsCache;
     const epochAtStart = this.catalogEpoch;
     const collected: ToolMeta[] = [];
     let cursor: string | undefined;
     let pages = 0;
-    this.catalogTruncated = false;
+    let truncated = false;
     const seenCursors = new Set<string>();
     do {
       const result = await this.request("tools/list", cursor ? { cursor } : {}, this.cfg.startup_timeout_sec, { signal }) as
         { tools?: unknown[]; nextCursor?: unknown };
       const next = typeof result?.nextCursor === "string" && result.nextCursor ? result.nextCursor : undefined;
       if (next) {
-        if (seenCursors.has(next)) { this.catalogTruncated = true; break; } // server cursor loop guard
+        if (seenCursors.has(next)) { truncated = true; break; } // server cursor loop guard
         seenCursors.add(next);
       }
       for (const tool of result?.tools ?? []) {
-        if (collected.length >= MAX_TOOLS) { this.catalogTruncated = true; break; }
+        if (collected.length >= MAX_TOOLS) { truncated = true; break; }
         const meta = toToolMeta(tool, this.mirrorHeaders);
         if (meta) collected.push(meta);
       }
       cursor = next;
       pages += 1;
     } while (cursor && pages < MAX_PAGES && collected.length < MAX_TOOLS);
-    if (cursor && pages >= MAX_PAGES) this.catalogTruncated = true;
-    if (this.catalogEpoch === epochAtStart) this.toolsCache = collected;  // a list_changed that arrived mid-crawl must win
-    return collected;
+    if (cursor && (pages >= MAX_PAGES || collected.length >= MAX_TOOLS)) truncated = true;
+    const catalog = { tools: collected, truncated };
+    if (this.catalogEpoch === epochAtStart) this.toolsCache = catalog;  // a list_changed that arrived mid-crawl must win
+    return catalog;
   }
 }
 

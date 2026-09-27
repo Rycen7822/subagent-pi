@@ -89,6 +89,10 @@ event('server-start', pid=os.getpid())
 # parent and NEVER reach the server process env.
 event('env-marker', present=str('CODEX_MCP_PROTOCOL_VERSION' in os.environ))
 TOOLS = [t for t in base_tools() if t['name'] not in TOOLS_HIDDEN]
+CATALOG_SIZE = os.environ.get('FAKE_MCP_CATALOG_SIZE')
+if CATALOG_SIZE is not None:
+    TOOLS = [{"name": f"bulk_{i}", "inputSchema": {"type": "object"},
+              "annotations": {"readOnlyHint": True}} for i in range(int(CATALOG_SIZE))]
 if DYNAMIC:
     TOOLS = TOOLS + [{
         "name": DYN_NAME, "description": "Dynamically generated tool",
@@ -115,7 +119,7 @@ def reply(req, result):
 def tools_page(cursor):
     if not PAGED:
         return {"tools": TOOLS}
-    page_size = 2
+    page_size = int(os.environ.get('FAKE_MCP_PAGE_SIZE', '2'))
     start = int(cursor) if cursor else 0
     page = PAGED_FULL[start:start + page_size]
     nxt = start + page_size

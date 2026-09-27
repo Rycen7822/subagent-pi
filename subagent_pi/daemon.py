@@ -8,7 +8,6 @@ import signal
 import sys
 from .common import MAX_FRAME, AgentError, check_peer, dumps, private_dir, read_frame, socket_path, close_writer
 from .runtime import Runtime
-from . import parent
 from .schema import validate_op
 from . import PROTOCOL_VERSION
 
@@ -45,7 +44,7 @@ async def serve(home: Path):
                         if len(env)>64 or any(not isinstance(k,str) or len(k)>128 or not isinstance(v,str) or len(v)>16384 for k,v in env.items()):
                             raise AgentError('invalid_request','source env snapshot exceeds bounds')
                     track_delivery=op=='wait' and req.get('wait_delivery') is True
-                    if track_delivery: reservation=parent.reserve_wait(runtime,params,source)
+                    if track_delivery: reservation=runtime.parent_notifications.reserve_wait(params,source)
                     job=asyncio.create_task(runtime.dispatch(op,params,source)); operations.add(job)
                     job.add_done_callback(operations.discard)
                     if op=='wait':
@@ -72,7 +71,7 @@ async def serve(home: Path):
                 pass  # No delivery receipt: pending attention becomes eligible again.
             finally:
                 if disconnected: disconnected.cancel()
-                parent.release_wait(runtime,reservation,delivered)
+                runtime.parent_notifications.release_wait(reservation,delivered)
                 clients.discard(current)
                 await close_writer(writer)
         server=await asyncio.start_unix_server(handle,str(sock),limit=MAX_FRAME)

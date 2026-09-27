@@ -18,17 +18,18 @@ Python 3.11+ 与 Node 标准库，加载用户已安装的 Pi SDK，无额外模
 | 边界 | 所有者 |
 | --- | --- |
 | CLI、MCP → 本地 IPC | `cli.py` / `mcp.py` 共用 `schema.py`、`client.py`；`daemon.py` 持有单实例锁和断线语义 |
-| agent/run 与投递状态 | `runtime.py`；prompt/steer 共用投递入口，RPC 回执不覆盖已经观察到的消费 |
-| 持久状态 | `store.py`：SQLite WAL/FULL、幂等请求、结果事务与通知记录；`views.py` 只提供有界读取 |
+| agent/run 状态 | `runtime.py` 负责锁、启动协调、终态与队列推进；prompt/steer 共用投递入口，RPC 回执不覆盖已经观察到的消费 |
+| 持久状态与读取 | `store.py`：SQLite WAL/FULL、幂等请求、结果事务与通知记录；`views.py` 只依赖账本、只读 Worker 查询与等待条件，按 scope 批量读取并渲染有界快照 |
 | 子进程 | `worker.py`：JSONL、启动交接与 readiness；`worker_guard.py`：session 租约；`ownership()` 统一判断退出/恢复/清理 |
-| 启动配置与继承 | `config.py` 生成 argv；`binding.py` 绑定 scope 并重建启动计划；`inheritance.py` 解析来源、技能与环境快照 |
+| 启动配置与继承 | `config.py` 生成 argv；`binding.py` 持有 scope 环境并重建启动计划；`inheritance.py` 解析来源与技能，CLI/MCP adapter 捕获父身份 |
+| 父代理通知 | `parent.py` 持有 wait 保留、并发投递和关闭状态；独立的 queue 发送函数只处理外部 I/O，未知结果不重试 |
 | MCP 配置规则 | `mcp_config.py`：字段兼容、工具权限、超时与凭证引用解析；不启动进程、不读取环境 |
 | MCP 扩展 | `extensions/codex-mcp-bridge.ts`：私有管道 bootstrap、工具授权、连接生命周期与 readiness |
 | MCP wire | `extensions/mcp/connection.ts`：共享协议、catalog 与 header schema；`stdio.ts` / `http.ts` 分别拥有进程和 HTTP 交换 |
 | Pi SDK | `runtime/pi-sdk.mjs`：资源、公开 action、UI 与协议；`task-queue.mjs`：串行输入与异步归属；`protocol-output.mjs`：有界输出 |
 | 受管 Pi 上下文 | `managed-context.ts` 保留 Pi 全局指令，启动时读取父 scope 的 `SUBAGENT-PI.md`；`managed-surface.ts` 按来源限制内建工具 |
 
-机制模块不反向依赖 Runtime；MCP wire 不依赖 Pi 扩展 API。每个连接拥有自己的配置、catalog 与未完成请求；HTTP 的 JSON/SSE 共用有界读流与关闭路径。SDK 队列将输入和其字节数放在同一项，任务归属由 AsyncLocalStorage 保持。HTTP 与 stdio 保留各自的协商/降级规则；工具调用失败后均不自动重放。运行设置只在受管 SDK 子进程内存中修改，不改 Pi 宿主。
+机制模块不反向依赖 Runtime；MCP wire 不依赖 Pi 扩展 API。每个连接拥有自己的配置、包含完整性标记的 catalog 快照与未完成请求；HTTP 的 JSON/SSE 共用有界读流与关闭路径。SDK 队列将输入和其字节数放在同一项，任务归属由 AsyncLocalStorage 保持。HTTP 与 stdio 保留各自的协商/降级规则；工具调用失败后均不自动重放。运行设置只在受管 SDK 子进程内存中修改，不改 Pi 宿主。
 
 ## 数据结构
 

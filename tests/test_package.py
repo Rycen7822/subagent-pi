@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 from pathlib import Path
@@ -155,15 +156,29 @@ class RuntimeModuleBoundaries(unittest.TestCase):
         for forbidden in ('import signal','import fcntl','os.pipe(','create_subprocess_exec',
                           'killpg','connect_read_pipe','atomic_json','run_in_executor'):
             self.assertNotIn(forbidden,src,f'runtime.py re-acquired {forbidden!r}')
-    def test_no_module_imports_runtime_into_the_mechanics(self):
-        for module in ('worker','binding','views'):
-            src=(ROOT/f'subagent_pi/{module}.py').read_text()
-            self.assertNotIn('from .runtime',src,f'{module}.py must not depend on runtime.py')
-    def test_local_import_breaks_the_boot_cycle(self):
-        # worker.boot_worker imports binding lazily so binding can stay importable
-        # without a Runtime instance (and no module-level cycle appears).
-        src=(ROOT/'subagent_pi/worker.py').read_text()
-        self.assertIn('from .binding import child_env, inheritance_plan',src)
+    def test_mechanics_do_not_import_runtime(self):
+        for module in ('worker','binding','views','parent'):
+            tree=ast.parse((ROOT/f'subagent_pi/{module}.py').read_text())
+            for node in ast.walk(tree):
+                if isinstance(node,ast.Import):
+                    self.assertFalse(any(a.name=='subagent_pi.runtime' for a in node.names),module)
+                elif isinstance(node,ast.ImportFrom):
+                    self.assertNotIn(node.module,('runtime','subagent_pi.runtime'),module)
+                    if node.module in (None,'subagent_pi'):
+                        self.assertFalse(any(a.name=='runtime' for a in node.names),module)
+    def test_binding_works_without_runtime_or_worker(self):
+        from subagent_pi.binding import ScopeBindings
+        from subagent_pi.store import Store
+        with tempfile.TemporaryDirectory() as path:
+            store=Store(Path(path))
+            store.execute('INSERT INTO scopes(id,cwd,label,created) VALUES(?,?,?,?)',('s',path,'test',0))
+            binding=ScopeBindings(store,{'inheritance':{'enabled':False},'profiles':{}})
+            binding.bind_scope_source('s',{}, {'env':{'PATH':'/bin','SECRET':'private'}})
+            self.assertEqual(binding.child_env('s',{})['PATH'],'/bin')
+            self.assertNotIn('SECRET',binding.child_env('s',{}))
+            self.assertEqual(binding.inheritance_plan({'scope':'s'},{},1)['reason'],
+                             'inheritance disabled by config')
+            store.close()
 
 class DevSetupStaging(unittest.TestCase):
     """scripts/dev-setup.mjs runs on every npm install/setup and stages Pi's type

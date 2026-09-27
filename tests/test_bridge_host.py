@@ -104,6 +104,11 @@ class HostHarness:
     def events(self, path):
         if not Path(path).exists(): return []
         return [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
+    def kill_started(self, srv):
+        for event in self.events(srv['events']):
+            if event['event'] != 'server-start': continue
+            try: os.kill(event['pid'], 9)
+            except ProcessLookupError: pass
     def calls(self, log):
         return Path(log).read_text().splitlines() if Path(log).exists() else []
 
@@ -163,10 +168,7 @@ class BridgeHostTests(BridgeHostCase):
         self.assertIn('echo:{"count": 2, "text": "abc"}', self.h.calls(srv['log']))
     def test_http_json_and_sse(self):
         srv = self.h.start_http()
-        cfg = {'name': 'web', 'transport': 'http', 'url': srv['url'],
-               'headers': {}, 'bearer_token': None, 'startup_timeout_sec': 10,
-               'tool_timeout_sec': 5, 'required': False, 'allowed_tools': ['search'],
-               'disabled_tools': [], 'approval_default': 'auto', 'tool_approval': {}}
+        cfg = self.http_cfg(srv, allowed_tools=['search'])
         out = self.h.run_host([cfg], [
             {'name': 'describe', 'action': 'describe', 'server': 'web', 'tool': 'search'},
             # P1-B: a read child confirms EVERY call, even parent-auto readOnly tools.
@@ -209,10 +211,7 @@ class BridgeHostTests(BridgeHostCase):
             starts = [e['pid'] for e in self.h.events(srv['events']) if e['event']=='server-start']
             self.assertGreaterEqual(len(starts),2,'a blocked stdin must close and reconnect after timeout')
         finally:
-            for e in self.h.events(srv['events']):
-                if e['event']=='server-start':
-                    try: os.kill(e['pid'],9)
-                    except ProcessLookupError: pass
+            self.h.kill_started(srv)
     def test_stdio_outbound_buffer_has_a_hard_limit(self):
         srv = self.h.start_stdio(mode='stall_stdin_after_list')
         out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
@@ -233,10 +232,7 @@ class BridgeHostTests(BridgeHostCase):
             self.assertEqual(len(starts),1)
             with self.assertRaises(ProcessLookupError): os.kill(starts[0],0)
         finally:
-            for e in self.h.events(srv['events']):
-                if e['event']=='server-start':
-                    try: os.kill(e['pid'],9)
-                    except ProcessLookupError: pass
+            self.h.kill_started(srv)
     def test_stdio_close_reaps_wrapped_server_descendant(self):
         srv = self.h.start_stdio(mode='ignore_term_after_eof')
         cfg = stdio_cfg(server_env=srv['env'],args=[str(HERE/'fake_mcp_wrapper.py')])
@@ -250,10 +246,7 @@ class BridgeHostTests(BridgeHostCase):
             self.assertEqual(len(pids),1)
             with self.assertRaises(ProcessLookupError): os.kill(pids[0],0)
         finally:
-            for e in self.h.events(srv['events']):
-                if e['event']=='server-start':
-                    try: os.kill(e['pid'],9)
-                    except ProcessLookupError: pass
+            self.h.kill_started(srv)
     def test_stdio_exit_mid_call(self):
         srv = self.h.start_stdio(mode='die_after_init')
         out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
@@ -273,10 +266,7 @@ class BridgeHostTests(BridgeHostCase):
         self.assertEqual(out['results'][0]['kind'], 'error')
     def test_http_hang_bounded(self):
         srv = self.h.start_http(mode='headers_then_hang')
-        cfg = {'name': 'web', 'transport': 'http', 'url': srv['url'], 'headers': {},
-               'bearer_token': None, 'startup_timeout_sec': 3, 'tool_timeout_sec': 2,
-               'required': False, 'allowed_tools': None, 'disabled_tools': [],
-               'approval_default': 'auto', 'tool_approval': {}}
+        cfg = self.http_cfg(srv, startup_timeout_sec=3, tool_timeout_sec=2)
         started = time.monotonic()
         out = self.h.run_host([cfg], [{'name': 'call', 'action': 'call', 'server': 'web',
                                        'tool': 'publish', 'args': {'body': 'x'}}], timeout=30)
@@ -346,8 +336,7 @@ class ReadChildPolicyTests(BridgeHostCase):
 
     def run_case(self, cfg_overrides, steps, access='read'):
         srv = self.h.start_stdio()
-        cfg = stdio_cfg(server_env=srv['env'], **cfg_overrides)
-        out = self.h.run_host([cfg], steps, access=access)
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'], **cfg_overrides)], steps, access=access)
         return srv, out
 
     def test_read_child_with_allowlist_and_auto_cannot_call_write_tool(self):
@@ -366,6 +355,13 @@ class ReadChildPolicyTests(BridgeHostCase):
         self.assertEqual(out['results'][0]['kind'], 'error')
         self.assertEqual(self.h.calls(srv['log']), [])
 
+    def test_read_child_without_allowlist_readonly_still_confirms(self):
+        srv, out = self.run_case({'approval_default': 'auto'}, [
+            {'name': 'call', 'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'x'}, 'confirm': False},
+        ])
+        self.assertIn('denied', out['results'][0]['text'])
+        self.assertEqual(self.h.calls(srv['log']), [])
+
     def test_read_child_readonly_tool_requires_confirmation(self):
         srv, out = self.run_case({'allowed_tools': ['status'], 'approval_default': 'auto'}, [
             {'name': 'rejected', 'action': 'call', 'server': 'local', 'tool': 'status', 'args': {}, 'confirm': False},
@@ -378,34 +374,20 @@ class ReadChildPolicyTests(BridgeHostCase):
         calls = [c for c in self.h.calls(srv['log']) if c.startswith('status')]
         self.assertEqual(len(calls), 1)                       # exactly the accepted one
 
-    def test_read_child_without_allowlist_readonly_still_confirms(self):
-        srv, out = self.run_case({'approval_default': 'auto'}, [
-            {'name': 'call', 'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'x'}, 'confirm': False},
-        ])
-        self.assertIn('denied', out['results'][0]['text'])
-        self.assertEqual(self.h.calls(srv['log']), [])
-
-    def test_read_child_deny_beats_allowlist(self):
-        srv, out = self.run_case({'allowed_tools': ['echo', 'status'], 'disabled_tools': ['status'], 'approval_default': 'auto'}, [
-            {'name': 'list', 'action': 'list', 'server': 'local'},
-            {'name': 'call', 'action': 'call', 'server': 'local', 'tool': 'status', 'args': {}, 'confirm': True},
-        ])
-        listing = json.loads(next(r for r in out['results'] if r['step'] == 'list')['text'])
-        names = [t['name'] for t in listing['tools']]
-        self.assertNotIn('status', names)   # deny beats allowlist AND readOnly
-        self.assertIn('echo', names)        # readOnly, unaffected by the status deny
-        self.assertEqual(out['results'][1]['kind'], 'error')
-        self.assertEqual(self.h.calls(srv['log']), [])
-
-    def test_read_child_empty_allowlist_allows_nothing(self):
-        srv, out = self.run_case({'allowed_tools': [], 'approval_default': 'auto'}, [
-            {'name': 'list', 'action': 'list', 'server': 'local'},
-            {'name': 'call', 'action': 'call', 'server': 'local', 'tool': 'status', 'args': {}, 'confirm': True},
-        ])
-        listing = json.loads(next(r for r in out['results'] if r['step'] == 'list')['text'])
-        self.assertEqual(listing['tools'], [])  # an explicit empty allowlist allows nothing
-        self.assertEqual(out['results'][1]['kind'], 'error')
-        self.assertEqual(self.h.calls(srv['log']), [])
+    def test_read_child_deny_and_empty_allowlist(self):
+        for policy, expected_names in (
+            ({'allowed_tools': ['echo', 'status'], 'disabled_tools': ['status']}, ['echo']),
+            ({'allowed_tools': []}, []),
+        ):
+            with self.subTest(policy=policy):
+                srv, out = self.run_case(dict(policy, approval_default='auto'), [
+                    {'name': 'list', 'action': 'list', 'server': 'local'},
+                    {'name': 'call', 'action': 'call', 'server': 'local', 'tool': 'status', 'args': {}, 'confirm': True},
+                ])
+                listing = json.loads(next(r for r in out['results'] if r['step'] == 'list')['text'])
+                self.assertEqual([t['name'] for t in listing['tools']], expected_names)
+                self.assertEqual(out['results'][1]['kind'], 'error')
+                self.assertEqual(self.h.calls(srv['log']), [])
 
     def test_write_child_keeps_per_tool_confirmation(self):
         srv, out = self.run_case({'approval_default': 'auto', 'tool_approval': {'echo': 'confirm'}}, [
@@ -432,7 +414,7 @@ class DiscoveryFlowTests(BridgeHostCase):
         self.assertEqual(servers['servers'][0]['server'], 'local')
         # Level 1 did not connect the server: no stage events exist at all.
         self.assertEqual(self.h.events(srv['events']), [])
-        self.assertFalse(Path(srv['dyn_file']).exists() is False and False)
+        self.assertFalse(Path(srv['dyn_file']).exists())
 
     def test_dynamic_discovery_end_to_end(self):
         srv = self.h.start_stdio(dynamic=True)
@@ -474,7 +456,8 @@ class DiscoveryFlowTests(BridgeHostCase):
         paged_cfg = stdio_cfg(server_env=srv_paged['env'], approval_default='prompt')
         out = self.h.run_host([paged_cfg], [{'name': 'catalog', 'action': 'list', 'server': 'local'}], access='write')
         catalog = json.loads(next(r for r in out['results'])['text'])
-        self.assertEqual(len(catalog['tools']), len(catalog['tools']))
+        self.assertEqual([t['name'] for t in catalog['tools']],
+                         ['echo', 'delete_file', 'status', 'unannounced'])
         self.assertFalse(catalog['truncated'])  # 3 pages fit the page budget: a complete catalog
         # A paged catalog still serves tools from the LAST page.
         last_page_tool = catalog['tools'][-1]['name']
@@ -488,6 +471,27 @@ class DiscoveryFlowTests(BridgeHostCase):
         big = json.loads(next(r for r in out3['results'])['text'])
         self.assertTrue(big['truncated'])
         self.assertLessEqual(len(big['tools']), 512)
+
+    def test_catalog_limit_reports_unseen_pages(self):
+        for size, page_size, expected_pages, truncated in (
+            (513, 512, 1, True),
+            (513, 256, 2, True),
+            (513, 600, 1, True),
+            (512, 512, 1, False),
+        ):
+            with self.subTest(size=size, page_size=page_size):
+                srv = self.h.start_stdio(paged=True, extra={
+                    'FAKE_MCP_CATALOG_SIZE': str(size),
+                    'FAKE_MCP_PAGE_SIZE': str(page_size),
+                })
+                cfg = stdio_cfg(server_env=srv['env'])
+                out = self.h.run_host([cfg], [{'action': 'list', 'server': 'local'}], access='write')
+                catalog = json.loads(out['results'][0]['text'])
+                self.assertEqual([t['name'] for t in catalog['tools']],
+                                 [f'bulk_{i}' for i in range(min(size, 512))])
+                self.assertEqual(catalog['truncated'], truncated)
+                pages = [e for e in self.h.events(srv['events']) if e['event'] == 'tools-list-received']
+                self.assertEqual(len(pages), expected_pages)
 
     def test_catalog_filters_deny_and_reader_and_handles_empty(self):
         srv = self.h.start_stdio(hide='unannounced')
@@ -792,14 +796,10 @@ class StdioTransportFailureTests(BridgeHostCase):
         self.assertEqual(err['kind'], 'error')
         self.assertIn('closed', err['message'])
 
-if __name__ == '__main__':
-    unittest.main()
 class LegacySessionTests(BridgeHostCase):
     """2025-06-18 legacy HTTP lifecycle: negotiation, protocol header, session
-    prefix = 'legacy-sess-'
     expiry (404) recovery — and proof that an expired-session call is never replayed."""
-
-
+    prefix = 'legacy-sess-'
     def test_negotiates_version_and_sends_headers(self):
         srv = self.h.start_http('normal')
         res = self.h.run_host([self.http_cfg(srv, protocol_mode='legacy_2025_06_18')],
@@ -839,10 +839,8 @@ class LegacySessionTests(BridgeHostCase):
 
 class ModernProtocolTests(BridgeHostCase):
     """2026-07-28 modern lifecycle against a strict fixture that rejects requests
-    prefix = 'modern-mcp-'
     missing MCP-Protocol-Version / Mcp-Method / Mcp-Name / modern _meta."""
-
-
+    prefix = 'modern-mcp-'
     def test_strict_server_accepts_bridge_requests(self):
         srv = self.h.start_http('modern')
         res = self.h.run_host([self.http_cfg(srv)],
@@ -921,30 +919,22 @@ class XMcHeaderTests(BridgeHostCase):
     invalid annotations instead of failing the server."""
     prefix = 'x-mcp-hdr-'
 
-    def test_modern_call_mirrors_declared_headers(self):
-        srv = self.h.start_http('modern')
-        res = self.h.run_host([self.http_cfg(srv)], [
-            {'name': 'call', 'action': 'call', 'server': 'web', 'tool': 'hdr',
-             'args': {'trace_id': 'tr-1', 'count': 7, 'flag': True}}], access='write')['results']
-        self.assertEqual(res[0]['kind'], 'result', res[0].get('message'))
-        calls = [e for e in self.h.events(srv['events']) if e['event'] == 'call-received' and e['tool'] == 'hdr']
-        self.assertEqual(len(calls), 1)
-        ph = calls[0]['param_headers']
-        self.assertEqual(ph.get('mcp-param-trace-id'), 'tr-1')
-        self.assertEqual(ph.get('mcp-param-count'), '7')
-        self.assertEqual(ph.get('mcp-param-x-flag'), 'true')
-        # the body keeps every argument unchanged
-        self.assertEqual(calls[0]['args'], {'trace_id': 'tr-1', 'count': 7, 'flag': True})
-
-    def test_absent_argument_produces_no_header(self):
-        srv = self.h.start_http('modern')
-        res = self.h.run_host([self.http_cfg(srv)], [
-            {'name': 'call', 'action': 'call', 'server': 'web', 'tool': 'hdr',
-             'args': {'trace_id': 'only-trace'}}], access='write')['results']
-        self.assertEqual(res[0]['kind'], 'result')
-        calls = [e for e in self.h.events(srv['events']) if e['event'] == 'call-received' and e['tool'] == 'hdr']
-        # only the present argument is mirrored; count/flag produce no headers
-        self.assertEqual(calls[0]['param_headers'], {'mcp-param-trace-id': 'only-trace'})
+    def test_declared_headers_mirror_only_present_arguments_and_keep_the_body(self):
+        cases = (
+            ({'trace_id': 'tr-1', 'count': 7, 'flag': True},
+             {'mcp-param-trace-id': 'tr-1', 'mcp-param-count': '7', 'mcp-param-x-flag': 'true'}),
+            ({'trace_id': 'only-trace'}, {'mcp-param-trace-id': 'only-trace'}),
+        )
+        for args, expected_headers in cases:
+            with self.subTest(args=args):
+                srv = self.h.start_http('modern')
+                result = self.h.run_host([self.http_cfg(srv)], [
+                    {'action': 'call', 'server': 'web', 'tool': 'hdr', 'args': args}], access='write')['results'][0]
+                self.assertEqual(result['kind'], 'result', result.get('message'))
+                calls = [e for e in self.h.events(srv['events']) if e['event'] == 'call-received' and e['tool'] == 'hdr']
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]['param_headers'], expected_headers)
+                self.assertEqual(calls[0]['args'], args)
 
     def test_invalid_annotations_exclude_the_tool_not_the_server(self):
         srv = self.h.start_http('modern', extra={'FAKE_MCP_HEADER_TOOLS': '1'})
@@ -991,41 +981,26 @@ class SequentialExecutionTests(BridgeHostCase):
     two calls submitted CONCURRENTLY must not overlap server-side."""
     prefix = 'seq-exec-'
 
-    def test_concurrent_proxy_calls_serialize_server_side(self):
-        srv = self.h.start_stdio(extra={'FAKE_MCP_SLOW_MUTATION_MS': '400'})
-        cfg = stdio_cfg(server_env=srv['env'], approval_default='auto')
-        out = self.h.run_host([cfg], [
-            {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'echo',
-             'args': {'text': 'first'}, 'launch': True},
-            {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'echo',
-             'args': {'text': 'second'}, 'launch': True},
-            {'action': 'awaitPending'}], access='write', timeout=90)
-        by = {r['step']: r for r in out['results']}
-        self.assertEqual(out['registered']['executionMode'], 'sequential')
-        self.assertEqual(by['c1']['kind'], 'result', by['c1'].get('message'))
-        self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
-        seq = [e['event'] for e in self.h.events(srv['events']) if e['event'] in ('call-start', 'call-end')]
-        # submitted concurrently, executed serially: the second start is after the first end
-        self.assertEqual(seq, ['call-start', 'call-end', 'call-start', 'call-end'])
-        self.assertIn('first', by['c1']['text'])
-        self.assertIn('second', by['c2']['text'])  # no state reuse between queued calls
-
-    def test_cancelled_first_call_does_not_poison_the_second(self):
-        srv = self.h.start_stdio(extra={'FAKE_MCP_SLOW_MUTATION_MS': '400'})
-        cfg = stdio_cfg(server_env=srv['env'], approval_default='auto')
-        out = self.h.run_host([cfg], [
-            {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'echo',
-             'args': {'text': 'first'}, 'launch': True, 'abortAfterMs': 150},
-            {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'echo',
-             'args': {'text': 'second'}, 'launch': True},
-            {'action': 'awaitPending'}], access='write', timeout=90)
-        by = {r['step']: r for r in out['results']}
-        self.assertEqual(by['c1']['kind'], 'error')  # cancelled mid-flight
-        self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
-        self.assertIn('second', by['c2']['text'])
-        seq = [e['event'] for e in self.h.events(srv['events']) if e['event'] in ('call-start', 'call-end')]
-        self.assertEqual(seq.count('call-start'), 2)
-        self.assertEqual(seq.count('call-end'), 2)  # the server finished both handler windows
+    def test_concurrent_calls_are_serial_and_cancellation_does_not_poison_the_queue(self):
+        for abort_first in (False, True):
+            with self.subTest(abort_first=abort_first):
+                srv = self.h.start_stdio(extra={'FAKE_MCP_SLOW_MUTATION_MS': '400'})
+                first = {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'echo',
+                         'args': {'text': 'first'}, 'launch': True}
+                if abort_first: first['abortAfterMs'] = 150
+                out = self.h.run_host([stdio_cfg(server_env=srv['env'], approval_default='auto')], [first,
+                    {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'echo',
+                     'args': {'text': 'second'}, 'launch': True},
+                    {'action': 'awaitPending'}], access='write', timeout=90)
+                by = {r['step']: r for r in out['results']}
+                self.assertEqual(out['registered']['executionMode'], 'sequential')
+                self.assertEqual(by['c1']['kind'], 'error' if abort_first else 'result')
+                self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
+                self.assertIn('second', by['c2']['text'])
+                sequence = [e['event'] for e in self.h.events(srv['events'])
+                            if e['event'] in ('call-start', 'call-end')]
+                self.assertEqual(sequence, ['call-start', 'call-end'] * 2)
+                if not abort_first: self.assertIn('first', by['c1']['text'])
 
 
 class StdioGenerationTests(BridgeHostCase):
@@ -1044,44 +1019,29 @@ class StdioGenerationTests(BridgeHostCase):
                              'initialize-received')
         return ev
 
-    def test_confirm_pending_process_exit_no_respawn(self):
-        srv = self.h.start_stdio(extra={'FAKE_MCP_DIE_AFTER_LIST_MS': '300'})
-        cfg = stdio_cfg(server_env=srv['env'])  # approval prompt: calls wait for confirm
-        out = self.h.run_host([cfg], [
-            {'name': 'l1', 'action': 'list', 'server': 'local'},
-            {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
-             'args': {'path': 'x'}, 'confirm': True, 'confirmDelayMs': 700, 'launch': True},
-            {'action': 'awaitPending'},
-            {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
-             'args': {'path': 'y'}, 'confirm': True}], access='write', timeout=90)
-        by = {r['step']: r for r in out['results']}
-        self.assertEqual(by['l1']['kind'], 'result')
-        # the confirm-pending call failed; the server NEVER received it
-        self.assertEqual(by['c1']['kind'], 'error')
-        self.assertIn('exited', by['c1']['message'])
-        # the next explicit call built a NEW process and the side effect ran exactly once
-        self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
-        self.assertEqual(len(self.h.calls(srv['log'])), 1)
-        ev = self._assert_every_process_rehandshakes(srv)
-        self.assertEqual([e['tool'] for e in ev if e['event'] == 'call-received'], ['delete_file'])
-
-    def test_confirm_pending_stdin_closed_no_respawn(self):
-        srv = self.h.start_stdio(extra={'FAKE_MCP_CLOSE_STDIN_ONCE_FILE': str(Path(self.tmp.name) / 'close-once.marker')})
-        cfg = stdio_cfg(server_env=srv['env'])
-        out = self.h.run_host([cfg], [
-            {'name': 'l1', 'action': 'list', 'server': 'local'},
-            {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
-             'args': {'path': 'x'}, 'confirm': True, 'confirmDelayMs': 700, 'launch': True},
-            {'action': 'awaitPending'},
-            {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
-             'args': {'path': 'y'}, 'confirm': True}], access='write', timeout=90)
-        by = {r['step']: r for r in out['results']}
-        # the write hit the closed read end: transport error, no respawn, no replay
-        self.assertEqual(by['c1']['kind'], 'error')
-        self.assertIn('transport broken', by['c1']['message'])
-        self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
-        self.assertEqual(len(self.h.calls(srv['log'])), 1)
-        self._assert_every_process_rehandshakes(srv)
+    def test_pending_confirmation_failure_rehandshakes_without_replay(self):
+        cases = (
+            ({'FAKE_MCP_DIE_AFTER_LIST_MS': '300'}, 'exited'),
+            ({'FAKE_MCP_CLOSE_STDIN_ONCE_FILE': str(Path(self.tmp.name) / 'close-once.marker')}, 'transport broken'),
+        )
+        for extra, error in cases:
+            with self.subTest(error=error):
+                srv = self.h.start_stdio(extra=extra)
+                out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
+                    {'name': 'l1', 'action': 'list', 'server': 'local'},
+                    {'name': 'c1', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
+                     'args': {'path': 'x'}, 'confirm': True, 'confirmDelayMs': 700, 'launch': True},
+                    {'action': 'awaitPending'},
+                    {'name': 'c2', 'action': 'call', 'server': 'local', 'tool': 'delete_file',
+                     'args': {'path': 'y'}, 'confirm': True}], access='write', timeout=90)
+                by = {r['step']: r for r in out['results']}
+                self.assertEqual(by['l1']['kind'], 'result')
+                self.assertEqual(by['c1']['kind'], 'error')
+                self.assertIn(error, by['c1']['message'])
+                self.assertEqual(by['c2']['kind'], 'result', by['c2'].get('message'))
+                self.assertEqual(len(self.h.calls(srv['log'])), 1)
+                events = self._assert_every_process_rehandshakes(srv)
+                self.assertEqual([e['tool'] for e in events if e['event'] == 'call-received'], ['delete_file'])
 
 
 class StdioEraTests(BridgeHostCase):
@@ -1089,67 +1049,37 @@ class StdioEraTests(BridgeHostCase):
     consumed client-side; the server process never sees it."""
     prefix = 'stdio-era-'
 
-    def test_modern_stdio_first_rpc_is_discover_with_meta_and_marker_never_reaches_server(self):
-        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1'})
-        cfg = stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')
-        out = self.h.run_host([cfg], [
-            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
-        ], access='write')['results']
-        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
-        evs = self.h.events(srv['events'])
-        # Auto lifecycle: discover -> (modern confirmed) -> catalog list, never initialize
-        self.assertEqual(next(e for e in evs if e['event'] == 'first-method')['method'], 'server/discover')
-        self.assertEqual(next(e for e in evs if e['event'] == 'discover-received')['modern_meta'], '2026-07-28')
-        self.assertEqual(next(e for e in evs if e['event'] == 'tools-list-received')['modern_meta'], '2026-07-28')
-        self.assertNotIn('initialize-received', [e['event'] for e in evs])
-        marker = next(e for e in evs if e['event'] == 'env-marker')
-        self.assertEqual(marker['present'], 'False')  # the server process env is clean
-
-    def test_modern_stdio_falls_back_to_initialize_on_legacy_discover_error(self):
-        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1',
-                                        'FAKE_MCP_DISCOVER_ERROR_CODE': '-32601'})
-        out = self.h.run_host([stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')], [
-            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
-        ], access='write')['results']
-        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
-        evs = [e['event'] for e in self.h.events(srv['events'])]
-        # fallback order: discover (side-effect-free) -> full legacy handshake -> catalog
-        self.assertEqual(evs[evs.index('discover-received') + 1:][:3],
-                         ['initialize-received', 'initialized-received', 'tools-list-received'])
-
-    def test_modern_stdio_unsupported_version_without_common_fails_without_fallback(self):
-        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1',
-                                        'FAKE_MCP_DISCOVER_ERROR_CODE': '-32022',
-                                        'FAKE_MCP_DISCOVER_SUPPORTED': '1999-01-01'})
-        out = self.h.run_host([stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')], [
-            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
-        ], access='write')['results']
-        self.assertEqual(out[0]['kind'], 'error')
-        self.assertIn('no common modern version', out[0]['message'])
-        self.assertNotIn('initialize-received', [e['event'] for e in self.h.events(srv['events'])])
-        self.assertEqual(self.h.calls(srv['log']), [])  # side-effect count 0
-
-    def test_modern_stdio_recognized_header_mismatch_keeps_modern(self):
-        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1',
-                                        'FAKE_MCP_DISCOVER_ERROR_CODE': '-32020'})
-        out = self.h.run_host([stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')], [
-            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
-        ], access='write')['results']
-        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))  # -32020 stays modern, no fallback
-        evs = [e['event'] for e in self.h.events(srv['events'])]
-        self.assertNotIn('initialize-received', evs)
-        self.assertIn('tools-list-received', evs)  # catalog list ran with modern _meta
-
-    def test_modern_stdio_malformed_discover_result_is_a_protocol_error(self):
-        srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1',
-                                        'FAKE_MCP_DISCOVER_MALFORMED': '1'})
-        out = self.h.run_host([stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')], [
-            {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
-        ], access='write')['results']
-        self.assertEqual(out[0]['kind'], 'error')
-        self.assertIn('malformed DiscoverResult', out[0]['message'])
-        self.assertNotIn('initialize-received', [e['event'] for e in self.h.events(srv['events'])])
-        self.assertEqual(self.h.calls(srv['log']), [])
+    def test_modern_discovery_classifies_errors_before_any_tool_call(self):
+        cases = (
+            # fixture options, outcome, legacy handshakes, server calls, error text
+            ({}, 'result', 0, ['echo:{"text": "hi"}'], None),
+            ({'FAKE_MCP_DISCOVER_ERROR_CODE': '-32601'}, 'result', 1, ['echo:{"text": "hi"}'], None),
+            ({'FAKE_MCP_DISCOVER_ERROR_CODE': '-32022', 'FAKE_MCP_DISCOVER_SUPPORTED': '1999-01-01'},
+             'error', 0, [], 'no common modern version'),
+            ({'FAKE_MCP_DISCOVER_ERROR_CODE': '-32020'}, 'result', 0, ['echo:{"text": "hi"}'], None),
+            ({'FAKE_MCP_DISCOVER_MALFORMED': '1'}, 'error', 0, [], 'malformed DiscoverResult'),
+        )
+        for extra, kind, handshakes, calls, message in cases:
+            with self.subTest(extra=extra):
+                srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1', **extra})
+                result = self.h.run_host([stdio_cfg(server_env=srv['env'], protocol_mode='modern_2026_07_28')], [
+                    {'action': 'call', 'server': 'local', 'tool': 'echo', 'args': {'text': 'hi'}, 'confirm': True},
+                ], access='write')['results'][0]
+                self.assertEqual(result['kind'], kind, result.get('message'))
+                if message: self.assertIn(message, result['message'])
+                events = self.h.events(srv['events'])
+                names = [event['event'] for event in events]
+                self.assertEqual(next(e['method'] for e in events if e['event'] == 'first-method'), 'server/discover')
+                self.assertEqual(next(e['modern_meta'] for e in events if e['event'] == 'discover-received'), '2026-07-28')
+                self.assertEqual(names.count('initialize-received'), handshakes)
+                self.assertEqual(self.h.calls(srv['log']), calls)
+                if kind == 'result': self.assertIn('tools-list-received', names)
+                if extra.get('FAKE_MCP_DISCOVER_ERROR_CODE') == '-32601':
+                    self.assertEqual(names[names.index('discover-received') + 1:][:3],
+                                     ['initialize-received', 'initialized-received', 'tools-list-received'])
+                if not extra:
+                    self.assertEqual(next(e['modern_meta'] for e in events if e['event'] == 'tools-list-received'), '2026-07-28')
+                    self.assertEqual(next(e['present'] for e in events if e['event'] == 'env-marker'), 'False')
 
     def test_strict_fixture_rejects_a_legacy_first_rpc(self):
         srv = self.h.start_stdio(extra={'FAKE_MCP_STRICT_FIRST_DISCOVER': '1'})
@@ -1177,86 +1107,45 @@ class HttpEraTests(BridgeHostCase):
     """P1-B: HTTP era classification reads the bounded JSON-RPC error body."""
     prefix = 'http-era-'
 
-    def test_legacy400_body_falls_back_to_initialize(self):
-        srv = self.h.start_http('normal', extra={'FAKE_MCP_DISCOVER_REJECT': 'legacy400'})
-        out = self.h.run_host([self.http_cfg(srv)], [
-            {'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}], access='write')['results']
-        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
-        evs = self.h.events(srv['events'])
-        rejected = [e for e in evs if e['event'] == 'discover-rejected']
-        self.assertEqual([e['status'] for e in rejected], [400])  # legacy-style 400 body
-        self.assertIn('initialize-received', [e['event'] for e in evs])  # legal legacy fallback
-        self.assertEqual(self.h.calls(srv['log']), ['search:{"query": "x"}'])  # side effect exactly once
-
-    def test_modern400_unsupported_version_stays_modern(self):
-        srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_REJECT': 'modern400'})
-        out = self.h.run_host([self.http_cfg(srv)], [
-            {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
-            access='write')['results']
-        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
-        evs = self.h.events(srv['events'])
-        self.assertEqual([e['status'] for e in evs if e['event'] == 'discover-rejected'], [400])
-        self.assertNotIn('initialize-received', [e['event'] for e in evs])  # never fell back to legacy
-        self.assertEqual(self.h.calls(srv['log']), ['publish:{"body": "b"}'])  # side effect exactly once
-
-    def test_recognized_modern_errors_32020_and_32021_keep_modern(self):
-        for reject, label in (('mismatch400', 'http400'), ('capability400', 'http400'), ('inband32020', 'http200')):
+    def test_discover_error_classification_never_replays_a_tool_call(self):
+        # Each case drives the real HTTP bridge and checks both handshake era
+        # and the independent server-side business-call log.
+        cases = (
+            # reject, server mode, result kind, initialize count, HTTP status, calls, error text
+            ('legacy400', 'normal', 'result', 1, 400, ['search:{"query": "x"}'], None),
+            ('modern400', 'modern', 'result', 0, 400, ['publish:{"body": "b"}'], None),
+            ('mismatch400', 'modern', 'result', 0, None, ['publish:{"body": "b"}'], None),
+            ('capability400', 'modern', 'result', 0, None, ['publish:{"body": "b"}'], None),
+            ('inband32020', 'modern', 'result', 0, None, ['publish:{"body": "b"}'], None),
+            ('inband32601', 'normal', 'result', 1, None, ['search:{"query": "x"}'], None),
+            ('modern400_nocommon', 'modern', 'error', 0, None, [], 'no common modern version'),
+            *((status, 'modern', 'error', 0, int(status), [], f'HTTP {status}')
+              for status in ('401', '403', '429', '503')),
+        )
+        for reject, mode, kind, init_count, status, calls, message in cases:
             with self.subTest(reject=reject):
-                srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_REJECT': reject})
-                out = self.h.run_host([self.http_cfg(srv)], [
-                    {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
-                    access='write')['results']
-                self.assertEqual(out[0]['kind'], 'result', f'{reject}: {out[0].get("message")}')
-                evs = [e['event'] for e in self.h.events(srv['events'])]
-                self.assertNotIn('initialize-received', evs)  # recognized modern error: initialize_count 0
-                self.assertEqual(self.h.calls(srv['log']), [f'publish:{{"body": "b"}}'])  # exactly once
-
-    def test_inband_legacy_32601_falls_back_to_initialize(self):
-        # legacy-mode server: it refuses discover in-band AND accepts the
-        # initialize fallback (a modern-only server could not serve the fallback)
-        srv = self.h.start_http('normal', extra={'FAKE_MCP_DISCOVER_REJECT': 'inband32601'})
-        out = self.h.run_host([self.http_cfg(srv)], [
-            {'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}], access='write')['results']
-        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
-        evs = [e['event'] for e in self.h.events(srv['events'])]
-        self.assertEqual([e['method'] for e in self.h.events(srv['events']) if e['event'] == 'request'
-                          and e['method'] == 'initialize'].count('initialize'), 1)  # initialize_count 1
-        self.assertEqual(self.h.calls(srv['log']), ['search:{"query": "x"}'])
+                srv = self.h.start_http(mode, extra={'FAKE_MCP_DISCOVER_REJECT': reject})
+                tool, args = ('search', {'query': 'x'}) if mode == 'normal' else ('publish', {'body': 'b'})
+                action = {'action': 'call', 'server': 'web', 'tool': tool, 'args': args}
+                if tool == 'publish': action['confirm'] = True
+                result = self.h.run_host([self.http_cfg(srv)], [action], access='write')['results'][0]
+                self.assertEqual(result['kind'], kind, result.get('message'))
+                if message: self.assertIn(message, result['message'])
+                events = self.h.events(srv['events'])
+                self.assertEqual(sum(e['event'] == 'initialize-received' for e in events), init_count)
+                if status is not None:
+                    self.assertEqual([e['status'] for e in events if e['event'] == 'discover-rejected'], [status])
+                self.assertEqual(self.h.calls(srv['log']), calls)
 
     def test_malformed_discover_result_is_a_protocol_error_not_a_fallback(self):
         srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_MALFORMED': '1'})
-        out = self.h.run_host([self.http_cfg(srv)], [
+        result = self.h.run_host([self.http_cfg(srv)], [
             {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
-            access='write')['results']
-        self.assertEqual(out[0]['kind'], 'error')
-        self.assertIn('malformed DiscoverResult', out[0]['message'])
-        evs = [e['event'] for e in self.h.events(srv['events'])]
-        self.assertNotIn('initialize-received', evs)  # no fallback
-        self.assertEqual(self.h.calls(srv['log']), [])  # side-effect count 0
-
-    def test_modern400_no_common_version_is_an_incompatibility(self):
-        srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_REJECT': 'modern400_nocommon'})
-        out = self.h.run_host([self.http_cfg(srv)], [
-            {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
-            access='write')['results']
-        self.assertEqual(out[0]['kind'], 'error')
-        self.assertIn('no common modern version', out[0]['message'])
+            access='write')['results'][0]
+        self.assertEqual(result['kind'], 'error')
+        self.assertIn('malformed DiscoverResult', result['message'])
         self.assertNotIn('initialize-received', [e['event'] for e in self.h.events(srv['events'])])
-        self.assertEqual(self.h.calls(srv['log']), [])  # side-effect count 0: no fallback, no replay
-
-    def test_auth_and_rate_limit_status_never_downgrade_the_era(self):
-        for status in ('401', '403', '429', '503'):
-            with self.subTest(status=status):
-                srv = self.h.start_http('modern', extra={'FAKE_MCP_DISCOVER_REJECT': status})
-                out = self.h.run_host([self.http_cfg(srv)], [
-                    {'action': 'call', 'server': 'web', 'tool': 'publish', 'args': {'body': 'b'}, 'confirm': True}],
-                    access='write')['results']
-                self.assertEqual(out[0]['kind'], 'error', status)
-                self.assertIn(f'HTTP {status}', out[0]['message'], status)
-                evs = self.h.events(srv['events'])
-                self.assertEqual([e['status'] for e in evs if e['event'] == 'discover-rejected'], [int(status)])
-                self.assertNotIn('initialize-received', [e['event'] for e in evs])  # not a downgrade trigger
-                self.assertEqual(self.h.calls(srv['log']), [])
+        self.assertEqual(self.h.calls(srv['log']), [])
 
 
 class HeaderE2eTests(BridgeHostCase):
@@ -1339,13 +1228,6 @@ class RedirectTests(BridgeHostCase):
     body is ever transmitted before the target origin is verified."""
     prefix = 'redirect-'
 
-    @staticmethod
-    def _events_of(h, srv):
-        try:
-            return h.events(srv['events'])
-        except Exception:
-            return []  # no request ever arrived, so the fake wrote no log
-
     def test_cross_origin_307_never_sends_secret_headers_or_tool_body(self):
         b = self.h.start_http('modern')
         a = self.h.start_http('modern', extra={'FAKE_MCP_REDIRECT_PLAN': f"307:{b['url']}"})
@@ -1356,28 +1238,10 @@ class RedirectTests(BridgeHostCase):
         self.assertEqual(out[0]['kind'], 'error')
         self.assertIn('cross-origin redirect', out[0]['message'])
         self.assertIn('no headers or body were sent', out[0]['message'])
-        self.assertEqual(self._events_of(self.h, b), [])  # B received ZERO requests
+        self.assertEqual(self.h.events(b['events']), [])  # B received ZERO requests
         self.assertEqual(self.h.calls(b['log']), [])  # tool body canary never reached B
         self.assertEqual(self.h.calls(a['log']), [])  # A redirected before executing anything
-        self.assertEqual([e for e in self._events_of(self.h, a) if e['event'] == 'redirect-sent'][0]['status'], 307)
-
-    def test_same_origin_307_redirect_completes_and_executes_once(self):
-        a = self.h.start_http('modern', extra={'FAKE_MCP_REDIRECT_PLAN': '307:/mcp2'})
-        out = self.h.run_host([self.http_cfg(a)], [
-            {'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}], access='write')['results']
-        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
-        self.assertEqual(self.h.calls(a['log']), ['search:{"query": "x"}'])  # executed exactly once, not replayed
-        self.assertEqual(len([e for e in self.h.events(a['events']) if e['event'] == 'redirect-sent']), 1)
-
-    def test_redirect_with_unfinished_body_releases_each_socket(self):
-        a = self.h.start_http('redirect_hanging_body')
-        actions = [{'action':'call','server':'web','tool':'search','args':{'query':str(i)},
-                    'name':f'call-{i}'} for i in range(4)]
-        actions += [{'waitMs':200},{'socketCount':True,'name':'open-sockets'}]
-        out = self.h.run_host([self.http_cfg(a,protocol_mode='legacy_2025_06_18')],actions,access='write')['results']
-        self.assertEqual([r['kind'] for r in out[:4]],['result']*4)
-        self.assertEqual(len(self.h.calls(a['log'])),4)
-        self.assertLess(out[-1]['sockets'],3,'discarded redirect bodies retained live sockets')
+        self.assertEqual([e for e in self.h.events(a['events']) if e['event'] == 'redirect-sent'][0]['status'], 307)
 
     def test_second_hop_cross_origin_is_rejected(self):
         b = self.h.start_http('modern')
@@ -1387,7 +1251,7 @@ class RedirectTests(BridgeHostCase):
             access='write')['results']
         self.assertEqual(out[0]['kind'], 'error')
         self.assertIn('cross-origin redirect', out[0]['message'])
-        self.assertEqual(self._events_of(self.h, b), [])  # the second hop never happened
+        self.assertEqual(self.h.events(b['events']), [])  # the second hop never happened
         self.assertEqual(self.h.calls(a['log']), [])
 
     def test_redirect_loop_is_detected(self):
@@ -1408,6 +1272,24 @@ class RedirectTests(BridgeHostCase):
         self.assertIn('redirect-sent', evs)
         self.assertIn('get-received', evs)  # 303 was followed as GET
         self.assertEqual(self.h.calls(a['log']), [])  # the tool body was dropped, never executed
+
+    def test_same_origin_307_redirect_completes_and_executes_once(self):
+        a = self.h.start_http('modern', extra={'FAKE_MCP_REDIRECT_PLAN': '307:/mcp2'})
+        out = self.h.run_host([self.http_cfg(a)], [
+            {'action': 'call', 'server': 'web', 'tool': 'search', 'args': {'query': 'x'}}], access='write')['results']
+        self.assertEqual(out[0]['kind'], 'result', out[0].get('message'))
+        self.assertEqual(self.h.calls(a['log']), ['search:{"query": "x"}'])  # executed exactly once, not replayed
+        self.assertEqual(len([e for e in self.h.events(a['events']) if e['event'] == 'redirect-sent']), 1)
+
+    def test_redirect_with_unfinished_body_releases_each_socket(self):
+        a = self.h.start_http('redirect_hanging_body')
+        actions = [{'action':'call','server':'web','tool':'search','args':{'query':str(i)},
+                    'name':f'call-{i}'} for i in range(4)]
+        actions += [{'waitMs':200},{'socketCount':True,'name':'open-sockets'}]
+        out = self.h.run_host([self.http_cfg(a,protocol_mode='legacy_2025_06_18')],actions,access='write')['results']
+        self.assertEqual([r['kind'] for r in out[:4]],['result']*4)
+        self.assertEqual(len(self.h.calls(a['log'])),4)
+        self.assertLess(out[-1]['sockets'],3,'discarded redirect bodies retained live sockets')
 
     def test_deadline_covers_all_redirect_hops(self):
         # same-origin hop 1 (/mcp2), then hop 2 hangs: the exchange deadline must

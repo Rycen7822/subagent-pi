@@ -19,6 +19,7 @@ ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.common import AgentError, dumps, group_members, process_identity
 from subagent_pi import worker
+from subagent_pi import views
 from subagent_pi.runtime import Runtime
 from subagent_pi.worker import read_receipt
 from subagent_pi.schema import TOOLS, validate_op
@@ -196,34 +197,34 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def observed(w,error):
             try: await original(w,error)
             finally: finished.set()
-        with m.patch.object(self.rt,'fail_worker',observed):
-            steering=asyncio.create_task(self.mutation('send',aid,mode='steer',message='STEER'))
-            replacement=None
-            try:
-                await self.until(lambda: self.events(aid,'extension_error'))
-                replacement=asyncio.create_task(self.mutation('send',aid,interrupt=True,message='delay=1|NEW'))
-                await self.until(lambda: self.rt.agent_locks[aid]._waiters)
-                release.touch()
-                with self.assertRaises(AgentError) as caught: await steering
-                self.assertEqual(caught.exception.code,'rpc_timeout')
-                new=await replacement
-                await asyncio.wait_for(finished.wait(),5)
-                current=self.rt.workers[aid]; row=self.rt.store.agent(self.scope,aid)
-                self.assertEqual(current.generation,old_worker.generation+1)
-                self.assertIsNone(current.proc.returncode)
-                self.assertEqual(row['state'],'running')
-                self.assertEqual(row['current_run'],new['run_id'])
-                self.assertEqual(row['cleanup'],'not_checked')
-                self.assertIn('transport limit',old_worker.error)
-                with self.assertRaises(AgentError) as conflict: await self.spawn('MUST_NOT_START',access='write')
-                self.assertEqual(conflict.exception.code,'writer_conflict')
-                self.assertFalse((await self.wait(new['run_id']))['timed_out'])
-                self.assertEqual((await self.result(new['run_id']))['text'],'Completed: NEW')
-                self.assertEqual(self.rt.store.run(self.scope,spawned['run_id'])['state'],'interrupted')
-            finally:
-                for task in (steering,replacement):
-                    if task and not task.done(): task.cancel()
-                await asyncio.gather(*(t for t in (steering,replacement) if t),return_exceptions=True)
+        old_worker.on_failure=observed
+        steering=asyncio.create_task(self.mutation('send',aid,mode='steer',message='STEER'))
+        replacement=None
+        try:
+            await self.until(lambda: self.events(aid,'extension_error'))
+            replacement=asyncio.create_task(self.mutation('send',aid,interrupt=True,message='delay=1|NEW'))
+            await self.until(lambda: self.rt.agent_locks[aid]._waiters)
+            release.touch()
+            with self.assertRaises(AgentError) as caught: await steering
+            self.assertEqual(caught.exception.code,'rpc_timeout')
+            new=await replacement
+            await asyncio.wait_for(finished.wait(),5)
+            current=self.rt.workers[aid]; row=self.rt.store.agent(self.scope,aid)
+            self.assertEqual(current.generation,old_worker.generation+1)
+            self.assertIsNone(current.proc.returncode)
+            self.assertEqual(row['state'],'running')
+            self.assertEqual(row['current_run'],new['run_id'])
+            self.assertEqual(row['cleanup'],'not_checked')
+            self.assertIn('transport limit',old_worker.error)
+            with self.assertRaises(AgentError) as conflict: await self.spawn('MUST_NOT_START',access='write')
+            self.assertEqual(conflict.exception.code,'writer_conflict')
+            self.assertFalse((await self.wait(new['run_id']))['timed_out'])
+            self.assertEqual((await self.result(new['run_id']))['text'],'Completed: NEW')
+            self.assertEqual(self.rt.store.run(self.scope,spawned['run_id'])['state'],'interrupted')
+        finally:
+            for task in (steering,replacement):
+                if task and not task.done(): task.cancel()
+            await asyncio.gather(*(t for t in (steering,replacement) if t),return_exceptions=True)
 
     async def test_respawn_cannot_overtake_exit_accounting(self):
         for completed in (False,True):
@@ -283,9 +284,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         queued=await self.mutation('send',aid,mode='follow_up',message='MUST_NOT_RESUME')
         entered=asyncio.Event(); release=asyncio.Event()
         original=worker.terminate
-        async def delayed_terminate(rt,current):
+        async def delayed_terminate(directory,current):
             entered.set(); await release.wait()
-            return await original(rt,current)
+            return await original(directory,current)
         with m.patch('subagent_pi.runtime.terminate',delayed_terminate):
             failing=asyncio.create_task(self.rt.fail_worker(w,'reader failed'))
             replacing=None
@@ -494,6 +495,33 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(hashlib.sha256(text.encode()).hexdigest(),preview['result_sha256'])
             self.assertFalse((await self.result(run['id']))['acknowledged'])
 
+    async def test_wait_and_outstanding_use_bounded_scoped_reads(self):
+        store=self.rt.store
+        reader=views.ReadViews(store, lambda aid: None, asyncio.Condition(), 60)
+        store.execute('''INSERT INTO agents(id,scope,name,cwd,state,session_file,launch,created,updated)
+                         VALUES(?,?,?,?,?,?,?,?,?)''',
+                      ('read-agent',self.scope,'query-agent',str(self.workspace),'idle','session','{}',0,0))
+        ids=[f'read-run-{i}' for i in range(20)]
+        for i,rid in enumerate(ids):
+            store.execute('INSERT INTO runs(id,agent_id,scope,state,task,created) VALUES(?,?,?,?,?,?)',
+                          (rid,'read-agent',self.scope,'running','query',i))
+            store.finish(rid,'completed',f'answer {i}')
+        selects=[]
+        store.db.set_trace_callback(lambda sql: selects.append(sql) if sql.lstrip().upper().startswith('SELECT') else None)
+        try:
+            listing=reader.outstanding(self.scope)
+            list_reads=len(selects); selects.clear()
+            waited=await reader.wait({'scope':self.scope,'run_ids':list(reversed(ids)),
+                                             'mode':'all','timeout_seconds':0})
+            wait_reads=len(selects)
+        finally:
+            store.db.set_trace_callback(None)
+        self.assertLessEqual(list_reads,5)
+        self.assertLessEqual(wait_reads,6)
+        self.assertEqual([r['id'] for r in waited['runs']],list(reversed(ids)))
+        self.assertEqual({r['name'] for r in listing['runs']},{'query-agent'})
+        self.assertFalse(waited['timed_out'])
+
     async def test_legacy_mutation_digest_still_replays_without_spawning_again(self):
         p={'scope':self.scope,'request_id':'old-digest','cwd':str(self.workspace),'task':'simple','access':'read'}
         created=await self.rt.dispatch('spawn',p)
@@ -555,18 +583,18 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             if w is old:
                 reached.set(); await release.wait()
             await original(w,code)
-        with m.patch.object(self.rt,'worker_exited',side_effect=delayed):
-            try:
-                await self.mutation('close',run['agent_id'])
-                await asyncio.wait_for(reached.wait(),3)
-                revived=await self.mutation('respawn',run['agent_id'],message='delay=0.3|replacement')
-                new=self.rt.workers[run['agent_id']]
-                exit_task=old.tasks[2]; release.set()
-                await asyncio.wait_for(exit_task,3)
-                await self.wait(revived['run_id'])
-                self.assertIs(self.rt.workers[run['agent_id']],new)
-                self.assertEqual((await self.result(revived['run_id']))['text'],'Completed: replacement')
-            finally: release.set()
+        old.on_exit=delayed
+        try:
+            await self.mutation('close',run['agent_id'])
+            await asyncio.wait_for(reached.wait(),3)
+            revived=await self.mutation('respawn',run['agent_id'],message='delay=0.3|replacement')
+            new=self.rt.workers[run['agent_id']]
+            exit_task=old.tasks[2]; release.set()
+            await asyncio.wait_for(exit_task,3)
+            await self.wait(revived['run_id'])
+            self.assertIs(self.rt.workers[run['agent_id']],new)
+            self.assertEqual((await self.result(revived['run_id']))['text'],'Completed: replacement')
+        finally: release.set()
 
     async def test_lock_waiters_keep_one_identity_and_idle_locks_are_reclaimed(self):
         for locks in (self.rt.agent_locks,self.rt.request_locks):
@@ -688,7 +716,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.rt.config['event_max_count_per_agent']=100
         agent=self.rt.store.agent(self.scope,s['agent_id'])
         for generation in range(30):
-            current=worker.Worker(self.rt,{**agent,'generation':agent['generation']+generation+1},None)
+            current=self.rt.make_worker({**agent,'generation':agent['generation']+generation+1},None)
             for event in range(10): self.rt.event(current,'synthetic',{'event':event})
         count=self.rt.store.one('SELECT count(*) AS n FROM events WHERE agent_id=?',(s['agent_id'],))['n']
         self.assertLessEqual(count,109)
@@ -863,6 +891,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.rt.config['pi_command']=['/definitely/missing/pi']
         with self.assertRaises(AgentError) as cm: await self.spawn()
         self.assertEqual(cm.exception.code,'pi_not_found')
+    async def test_failed_worker_registration_only_stops_its_verified_guard(self):
+        with m.patch.object(self.rt,'make_worker',side_effect=RuntimeError('registration refused')):
+            with self.assertRaisesRegex(RuntimeError,'registration refused'):
+                await self.spawn()
+        agent=self.rt.store.one('SELECT * FROM agents WHERE scope=?',(self.scope,))
+        self.assertEqual(agent['cleanup'],'verified')
+        self.assertFalse(group_members(agent['pid']))
+        self.assertNotIn(agent['id'],self.rt.workers)
+    async def test_unverified_boot_process_group_is_never_signalled(self):
+        with m.patch('subagent_pi.worker.live_identity',return_value=None), \
+             m.patch('subagent_pi.worker.ownership',return_value={'status':'unknown'}), \
+             m.patch('subagent_pi.worker.group_members',return_value=[123]), \
+             m.patch('subagent_pi.worker.stop_group') as stop:
+            self.assertEqual(await worker.stop_owned_process(self.home,{'identity':'old'},m.Mock(pid=123)),
+                             ('unknown',False))
+            stop.assert_not_called()
     async def test_schema_validation(self):
         with self.assertRaises(AgentError): validate_op('spawn',{'scope':self.scope,'task':'x'})
         with self.assertRaises(AgentError): validate_op('list',{'scope':self.scope,'limit':True})
@@ -941,7 +985,7 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
         # the receipt channel.
         with m.patch('os.pipe',self.recording_pipe):
             real_terminate=worker.terminate
-            async def parked_terminate(rt,w):
+            async def parked_terminate(directory,w):
                 target=self.pipes[1][0]  # receipt read end
                 # Ordering evidence: read_receipt's transport already closed it.
                 for _ in range(200):
@@ -957,8 +1001,8 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
                     if b.fileno()==target: self.pair=(b,a); break
                     self.spares.append((a,b))
                 self.assertIsNotNone(self.pair,'could not reoccupy receipt fd %d'%target)
-                await real_terminate(rt,w)
-            with m.patch.object(worker,'terminate',parked_terminate):
+                return await real_terminate(directory,w)
+            with m.patch('subagent_pi.runtime.terminate',parked_terminate):
                 with self.assertRaises(AgentError) as cm:
                     await self.rt.dispatch('spawn',{'scope':self.scope,'request_id':'fd-reuse','cwd':str(self.workspace),'task':'simple','access':'read'})
         self.assertEqual(cm.exception.code,'inheritance_required_server_failed')
@@ -974,7 +1018,7 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
         r,w=os.pipe()
         try:
             with self.assertRaises(AgentError) as cm:
-                await read_receipt(self.rt,r,'a',1,0.05)
+                await read_receipt(r,'a',1,0.05)
             self.assertEqual(cm.exception.code,'bridge_unavailable')
             for _ in range(10): await asyncio.sleep(0)  # transport close is loop-scheduled
             with self.assertRaises(OSError): os.fstat(r)  # closed exactly once
@@ -983,7 +1027,7 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
     async def test_read_receipt_closes_fd_on_cancellation(self):
         r,w=os.pipe()
         try:
-            t=asyncio.create_task(read_receipt(self.rt,r,'a',1,5))
+            t=asyncio.create_task(read_receipt(r,'a',1,5))
             await asyncio.sleep(0.05); t.cancel()
             with self.assertRaises(asyncio.CancelledError): await t
             for _ in range(10): await asyncio.sleep(0)
@@ -996,35 +1040,35 @@ class ReceiptFdOwnership(unittest.IsolatedAsyncioTestCase):
             loop=asyncio.get_running_loop()
             with m.patch.object(loop,'connect_read_pipe',side_effect=OSError('transport refused')):
                 with self.assertRaises(OSError):
-                    await read_receipt(self.rt,r,'a',1,1)
+                    await read_receipt(r,'a',1,1)
             with self.assertRaises(OSError): os.fstat(r)
         finally: os.close(w)
+
+def seed_owner_row(owner=None, *, pid=None, identity=None, state='running', cleanup='pending'):
+    """Seed one old worker ledger row and its optional guard owner record."""
+    tmp=tempfile.TemporaryDirectory(prefix='restart-owner-')
+    home=Path(tmp.name)/'state'; home.mkdir()
+    ws=Path(tmp.name)/'ws'; ws.mkdir()
+    (home/'config.toml').write_text('[inheritance]\nenabled = false\n')
+    directory=home/'agents'/'pi_seed'; (directory/'sessions').mkdir(parents=True)
+    (directory/'session.jsonl').write_text('{}\n')
+    if owner is not None: (directory/'owner.json').write_text(json.dumps(owner))
+    store=Store(home)
+    store.execute('INSERT INTO scopes(id,cwd,label,created) VALUES(?,?,?,?)',('s1',str(ws),'t',1.0))
+    store.execute('INSERT INTO agents(id,scope,name,cwd,state,session_file,launch,created,updated,pid,identity,cleanup) '
+                  'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+        ('pi_seed','s1','pi_seed',str(ws),state,str(directory/'session.jsonl'),
+         json.dumps({'argv':['x'],'cwd':str(ws),'access':'read'}),1.0,1.0,pid,identity,cleanup))
+    store.close()
+    return tmp, home
 
 class RestartOwnershipVerdict(unittest.TestCase):
     """A ledger row whose owner record never landed must not be reported as a
     verified cleanup while a live process may still hold the session."""
-    def seed(self, state='running', pid=None, identity=None, write_owner=False):
-        tmp=tempfile.TemporaryDirectory(prefix='restart-owner-')
-        home=Path(tmp.name)/'state'; home.mkdir()
-        ws=Path(tmp.name)/'ws'; ws.mkdir()
-        (home/'config.toml').write_text('[inheritance]\nenabled = false\n')
-        directory=home/'agents'/'pi_seed'; (directory/'sessions').mkdir(parents=True)
-        (directory/'session.jsonl').write_text('{}\n')
-        if write_owner:
-            (directory/'owner.json').write_text(json.dumps({'guard_pid':pid,'guard_identity':identity,'spawning':False}))
-        store=Store(home)
-        store.execute('INSERT INTO scopes(id,cwd,label,created) VALUES(?,?,?,?)',('s1',str(ws),'t',1.0))
-        store.execute('INSERT INTO agents(id,scope,name,cwd,state,session_file,launch,created,updated,pid,identity,cleanup) '
-                      'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-            ('pi_seed','s1','pi_seed',str(ws),state,str(directory/'session.jsonl'),
-             json.dumps({'argv':['x'],'cwd':str(ws),'access':'read'}),1.0,1.0,pid,identity,'pending'))
-        store.close()
-        return tmp, home
-
     def test_live_pid_without_owner_record_is_orphaned_not_verified(self):
         alive=subprocess.Popen(['sleep','60'])
         try:
-            tmp,home=self.seed(pid=alive.pid,identity=process_identity(alive.pid))
+            tmp,home=seed_owner_row(pid=alive.pid,identity=process_identity(alive.pid))
             rt=Runtime(home)
             row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
             self.assertNotEqual(row['cleanup'],'verified',
@@ -1034,14 +1078,14 @@ class RestartOwnershipVerdict(unittest.TestCase):
             alive.kill(); alive.wait(); tmp.cleanup()
 
     def test_dead_pid_without_owner_record_may_be_verified(self):
-        tmp,home=self.seed(pid=999999,identity='boot:gone')
+        tmp,home=seed_owner_row(pid=999999,identity='boot:gone')
         rt=Runtime(home)
         row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
         self.assertEqual(row['cleanup'],'verified')
         tmp.cleanup()
 
     def test_unreadable_owner_record_is_never_verified(self):
-        tmp,home=self.seed(pid=999999,identity='boot:gone',write_owner=False)
+        tmp,home=seed_owner_row(pid=999999,identity='boot:gone')
         (home/'agents'/'pi_seed'/'owner.json').write_text('{not json')
         rt=Runtime(home)
         row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
@@ -1051,7 +1095,7 @@ class RestartOwnershipVerdict(unittest.TestCase):
     def test_never_launched_row_is_verified_not_a_phantom_orphan(self):
         # cleanup='verified' means no child was ever marked pending: there is no
         # owner record to expect, so the row must not stay unresolvable forever.
-        tmp,home=self.seed(pid=None,identity=None)
+        tmp,home=seed_owner_row(pid=None,identity=None)
         store=Store(home); store.agent_update('pi_seed',cleanup='verified'); store.close()
         rt=Runtime(home)
         row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
@@ -1061,7 +1105,7 @@ class RestartOwnershipVerdict(unittest.TestCase):
     def test_pending_launch_without_owner_record_stays_unknown(self):
         # cleanup='pending' is set before the fork, so a missing record cannot
         # prove the child never started.
-        tmp,home=self.seed(pid=None,identity=None)
+        tmp,home=seed_owner_row(pid=None,identity=None)
         store=Store(home); store.agent_update('pi_seed',cleanup='pending'); store.close()
         rt=Runtime(home)
         row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
@@ -1072,41 +1116,23 @@ class ReconcileAndReapAgree(unittest.TestCase):
     """Crash reconciliation and orphan reaping must reach the same verdict on the
     same owner record: a divergence would let `close` reap a session the restart
     path called unknown, or leave a row unresolvable after a clean shutdown."""
-    def seed(self, owner, pid=None, identity=None, state='running', cleanup='pending'):
-        tmp=tempfile.TemporaryDirectory(prefix='owner-agree-')
-        home=Path(tmp.name)/'state'; home.mkdir()
-        ws=Path(tmp.name)/'ws'; ws.mkdir()
-        (home/'config.toml').write_text('[inheritance]\nenabled = false\n')
-        directory=home/'agents'/'pi_seed'; (directory/'sessions').mkdir(parents=True)
-        (directory/'session.jsonl').write_text('{}\n')
-        if owner is not None:
-            (directory/'owner.json').write_text(json.dumps(owner))
-        store=Store(home)
-        store.execute('INSERT INTO scopes(id,cwd,label,created) VALUES(?,?,?,?)',('s1',str(ws),'t',1.0))
-        store.execute('INSERT INTO agents(id,scope,name,cwd,state,session_file,launch,created,updated,pid,identity,cleanup) '
-                      'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-            ('pi_seed','s1','pi_seed',str(ws),state,str(directory/'session.jsonl'),
-             json.dumps({'argv':['x'],'cwd':str(ws),'access':'read'}),1.0,1.0,pid,identity,cleanup))
-        store.close()
-        return tmp, home
-
     def test_both_paths_refuse_an_unverifiable_owner(self):
-        tmp,home=self.seed({'guard_pid':4081,'guard_identity':'boot:stale','spawning':True})
+        tmp,home=seed_owner_row({'guard_pid':4081,'guard_identity':'boot:stale','spawning':True})
         rt=Runtime(home)
         row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
         self.assertEqual(row['cleanup'],'unknown')
         with self.assertRaises(AgentError) as cm:
-            asyncio.run(worker.reap_orphan(rt,rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))))
+            asyncio.run(worker.reap_orphan(home/'agents'/'pi_seed',rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))))
         self.assertEqual(cm.exception.code,'ownership_unknown')
         tmp.cleanup()
 
     def test_both_paths_clear_a_verified_gone_owner(self):
-        tmp,home=self.seed({'guard_pid':999999,'guard_identity':'boot:gone',
+        tmp,home=seed_owner_row({'guard_pid':999999,'guard_identity':'boot:gone',
                             'pi_pid':999998,'pi_identity':'boot:gone','spawning':False})
         rt=Runtime(home)
         row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
         self.assertEqual((row['state'],row['cleanup']),('dormant','verified'))
-        verdict=asyncio.run(worker.reap_orphan(rt,rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))))
+        verdict=asyncio.run(worker.reap_orphan(home/'agents'/'pi_seed',rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))))
         self.assertEqual(verdict,'verified')
         tmp.cleanup()
 

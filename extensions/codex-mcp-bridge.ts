@@ -173,12 +173,12 @@ export default async function (pi: ExtensionAPI) {
     if (params.action === "list") {
       // level 2: connect THIS server on demand; visibility rules apply here, not just at call time
       const conn = await ensureConnection(cfg);
-      const tools = await conn.ensureTools(signal);
+      const { tools, truncated: catalogTruncated } = await conn.ensureTools(signal);
       // An invalid x-mcp-header annotation excludes just that tool; the server and
       // its other tools stay usable.
       const visible = tools.filter((t) => toolVisible(cfg, t) && t.headerPlan.ok);
       const entries = visible.map((t) => ({ name: t.name, description: t.description ?? "", read_only: t.readOnly }));
-      let truncated = conn.catalogTruncated || visible.length !== tools.length;
+      let truncated = catalogTruncated || visible.length !== tools.length;
       let size = JSON.stringify({ server: serverName, tools: entries, truncated }).length;
       while (size > MAX_RESULT_TEXT && entries.length) {
         // Account once per removed entry instead of serializing the whole catalog again.
@@ -193,10 +193,10 @@ export default async function (pi: ExtensionAPI) {
       throw new Error(`Tool ${serverName}.${toolName} is excluded by the inherited server policy`);
     }
     const conn = await ensureConnection(cfg);
-    let tools = await conn.ensureTools(signal);
+    let { tools } = await conn.ensureTools(signal);
     let toolMeta = tools.find((t) => t.name === toolName);
     if (!toolMeta) {
-      tools = await conn.ensureTools(signal); // cache may be stale after list_changed
+      ({ tools } = await conn.ensureTools(signal)); // cache may be stale after list_changed
       toolMeta = tools.find((t) => t.name === toolName);
       if (!toolMeta) throw new Error(`Tool ${toolName} is not offered by ${serverName}; use action=list with server=${serverName} to discover tools`);
     }

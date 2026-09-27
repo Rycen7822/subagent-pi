@@ -46,6 +46,13 @@ def parse_surface(text: str) -> dict:
 BRIDGE=ROOT/'extensions'/'codex-mcp-bridge.ts'
 SURFACE=ROOT/'extensions'/'managed-surface.ts'
 FAKE_PI=ROOT/'tests'/'fake_pi.py'
+ECHO_SERVER_SOURCE = '''import sys,json
+for line in sys.stdin:
+    request=json.loads(line)
+    if "id" in request:
+        result={"tools":[{"name":"echo","description":"t"}]} if request.get("method")=="tools/list" else {}
+        print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}),flush=True)
+'''
 
 def make_skill(base: Path, name: str, body='Body.', front_name=None):
     d=base/name
@@ -71,33 +78,23 @@ class SourceResolution(unittest.TestCase):
         return {'enabled':True,'skills':True,'mcp':True,'codex_home':str(home) if home else None}
     def test_explicit_wins_over_env_and_default(self):
         a=make_codex_home(self.base/'a'); b=make_codex_home(self.base/'b')
-        self.assertEqual(resolve_codex_home(self.config(a),{'CODEX_HOME':str(b)})[1],'explicit')
-        self.assertEqual(resolve_codex_home(self.config(a),{'CODEX_HOME':str(b)})[0],a)
+        self.assertEqual(resolve_codex_home(self.config(a),{'CODEX_HOME':str(b)}),(a,'explicit'))
     def test_scope_env_before_default(self):
         b=make_codex_home(self.base/'b')
         home,mode=resolve_codex_home(self.config(None),{'CODEX_HOME':str(b)})
         self.assertEqual((home,mode),(b,'scope_env'))
     def test_user_default_uses_home_env(self):
-        c=make_codex_home(self.base/'c')
-        old=os.environ.get('HOME')
-        os.environ['HOME']=str(self.base/'c')  # -> base/c/.codex
-        try:
+        make_codex_home(self.base/'c')
+        with mock.patch.dict(os.environ,{'HOME':str(self.base/'c')}):
             (self.base/'c'/'.codex').mkdir()
             home,mode=resolve_codex_home(self.config(None),{})
             self.assertEqual((mode,home.name),('user_default','.codex'))
-        finally:
-            if old is not None: os.environ['HOME']=old
     def test_missing_source_returns_none(self):
-        old=os.environ.get('HOME')
-        os.environ['HOME']=str(self.base/'nonexistent-home')
-        try:
+        with mock.patch.dict(os.environ,{'HOME':str(self.base/'nonexistent-home')}):
             home,mode=resolve_codex_home(self.config(None),{})
             self.assertIsNone(home)
-        finally:
-            if old is not None: os.environ['HOME']=old
     def test_nonexistent_explicit_dir_is_an_error(self):
-        # 4.1: a configured source that is missing must not silently fall back to
-        # another candidate directory.
+        # A missing explicit source must not silently fall back to the valid env source.
         make_codex_home(self.base/'b')
         with self.assertRaises(AgentError) as cm:
             resolve_codex_home(self.config(self.base/'missing'),{'CODEX_HOME':str(self.base/'b')})
@@ -501,7 +498,7 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         row=self.rt.store.scope(self.scope)
         self.assertEqual(row['codex_home'],str(self.codex))
         self.assertEqual(row['codex_source'],'scope_env')
-        self.assertEqual(self.rt.scope_env[self.scope]['SECRET_CANARY'],'canary-值-2026')
+        self.assertEqual(self.rt.bindings.scope_env[self.scope]['SECRET_CANARY'],'canary-值-2026')
     def snapshot(self,root: Path):
         return {str(p.relative_to(root)):p.stat().st_size for p in root.rglob('*') if p.is_file()}
     async def test_boot_writes_skills_and_marker_without_disk_config(self):
@@ -732,46 +729,38 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
     async def test_bootstrap_write_failure_recorded_without_payload(self):
         r,w=os.pipe()
         os.close(r)
-        await write_bootstrap(self.rt,w,'pi_none',9,b'{"mcp":{"servers":[]}}')
+        await self.rt.record_bootstrap_write(w,'pi_none',9,b'{"mcp":{"servers":[]}}')
         row=self.rt.store.one("SELECT payload FROM events WHERE type='bootstrap_write_failed' ORDER BY seq DESC LIMIT 1")
         self.assertIsNotNone(row)
         self.assertEqual(json.loads(row['payload'])['error'],'BrokenPipeError')
 
 class StoreMigration(unittest.TestCase):
-    def test_v1_database_upgrades_transactionally(self):
-        tmp=tempfile.TemporaryDirectory(prefix='inh-mig-'); base=Path(tmp.name)
-        db=sqlite3.connect(base/'registry.sqlite')
-        db.executescript('''
-        CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
-        CREATE TABLE runs(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,task TEXT NOT NULL,created REAL NOT NULL,started REAL,ended REAL,deadline REAL,result_path TEXT,result_sha TEXT,ack INTEGER NOT NULL DEFAULT 0,error TEXT,usage TEXT NOT NULL DEFAULT '{}');
-        CREATE TABLE scopes(id TEXT PRIMARY KEY,cwd TEXT NOT NULL,label TEXT NOT NULL,created REAL NOT NULL,revision INTEGER NOT NULL DEFAULT 0);
-        INSERT INTO meta VALUES('schema','1');
-        INSERT INTO scopes(id,cwd,label,created) VALUES('scope_x','/tmp','old',1);
-        '''); db.commit(); db.close()
-        store=Store(base)
-        cols={r['name'] for r in store.all("PRAGMA table_info(scopes)")}
-        self.assertIn('codex_home',cols); self.assertIn('inheritance',cols); self.assertIn('base_env',cols)
-        self.assertEqual(store.one("SELECT value FROM meta WHERE key='schema'")['value'],str(SCHEMA_VERSION))
-        self.assertEqual(store.scope('scope_x')['inheritance'],1)
-        store.close(); tmp.cleanup()
-    def test_v2_database_upgrades_to_current(self):
-        # A ledger written by 0.2.7 (schema 2) must reach the current version too.
-        tmp=tempfile.TemporaryDirectory(prefix='inh-mig2-'); base=Path(tmp.name)
-        db=sqlite3.connect(base/'registry.sqlite')
-        db.executescript('''
-        CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
-        CREATE TABLE runs(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,task TEXT NOT NULL,created REAL NOT NULL,started REAL,ended REAL,deadline REAL,result_path TEXT,result_sha TEXT,ack INTEGER NOT NULL DEFAULT 0,error TEXT,usage TEXT NOT NULL DEFAULT '{}');
-        CREATE TABLE scopes(id TEXT PRIMARY KEY,cwd TEXT NOT NULL,label TEXT NOT NULL,created REAL NOT NULL,revision INTEGER NOT NULL DEFAULT 0,
-            codex_home TEXT,codex_source TEXT,inheritance INTEGER NOT NULL DEFAULT 1);
-        INSERT INTO meta VALUES('schema','2');
-        INSERT INTO scopes(id,cwd,label,created,codex_source) VALUES('scope_y','/tmp','v2',1,'scope_env');
-        '''); db.commit(); db.close()
-        store=Store(base)
-        cols={r['name'] for r in store.all("PRAGMA table_info(scopes)")}
-        self.assertIn('base_env',cols)
-        self.assertEqual(store.one("SELECT value FROM meta WHERE key='schema'")['value'],str(SCHEMA_VERSION))
-        self.assertEqual(store.scope('scope_y')['codex_source'],'scope_env')  # data preserved
-        store.close(); tmp.cleanup()
+    def test_v1_and_v2_databases_upgrade_without_losing_scope_data(self):
+        # Schema 2 was written by 0.2.7; both old shapes must reach the current ledger.
+        for version in (1, 2):
+            with self.subTest(version=version), tempfile.TemporaryDirectory(prefix='inh-mig-') as path:
+                base=Path(path)
+                old_columns=',codex_home TEXT,codex_source TEXT,inheritance INTEGER NOT NULL DEFAULT 1' if version==2 else ''
+                db=sqlite3.connect(base/'registry.sqlite')
+                db.executescript(f'''
+                CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
+                CREATE TABLE runs(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,task TEXT NOT NULL,created REAL NOT NULL,started REAL,ended REAL,deadline REAL,result_path TEXT,result_sha TEXT,ack INTEGER NOT NULL DEFAULT 0,error TEXT,usage TEXT NOT NULL DEFAULT '{{}}');
+                CREATE TABLE scopes(id TEXT PRIMARY KEY,cwd TEXT NOT NULL,label TEXT NOT NULL,created REAL NOT NULL,revision INTEGER NOT NULL DEFAULT 0{old_columns});
+                INSERT INTO meta VALUES('schema','{version}');
+                INSERT INTO scopes(id,cwd,label,created) VALUES('scope_x','/tmp','old',1);
+                ''')
+                if version==2: db.execute("UPDATE scopes SET codex_source='scope_env' WHERE id='scope_x'")
+                db.commit(); db.close()
+                store=Store(base)
+                cols={r['name'] for r in store.all('PRAGMA table_info(scopes)')}
+                self.assertIn('base_env',cols)
+                self.assertEqual(store.one("SELECT value FROM meta WHERE key='schema'")['value'],str(SCHEMA_VERSION))
+                scope=store.scope('scope_x')
+                if version==1:
+                    self.assertIn('codex_home',cols); self.assertIn('inheritance',cols)
+                    self.assertEqual(scope['inheritance'],1)
+                else: self.assertEqual(scope['codex_source'],'scope_env')
+                store.close()
     def test_future_schema_is_refused(self):
         tmp=tempfile.TemporaryDirectory(prefix='inh-mig3-'); base=Path(tmp.name)
         db=sqlite3.connect(base/'registry.sqlite')
@@ -796,14 +785,7 @@ class RealPiBridge(unittest.IsolatedAsyncioTestCase):
         self.root=Path(self.tmp.name); self.home=self.root/'state'; self.home.mkdir()
         self.workspace=self.root/'workspace'; self.workspace.mkdir()
         self.codex=make_codex_home(self.root/'src')
-        (self.root/'srv.py').write_text(
-            'import sys,json\n'
-            'for line in sys.stdin:\n'
-            '    r=json.loads(line)\n'
-            '    if "id" in r and r.get("method")=="tools/list":\n'
-            '        print(json.dumps({"jsonrpc":"2.0","id":r["id"],"result":{"tools":[{"name":"echo","description":"t"}]}}),flush=True)\n'
-            '    elif "id" in r:\n'
-            '        print(json.dumps({"jsonrpc":"2.0","id":r["id"],"result":{}}),flush=True)\n')
+        (self.root/'srv.py').write_text(ECHO_SERVER_SOURCE)
         (self.codex/'config.toml').write_text(
             '[mcp_servers.echosrv]\ncommand = "python3"\nargs = ["../srv.py"]\n'.replace('../srv.py',str(self.root/'srv.py')))
         (self.home/'config.toml').write_text('pi_command = ["pi"]\nrpc_timeout_seconds = 15\nstartup_timeout_seconds = 40\n')
@@ -860,14 +842,7 @@ class RealPiSkillBoundary(unittest.IsolatedAsyncioTestCase):
         make_skill(self.codex/'skills','dup',body='Codex version of the duplicate.')
         make_skill(self.codex/'skills','codex-only')
         make_skill(self.workspace/'.agents'/'skills','projskill')
-        (self.root/'srv.py').write_text(
-            'import sys,json\n'
-            'for line in sys.stdin:\n'
-            '    r=json.loads(line)\n'
-            '    if "id" in r and r.get("method")=="tools/list":\n'
-            '        print(json.dumps({"jsonrpc":"2.0","id":r["id"],"result":{"tools":[{"name":"echo","description":"t"}]}}),flush=True)\n'
-            '    elif "id" in r:\n'
-            '        print(json.dumps({"jsonrpc":"2.0","id":r["id"],"result":{}}),flush=True)\n')
+        (self.root/'srv.py').write_text(ECHO_SERVER_SOURCE)
         (self.codex/'config.toml').write_text(
             '[mcp_servers.echosrv]\ncommand = "python3"\nargs = ["%s"]\n' % (self.root/'srv.py'))
         (self.home/'config.toml').write_text(

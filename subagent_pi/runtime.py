@@ -12,15 +12,15 @@ import shutil
 import sys
 import time
 
-from . import __version__, PROTOCOL_VERSION, views
-from .binding import bind_scope_source, doctor
+from . import __version__, PROTOCOL_VERSION, views, worker
+from .binding import ScopeBindings
 from .common import (TERMINAL, AgentError, RESIDENT_AGENT_STATES, bounded, crop,
-    dumps, group_members, identifier, integer, new_id, now, text)
+    dumps, group_members, identifier, integer, new_id, now, process_identity, text)
 from .config import load_config, launch_spec
 from . import parent
 from .store import Store
-from .worker import (RESULT_CAP, boot_worker, message_text, ownership,
-    reap_orphan, terminate)
+from .worker import (RESULT_CAP, Worker, message_text, ownership,
+    reap_orphan, terminate, write_bootstrap)
 
 def delegated_text(value: str, envelope: str) -> str:
     """A delegated task is data, never a Pi extension command: text that would be
@@ -42,16 +42,16 @@ class Runtime:
         self.store = Store(home)
         self.config = load_config(home)
         self.workers = {}
-        self.scope_env = {}  # bound snapshots; secret values live here and nowhere else
+        self.bindings = ScopeBindings(self.store, self.config)
         self.agent_locks = LockPool()
         self.request_locks = LockPool()
         self.admission = asyncio.Lock()
         self.changed = asyncio.Condition()
+        self.views = views.ReadViews(self.store, self.workers.get, self.changed, self.config['max_wait_seconds'])
         self.shutdown_requested = asyncio.Event()
         self.closing = False
         self.background = set()
-        self.parent_waits = {}
-        self.parent_deliveries = {}
+        self.parent_notifications = parent.ParentNotifications(self.store,self.spawn_task,self.workers.get)
         self._reconcile()
 
     def spawn_task(self,coro):
@@ -62,6 +62,115 @@ class Runtime:
             if not t.cancelled() and t.exception(): print('runtime task: '+str(t.exception()),file=sys.stderr)
         t.add_done_callback(done)
         return t
+
+    def make_worker(self, agent, proc):
+        return Worker(agent,proc,self.home/'agents'/agent['id']/'stderr.log',
+                      self.config['rpc_timeout_seconds'],self.config['default_idle_timeout_seconds'],
+                      self.spawn_task,self.on_event,self.fail_worker,self.worker_exited,self.retire_worker)
+
+    def retire_worker(self, w):
+        if self.workers.get(w.agent['id']) is w:
+            del self.workers[w.agent['id']]
+
+    async def record_bootstrap_write(self, fd, aid, generation, body):
+        status=await write_bootstrap(fd,body)
+        if status=='broken': self.store.event(aid,None,generation,'bootstrap_write_failed',{'error':'BrokenPipeError'})
+        elif status=='timeout': self.store.event(aid,None,generation,'bootstrap_write_timeout',{})
+
+    async def terminate_worker(self, w):
+        cleanup=await terminate(self.home/'agents'/w.agent['id'],w)
+        self.store.agent_update(w.agent['id'],cleanup=cleanup)
+        return cleanup
+
+    async def _boot_worker(self, a):
+        """Own the generation and ledger transitions; worker owns process pipes."""
+        aid=a['id']
+        if sum(not w.closed for w in self.workers.values()) >= self.config['max_resident_agents']:
+            raise AgentError('capacity_exceeded','Resident Pi limit reached; close an idle agent first')
+        spec=json.loads(a['launch'])
+        if spec.get('access')=='write': self.assert_writer_exclusive(aid,a['cwd'])
+        directory,session,argv=worker.session_argv(self.home,a,spec)
+        generation=a['generation']+1
+        first_launch=not a['generation']
+        plan=self.bindings.inheritance_plan(a,spec,generation)
+        worker.write_launch(directory,spec,[*argv,*plan['argv']],generation)
+        if plan['diagnostics']:
+            self.store.event(aid,None,generation,'inheritance_diagnostics',
+                bounded({'source':plan.get('source'),'servers':plan['servers'],'diagnostics':plan['diagnostics']},4096))
+        body=worker.bootstrap_body(plan['payload'])
+        guard_env=self.bindings.child_env(a['scope'],spec)
+        guard_env['PI_AGENTS_SCOPE_CWD']=self.store.scope(a['scope'])['cwd']
+        if spec.get('surface'):
+            guard_env['PI_AGENTS_CHILD_BUILTINS']=','.join(spec.get('builtins',[]))
+        proc=w=write_fd=receipt_fd=None
+        try:
+            proc,write_fd,receipt_fd=await worker.start_guard(directory,spec,guard_env,body,
+                lambda:self.store.agent_update(aid,state='starting',generation=generation,cleanup='pending'))
+            self.store.agent_update(aid,pid=proc.pid,identity=process_identity(proc.pid))
+            w=self.make_worker(self.store.agent(a['scope'],aid),proc)
+            self.workers[aid]=w
+            w.start()
+            if write_fd is not None:
+                self.spawn_task(self.record_bootstrap_write(write_fd,aid,generation,body))
+                write_fd=None  # writer thread owns and closes this end
+            state=await w.rpc('get_state',timeout=self.config['startup_timeout_seconds'])
+            if state.get('configurationError'):
+                raise AgentError('unsupported_thinking',state['configurationError'])
+            actual=state.get('sessionFile')
+            if not actual or not Path(actual).is_absolute():
+                raise AgentError('session_mismatch','Pi did not report an absolute persistent session path')
+            actual_path=Path(actual).resolve()
+            if first_launch:
+                if not actual_path.is_relative_to((directory/'sessions').resolve()):
+                    raise AgentError('session_mismatch','Pi session escaped its managed session directory')
+                self.store.agent_update(aid,session_file=str(actual_path))
+            elif actual_path!=session.resolve():
+                raise AgentError('session_mismatch','Pi did not select the managed session path')
+            if state.get('isStreaming'):
+                raise AgentError('unexpected_activity','Pi started a model turn without an explicit task')
+            if state.get('subagentProtocol') != 1:
+                raise AgentError('unsupported_transport',
+                    'The child must use subagent-pi SDK transport; stock Pi RPC and host patches are not supported')
+            try: await asyncio.wait_for(w.context_ready.wait(),worker.SURFACE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                raise AgentError('context_unavailable',
+                    'Managed Pi did not load its context extension; inspect the agent stderr log') from None
+            if spec.get('surface'):
+                report=await worker.surface_report(w)
+                self.store.event(aid,None,generation,'tool_surface',bounded(report if report is not None else {'ok':False,'reason':'no-report'},2048))
+                worker.check_surface(report)
+            if receipt_fd is not None:
+                fd,receipt_fd=receipt_fd,None  # read_receipt owns and closes the fd
+                receipt=await worker.read_receipt(fd,aid,generation,min(self.config['startup_timeout_seconds'],20))
+                self.store.event(aid,None,generation,'bridge_receipt',bounded(receipt,4096))
+                worker.check_receipt(receipt)
+            if plan['skills']:
+                self.store.event(aid,None,generation,'inheritance_skills',await worker.resolve_skills(w,plan))
+            if isinstance(state.get('thinking'),str):
+                if '--thinking' not in spec['argv']: spec['argv'] += ['--thinking',state['thinking']]
+                spec['thinking']=state['thinking']
+                spec['available_thinking']=state.get('availableThinking',[])
+            resolved_model=state.get('model')
+            if isinstance(resolved_model,dict) and resolved_model.get('id'):
+                if '--model' not in spec['argv']: spec['argv'] += ['--model',resolved_model['id']]
+                if '--provider' not in spec['argv'] and resolved_model.get('provider'):
+                    spec['argv'] += ['--provider',resolved_model['provider']]
+                spec['resolved_model']={'id':resolved_model['id'],'provider':resolved_model.get('provider')}
+                self.store.agent_update(aid,launch=dumps(spec))
+            self.store.agent_update(aid,state='idle',cleanup='not_checked')
+            self.event(w,'worker_ready',{'pi_session_id':state.get('sessionId'),'model':bounded(state.get('model'),1000)})
+            return w
+        except BaseException:
+            if w:
+                w.stopping=True
+                await self.terminate_worker(w)
+            elif proc:
+                cleanup,_=await worker.stop_owned_process(directory,self.store.agent(a['scope'],aid),proc)
+                self.store.agent_update(aid,cleanup=cleanup)
+            raise
+        finally:
+            worker.close_quietly(write_fd)
+            worker.close_quietly(receipt_fd)
 
     def _reconcile(self):
         """A new daemon cannot recover old pipes; never claim a live orphan is
@@ -85,7 +194,7 @@ class Runtime:
         async def wake():
             async with self.changed: self.changed.notify_all()
         self.spawn_task(wake())
-        parent.schedule(self)
+        self.parent_notifications.schedule()
 
     def event(self,w,kind,payload):
         self.store.event(w.agent['id'],w.run_id,w.generation,kind,bounded(payload,4096))
@@ -96,9 +205,12 @@ class Runtime:
             self.store.execute('DELETE FROM events WHERE agent_id=? AND seq < COALESCE((SELECT seq FROM events WHERE agent_id=? ORDER BY seq DESC LIMIT 1 OFFSET ?),0)',(w.agent['id'],w.agent['id'],cap-1))
 
     def on_event(self,w,e):
+        kind = e.get('type','unknown')
+        if kind in {'protocol_warning','protocol_error'}:
+            self.event(w,kind,{'message':e['message']})
+            return
         a = self.store.one('SELECT * FROM agents WHERE id=?',(w.agent['id'],))
         if not a or a['generation'] != w.generation: return
-        kind = e.get('type','unknown')
         w.last_activity = now()
         if kind == 'agent_start':
             # Defense against activity outside the managed SDK task queue.
@@ -297,7 +409,7 @@ class Runtime:
             a=self.store.one('SELECT * FROM agents WHERE id=?',(w.agent['id'],))
             if not a or a['generation']!=w.generation or w.closed: return
             self.cancel_queued(a['id'],'Worker stopped after unowned activity; queued task was not retried')
-            cleanup=await terminate(self,w)
+            cleanup=await self.terminate_worker(w)
             self.store.agent_update(a['id'],state='dormant',current_run=None,cleanup=cleanup)
             self.event(w,'worker_stopped',{'reason':'unowned_run','cleanup':cleanup})
             self.store.bump(a['scope']); self.notify()
@@ -313,7 +425,7 @@ class Runtime:
             self.cancel_queued(w.agent['id'],'Worker protocol failed; queued task was not retried')
             if w.run_id:
                 self.store.finish(w.run_id,'failed',w.last_text,error,w.usage); w.run_id=None
-            await terminate(self,w)
+            await self.terminate_worker(w)
             self.store.agent_update(w.agent['id'],state='crashed',current_run=None)
             self.notify()
 
@@ -338,7 +450,7 @@ class Runtime:
         self.cancel_queued(a['id'],'Cancelled because the active agent was stopped')
         # Terminating only this verified process group also cancels input hooks,
         # authentication preflights and extension timers that Pi cannot abort.
-        cleanup=await terminate(self,w)
+        cleanup=await self.terminate_worker(w)
         if w.run_id:
             self.store.finish(w.run_id,terminal,w.last_text,reason,w.usage)
             self.event(w,'run_terminal',{'state':terminal})
@@ -363,9 +475,9 @@ class Runtime:
             else:
                 sid=new_id('scope_')
                 self.store.execute('INSERT INTO scopes(id,cwd,label,created) VALUES(?,?,?,?)',(sid,cwd,text(p.get('label','Codex Pi delegation'),'label',160),now()))
-            parent.bind(self,sid,source)
-            bind_scope_source(self,sid,p,source)
-            return {'scope':sid,'cwd':cwd, 'outstanding':views.outstanding(self,sid),'parent_notifications':parent.status(self,sid)}
+            parent.bind(self.store,sid,source)
+            self.bindings.bind_scope_source(sid,p,source)
+            return {'scope':sid,'cwd':cwd, 'outstanding':self.views.outstanding(sid),'parent_notifications':parent.status(self.store,sid)}
         if op=='shutdown':
             if not p.get('force') and any(not w.closed for w in self.workers.values()):
                 raise AgentError('agents_present','Close resident agents first or use daemon stop --force')
@@ -376,12 +488,12 @@ class Runtime:
                     'resident_agents':sum(not w.closed for w in self.workers.values()),
                     'home':str(self.home),'hooks':False,'native_codex_agents_ui':False,
                     'warning':'Managed Pi runs with your OS-user permissions; no inherited Codex sandbox.'}
-            if p.get('inheritance'): report['inheritance']=doctor(self)
+            if p.get('inheritance'): report['inheritance']=self.bindings.doctor()
             return report
         sid=identifier(p.get('scope'),'scope'); scope=self.store.scope(sid)
         if op=='spawn' and 'cwd' not in p: p={**p,'cwd':scope['cwd']}
         if op in {'spawn','send','interrupt','close','respawn','ack','answer'}:
-            parent.bind(self,sid,source,allow_new=False)
+            parent.bind(self.store,sid,source,allow_new=False)
             key=identifier(p.get('request_id'),'request_id')
             async with self.request_locks[(sid,key)]:
                 previous=self.store.request_begin(sid,key,op,p)
@@ -397,10 +509,10 @@ class Runtime:
             limit=integer(p.get('limit',20),'limit',1,50)
             rows=self.store.all('SELECT * FROM agents WHERE scope=? ORDER BY created DESC LIMIT ?',(sid,limit))
             total=self.store.one('SELECT COUNT(*) n FROM agents WHERE scope=?',(sid,))['n']
-            return {'scope':sid,'agents':[views.brief_agent(self,a) for a in rows],'total':total,'omitted':max(0,total-len(rows)), 'outstanding':views.outstanding(self,sid,limit),'parent_notifications':parent.status(self,sid)}
-        if op=='inspect': return views.inspect(self,p)
-        if op=='result': return views.result(self,p)
-        if op=='wait': return await views.wait(self,p)
+            return {'scope':sid,'agents':[views.brief_agent(a,self.workers.get(a['id'])) for a in rows],'total':total,'omitted':max(0,total-len(rows)), 'outstanding':self.views.outstanding(sid,limit),'parent_notifications':parent.status(self.store,sid)}
+        if op=='inspect': return self.views.inspect(p)
+        if op=='result': return self.views.result(p)
+        if op=='wait': return await self.views.wait(p)
         raise AgentError('unknown_operation',f'Unknown operation: {op}')
 
     async def mutate(self,op,p):
@@ -437,7 +549,7 @@ class Runtime:
                 rid=self.add_run(a,task,'starting',integer(p.get('idle_timeout_seconds',self.config['default_idle_timeout_seconds']),'idle_timeout_seconds',1,604800))
                 async with self.agent_locks[aid]:
                     try:
-                        w=await boot_worker(self,a)
+                        w=await self._boot_worker(a)
                         await self.start_run(w,rid)
                     except AgentError as e:
                         if self.store.run(sid,rid)['state']=='starting':
@@ -460,7 +572,7 @@ class Runtime:
                 w=self.workers.get(aid)
                 if w and not w.closed:
                     cleanup=(await self.interrupt(a))['cleanup']
-                else: cleanup=await reap_orphan(self,a)
+                else: cleanup=await reap_orphan(self.home/'agents'/aid,a)
                 self.store.agent_update(aid,state='closed' if cleanup=='verified' else 'orphaned',current_run=None,cleanup=cleanup)
                 self.store.bump(sid); self.notify()
                 return {'agent_id':aid,'state':'closed' if cleanup=='verified' else 'orphaned','cleanup':cleanup,'session_retained':True}
@@ -469,7 +581,7 @@ class Runtime:
                 if w and not w.closed: raise AgentError('worker_alive','Close the current worker before respawn')
                 if a['state']=='orphaned' or a['cleanup']=='unknown': raise AgentError('orphaned_worker','Close/reap the orphan before respawn; old pipes cannot be reattached')
                 async with self.admission:
-                    w=await boot_worker(self,a)
+                    w=await self._boot_worker(a)
                 rid=None
                 if p.get('message'):
                     msg=delegated_text(text(p['message']),'Continue this delegated task:\n')
@@ -507,7 +619,7 @@ class Runtime:
                     if a['cleanup']!='verified':
                         raise AgentError('cleanup_unconfirmed','Previous worker cleanup could not be verified; inspect before respawn')
                     async with self.admission:
-                        w=await boot_worker(self,a)
+                        w=await self._boot_worker(a)
                     mode='send'
                 if mode=='steer':
                     if not w.run_id: raise AgentError('agent_idle','Agent is idle; use mode=send. Steering never implicitly respawns.')
@@ -548,13 +660,14 @@ class Runtime:
 
     async def shutdown(self):
         self.closing=True
+        self.parent_notifications.closing=True
         for w in list(self.workers.values()):
             if not w.closed:
                 a=self.store.agent(w.agent['scope'],w.agent['id'])
                 async with self.agent_locks[a['id']]:
                     try: await self.interrupt(a)
                     except Exception:
-                        with contextlib.suppress(Exception): await terminate(self,w)
+                        with contextlib.suppress(Exception): await self.terminate_worker(w)
                     self.store.agent_update(a['id'],state='dormant',current_run=None)
         tasks=list(self.background)
         for t in tasks:

@@ -276,6 +276,31 @@ print('Queued message '+str(uuid.uuid4())+' for thread '+thread+'.')
 
 
 class ParentScheduleBounds(unittest.TestCase):
+    def test_shutdown_done_callback_does_not_start_another_delivery(self):
+        binding={'codex_home':'/tmp/codex','thread_id':str(uuid.uuid4())}
+        notice={'id':'n1','scope':'s','run_id':'r','agent_id':'a','run_state':'completed',
+                'ack':0,'kind':'terminal','ui_id':None,'parent':dumps(binding),'priority':1,'created':0}
+        class StoreStub:
+            queries=0
+            def all(self,sql,args=()):
+                self.queries+=1
+                return [notice] if self.queries==1 else []
+            def execute(self,*args): pass
+        class TaskStub:
+            def add_done_callback(self,callback): self.done=callback
+        store=StoreStub(); tasks=[]
+        def spawn(coro):
+            coro.close()
+            task=TaskStub(); tasks.append(task); return task
+        notifications=parent.ParentNotifications(store,spawn,lambda _aid: None)
+        notifications.schedule()
+        self.assertEqual(len(tasks),1)
+        before=store.queries
+        notifications.closing=True
+        tasks[0].done(tasks[0])
+        self.assertEqual(notifications.deliveries,{})
+        self.assertEqual(store.queries,before)
+
     def test_busy_parent_backlog_stays_bounded_and_reserved_page_is_skipped(self):
         with tempfile.TemporaryDirectory(prefix='subagent-pi-parent-page-') as directory:
             rt=Runtime(Path(directory))
@@ -295,7 +320,7 @@ class ParentScheduleBounds(unittest.TestCase):
                     rt.store.execute('INSERT INTO parent_notifications(id,scope,run_id,kind,created) VALUES(?,?,?,?,?)',
                                      (f'notice_{i:03d}',sid,rid,'terminal',i))
                 rt.store.execute('COMMIT')
-                key=(codex_home,thread); rt.parent_deliveries[key]=object()
+                key=(codex_home,thread); rt.parent_notifications.deliveries[key]=object()
                 seen=[]; original=rt.store.all
                 def traced(sql,args=()):
                     rows=original(sql,args)
@@ -303,11 +328,11 @@ class ParentScheduleBounds(unittest.TestCase):
                     return rows
                 with mock.patch.object(rt.store,'all',side_effect=traced), \
                      mock.patch.object(rt.store,'run',wraps=rt.store.run) as run:
-                    parent.schedule(rt)
+                    rt.parent_notifications.schedule()
                     self.assertLessEqual(max(seen,default=0),64)
                     self.assertEqual(run.call_count,0)
 
-                del rt.parent_deliveries[key]
+                del rt.parent_notifications.deliveries[key]
                 class UnstartedTask:
                     def add_done_callback(self,_callback): pass
                 def capture_delivery(coro):
@@ -315,14 +340,14 @@ class ParentScheduleBounds(unittest.TestCase):
                     return UnstartedTask()
                 seen.clear()
                 with mock.patch.object(rt.store,'all',side_effect=traced), \
-                     mock.patch.object(rt,'spawn_task',side_effect=capture_delivery):
-                    parent.schedule(rt)
+                     mock.patch.object(rt.parent_notifications,'spawn_task',side_effect=capture_delivery):
+                    rt.parent_notifications.schedule()
                 self.assertLessEqual(sum(seen),64)
                 rt.store.execute("UPDATE parent_notifications SET state='pending' WHERE id='notice_000'")
-                rt.parent_deliveries.clear()
-                rt.parent_waits[object()]=(sid,frozenset(ids[:100]))
-                with mock.patch.object(rt,'spawn_task',side_effect=capture_delivery):
-                    parent.schedule(rt)
+                rt.parent_notifications.deliveries.clear()
+                rt.parent_notifications.waits[object()]=(sid,frozenset(ids[:100]))
+                with mock.patch.object(rt.parent_notifications,'spawn_task',side_effect=capture_delivery):
+                    rt.parent_notifications.schedule()
                 selected=rt.store.one("SELECT run_id FROM parent_notifications WHERE state='sending'")
                 self.assertEqual(selected['run_id'],ids[100])
             finally:
@@ -349,7 +374,7 @@ time.sleep(30)
                 def agent(self,*_args): return {'name':'child'}
                 def execute(self,_sql,values): self.saved=values
             store=StoreStub()
-            rt=mock.Mock(store=store)
+            notifications=parent.ParentNotifications(store,None,None)
             notice={'id':'notice-1','scope':'scope-1','kind':'terminal','ui_id':None}
             run={'agent_id':'agent-1','id':'run-1','state':'completed'}
             bound={'command':str(wrapper),'home':str(root),'codex_home':str(codex_home),
@@ -357,7 +382,7 @@ time.sleep(30)
             pgid=None
             try:
                 with mock.patch.object(parent,'QUEUE_TIMEOUT_SECONDS',.3):
-                    await asyncio.wait_for(parent.deliver(rt,notice,run,bound),5)
+                    await asyncio.wait_for(notifications.deliver(notice,run,bound),5)
                 child_info=json.loads((codex_home/'child.json').read_text())
                 pgid=child_info['pgid']
                 self.assertEqual(store.saved[0],'unknown')
