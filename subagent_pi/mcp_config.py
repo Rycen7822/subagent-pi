@@ -40,8 +40,7 @@ TOOL_FIELD_COMPAT = {'approval_mode': 'mapped', 'output_token_limit': 'mapped'}
 MCP_STDIO_KEYS = {f for f, (_, _, t) in MCP_FIELD_COMPAT.items() if 'stdio' in t}
 MCP_HTTP_KEYS = {f for f, (_, _, t) in MCP_FIELD_COMPAT.items() if 'http' in t}
 # Bookkeeping that never belongs to a child-side server config: the credential
-# references resolve_environment turns into values, and the disposition trail
-# parse_mcp_servers/policy_filter keep for diagnostics and policy decisions.
+# references resolve_environment turns into values, and parsing's disposition trail.
 SERVER_RESOLVED_KEYS = ('env_var_names', 'env_header_names', 'static_env', 'static_headers')
 SERVER_POLICY_KEYS = ('disposition', 'reasons')
 MAX_RESULT_TEXT_BYTES = 256 * 1024
@@ -344,21 +343,13 @@ def resolve_environment(servers: list[dict], env_snapshot: dict) -> tuple[list[d
     return servers, diagnostics
 
 
-def policy_filter(servers: list[dict], access: str) -> tuple[list[dict], list[Diagnostic]]:
-    """Child-limit intersection for read children. The parent's enabled_tools is a
-    parent-side declaration, not a read-safety endorsement; a read child without
-    an allowlist sees only readOnly-advertised tools and confirms every call
-    (confirm_all) — parent-side 'auto' can never relax this child rule."""
+def read_access_diagnostics(servers: list[dict], access: str) -> list[Diagnostic]:
+    """Explain read-child restrictions; the bridge enforces them from agent.access."""
     diagnostics: list[Diagnostic] = []
     if access == 'write':
-        return servers, diagnostics
+        return diagnostics
     for server in servers:
-        if server.get('disposition') != 'ok':
-            continue
-        if server.get('allowed_tools') is None:
-            server['confirm_all'] = True
+        if server.get('disposition') == 'ok' and server.get('allowed_tools') is None:
             diagnostics.append(Diagnostic('mcp', server['name'],
                                           'read child: server has no explicit enabled_tools allowlist; only readOnly tools are visible and every call confirms'))
-    return servers, diagnostics
-
-
+    return diagnostics

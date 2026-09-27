@@ -7,7 +7,7 @@ from pathlib import Path
 from .common import AgentError, BASE_ENV_KEYS, dumps, text
 from .inheritance import collect_skills, read_codex_config, referenced_env_names, resolve_codex_home
 from .mcp_config import (CODEX_MCP_BASELINE, SERVER_POLICY_KEYS, SERVER_RESOLVED_KEYS, Diagnostic,
-    parse_mcp_servers, policy_filter, resolve_environment)
+    parse_mcp_servers, read_access_diagnostics, resolve_environment)
 
 class ScopeBindings:
     def __init__(self, store, config):
@@ -132,8 +132,7 @@ class ScopeBindings:
             servers, mcp_diag = parse_mcp_servers(codex_home, raw, inh.get('mcp_protocol_mode', 'auto'))
             servers, env_diag = resolve_environment(servers, source_env or {})
             mcp_diag += env_diag
-            servers, access_diag = policy_filter(servers, spec['access'])
-            mcp_diag += access_diag
+            mcp_diag += read_access_diagnostics(servers, spec['access'])
         required_broken = [s['name'] for s in servers if s.get('required') and s.get('disposition') != 'ok']
         if required_broken:
             raise AgentError('inheritance_required_server_failed',
@@ -178,8 +177,6 @@ class ScopeBindings:
                     try:
                         servers,env_diag=resolve_environment(servers,self.scope_env.get(s['id'],{}))
                         mcp_diag+=env_diag
-                        servers,acc_diag=policy_filter(servers,'write')
-                        mcp_diag+=acc_diag
                     except AgentError as exc:
                         mcp_diag.append(Diagnostic('mcp','required',exc.message))
                     entry.update(inherited_skills=[{'path':path,'name':Path(path).name} for path in skills],

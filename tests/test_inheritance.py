@@ -22,7 +22,7 @@ sys.path.insert(0,str(ROOT))
 from subagent_pi.common import AgentError, dumps, socket_path
 from subagent_pi.config import PI_BUILTIN_TOOLS, load_config, launch_spec
 from subagent_pi.inheritance import capture_scope_env, collect_skills, referenced_env_names, resolve_codex_home
-from subagent_pi.mcp_config import CODEX_MCP_BASELINE, parse_mcp_servers, policy_filter, resolve_environment
+from subagent_pi.mcp_config import CODEX_MCP_BASELINE, parse_mcp_servers, read_access_diagnostics, resolve_environment
 from subagent_pi.runtime import Runtime
 from subagent_pi.store import SCHEMA_VERSION, Store
 from subagent_pi.worker import write_bootstrap
@@ -330,8 +330,7 @@ experimental_environment = "remote"
         config='[mcp_servers.strict]\ncommand = "x"\nenabled_tools = []\n'
         servers,_=self.parse(config)
         self.assertEqual(servers[0]['allowed_tools'],[])
-        policy_filter(servers,'write')
-        self.assertEqual(servers[0]['allowed_tools'],[])
+        self.assertEqual(read_access_diagnostics(servers,'read'),[])
     def test_recursion_guard_direct_command(self):
         bin_path=ROOT/'bin'/'subagent-pi'
         config=f'[mcp_servers.renamed_control]\ncommand = "{bin_path}"\nargs = ["mcp"]\n'
@@ -411,16 +410,16 @@ approval_mode = "banana"
         resolve_environment(servers,{'WEB_TOKEN':'tok','TRACE_ID':'tr-1'})
         self.assertEqual(servers[0]['bearer_token'],'tok')
         self.assertEqual(servers[0]['headers'],{'X-Static':'sv','X-Trace':'tr-1'})
-    def test_read_child_policy_intersects(self):
+    def test_read_child_diagnostics_do_not_mutate_policy(self):
         servers,_=self.parse(HTTP_TOML)  # has explicit allowlist
-        policy_filter(servers,'read')
-        self.assertEqual(servers[0]['name'],'web'); self.assertNotIn('confirm_all',servers[0])
+        self.assertEqual(read_access_diagnostics(servers,'read'),[])
         no_list,_=self.parse('[mcp_servers.open]\ncommand = "x"\n')
-        policy_filter(no_list,'read')
-        self.assertTrue(no_list[0]['confirm_all'])
-        no_list2,_=self.parse('[mcp_servers.open2]\ncommand = "x"\n')
-        policy_filter(no_list2,'write')
-        self.assertNotIn('confirm_all',no_list2[0])
+        before=dumps(no_list)
+        diagnostics=read_access_diagnostics(no_list,'read')
+        self.assertEqual([(d.name,d.reason) for d in diagnostics],[('open',
+            'read child: server has no explicit enabled_tools allowlist; only readOnly tools are visible and every call confirms')])
+        self.assertEqual(read_access_diagnostics(no_list,'write'),[])
+        self.assertEqual(dumps(no_list),before)
     def test_diagnostics_are_str_only(self):
         # F10: missing default skills dir previously put a Path object into the diagnostic.
         skills,diag=collect_skills(self.home,{},None,[])
@@ -1260,10 +1259,8 @@ class CodingAgentDirBinding(unittest.IsolatedAsyncioTestCase):
         self.profile_dir=self.root/'profile-agent'; self.profile_dir.mkdir()
         self.rt=None
         self.addCleanup(self.tmp.cleanup)
-        self.saved_coding_dir=os.environ.pop('PI_CODING_AGENT_DIR',None)
-        self.addCleanup(self._restore)
-    def _restore(self):
-        if self.saved_coding_dir is not None: os.environ['PI_CODING_AGENT_DIR']=self.saved_coding_dir
+        self.enterContext(mock.patch.dict(os.environ))
+        os.environ.pop('PI_CODING_AGENT_DIR',None)
     def write_config(self,extra=''):
         (self.home/'config.toml').write_text('pi_command = '+fake_pi_command()+'\nstartup_timeout_seconds = 25\n'+extra)
     async def asyncTearDown(self):

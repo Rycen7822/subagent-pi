@@ -16,6 +16,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.client import request
@@ -466,14 +467,8 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         self.pi_home=self.root/'userhome'; self.pi_home.mkdir()
         self.pi_agent=self.root/'agent'; self.pi_agent.mkdir()
         (self.pi_agent/'settings.json').write_text(json.dumps({'compaction':{'enabled':False},'retry':{'enabled':False}}))
-        self.saved_env={k:os.environ.get(k) for k in ('HOME','PI_CODING_AGENT_DIR')}
-        os.environ['HOME']=str(self.pi_home); os.environ['PI_CODING_AGENT_DIR']=str(self.pi_agent)
-
-    async def asyncTearDown(self):
-        await super().asyncTearDown()
-        for key,value in self.saved_env.items():
-            if value is None: os.environ.pop(key,None)
-            else: os.environ[key]=value
+        self.enterContext(mock.patch.dict(os.environ, {
+            'HOME':str(self.pi_home), 'PI_CODING_AGENT_DIR':str(self.pi_agent)}))
 
     def write_config(self,**profile_env):
         knobs={'PI_OFFLINE':'"1"','PI_SKIP_VERSION_CHECK':'"1"','PI_TELEMETRY':'"0"',**profile_env}

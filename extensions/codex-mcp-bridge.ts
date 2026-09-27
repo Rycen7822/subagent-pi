@@ -79,8 +79,7 @@ export default async function (pi: ExtensionAPI) {
 
   function needsConfirmation(cfg: ServerCfg, meta: ToolMeta): boolean {
     // The child rule always wins over parent-side auto: a read child confirms
-    // everything, and an explicit confirm_all (a server with no parent-side
-    // allowlist) confirms everything even in a write child.
+    // everything. Legacy payloads can also require confirm_all in a write child.
     return access === "read" || cfg.confirm_all === true ||
       (cfg.tool_approval[meta.name] ?? cfg.approval_default) !== "auto";
   }
