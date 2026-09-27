@@ -13,9 +13,10 @@ import shutil
 import signal
 import uuid
 
-from .common import AgentError, dumps, group_members
+from .common import AgentError, dumps, group_members, read_frame
 
 QUEUE_TIMEOUT_SECONDS=30
+RECALL_TIMEOUT_SECONDS=10
 
 
 def capture(environ, thread_id):
@@ -87,16 +88,36 @@ class ParentNotifications:
             # Only events actually included in the response are observed.
             for run in response['runs']:
                 if run['id'] in ids and run.get('result'):
-                    self.store.execute("UPDATE parent_notifications SET state='observed' WHERE scope=? AND run_id=? AND kind='terminal' AND state='pending'",(sid,run['id']))
+                    self.observe(sid,run['id'],'terminal')
             for question in response['questions']:
                 if question['run_id'] in ids:
-                    self.store.execute("UPDATE parent_notifications SET state='observed' WHERE scope=? AND run_id=? AND ui_id=? AND kind='question' AND state='pending'",(sid,question['run_id'],question['id']))
+                    self.observe(sid,question['run_id'],'question',question['id'])
         self.schedule()
+
+    def observe(self, sid, rid, kind, ui_id=None):
+        # Preserve observation even while enqueue is awaiting its receipt. The
+        # sender must not overwrite this intent when it publishes queued_id.
+        self.store.execute("UPDATE parent_notifications SET handled=1,state=CASE WHEN state='pending' THEN 'observed' ELSE state END WHERE scope=? AND run_id=? AND kind=? AND ui_id IS ?",
+                           (sid,rid,kind,ui_id))
+
+    async def acknowledge(self, sid, rid):
+        self.observe(sid,rid,'terminal')
+        # ACK remains durable if host recall is unavailable. Bound the barrier
+        # below the IPC call budget; background delivery/recall is not cancelled.
+        until=asyncio.get_running_loop().time()+20
+        while True:
+            self.schedule()
+            rows=self.store.all('SELECT state FROM parent_notifications WHERE scope=? AND run_id=? AND kind=?',(sid,rid,'terminal'))
+            if not any(row['state'] in ('sending','queued','recalling') for row in rows):
+                return 'failed' if any(row['state'] in ('unknown','recall_failed') for row in rows) else 'complete'
+            remaining=until-asyncio.get_running_loop().time()
+            if remaining<=0 or not self.deliveries: return 'pending'
+            await asyncio.wait(tuple(self.deliveries.values()),timeout=remaining,return_when=asyncio.FIRST_COMPLETED)
 
     def schedule(self):
         """At most four independent parent queues; no sender blocks another parent."""
         if self.closing or len(self.deliveries)>=4: return
-        priority="CASE n.kind WHEN 'question' THEN 0 ELSE 1 END"
+        priority="CASE WHEN n.state='queued' THEN 0 WHEN n.kind='question' THEN 1 ELSE 2 END"
         cursor=None
         while len(self.deliveries)<4:
             busy=tuple(self.deliveries)
@@ -107,7 +128,8 @@ class ParentNotifications:
             notices=self.store.all(
                 f'SELECT n.*,s.parent,r.agent_id,r.ack,r.state AS run_state,{priority} AS priority '
                 'FROM parent_notifications n JOIN scopes s ON s.id=n.scope '
-                f"JOIN runs r ON r.id=n.run_id AND r.scope=n.scope WHERE n.state='pending'{blocked}{after} "
+                f"JOIN runs r ON r.id=n.run_id AND r.scope=n.scope WHERE (n.state='pending' OR "
+                f"(n.state='queued' AND (n.handled=1 OR r.ack=1 OR n.kind='question'))){blocked}{after} "
                 f'ORDER BY {priority},n.created,n.id LIMIT 64',args)
             if not notices: break
             for notice in notices:
@@ -115,22 +137,37 @@ class ParentNotifications:
                 run={'id':notice['run_id'],'agent_id':notice['agent_id'],
                      'state':notice['run_state'],'ack':notice['ack']}
                 worker=self.worker_for(run['agent_id'])
-                relevant=(not run['ack']) if notice['kind']=='terminal' else bool(worker and worker.run_id==run['id'] and notice['ui_id'] in worker.ui)
-                if not relevant:
-                    self.store.execute("UPDATE parent_notifications SET state='superseded' WHERE id=?",(notice['id'],)); continue
-                if any(sid==notice['scope'] and notice['run_id'] in ids for sid,ids in self.waits.values()): continue
+                relevant=not notice['handled'] and ((not run['ack']) if notice['kind']=='terminal' else bool(worker and worker.run_id==run['id'] and notice['ui_id'] in worker.ui))
+                recalling=notice['state']=='queued'
+                if recalling and relevant: continue
+                if not recalling:
+                    if not relevant:
+                        self.store.execute("UPDATE parent_notifications SET state='superseded' WHERE id=?",(notice['id'],)); continue
+                    if any(sid==notice['scope'] and notice['run_id'] in ids for sid,ids in self.waits.values()): continue
                 parent=json.loads(notice['parent'])
                 key=(parent['codex_home'],parent['thread_id'])
                 if key in self.deliveries: continue
                 # Claim before scheduling; subsequent notify() calls cannot send twice.
-                self.store.execute("UPDATE parent_notifications SET state='sending' WHERE id=?",(notice['id'],))
-                task=self.spawn_task(self.deliver(notice,run,parent))
+                if recalling:
+                    self.store.execute("UPDATE parent_notifications SET state='recalling',handled=1 WHERE id=?",(notice['id'],))
+                    task=self.spawn_task(self.recall(notice,parent))
+                else:
+                    self.store.execute("UPDATE parent_notifications SET state='sending' WHERE id=?",(notice['id'],))
+                    task=self.spawn_task(self.deliver(notice,run,parent))
                 self.deliveries[key]=task
                 def finished(_,key=key):
                     self.deliveries.pop(key,None)
                     if not self.closing: self.schedule()
                 task.add_done_callback(finished)
                 if len(self.deliveries)>=4: break
+
+    async def recall(self, notice, parent):
+        # Delete only the exact submission acknowledged by Codex, never search by
+        # message content or edit the host database. An in-flight recall can be
+        # retried after restart: deletion of the same ID is idempotent.
+        deleted,error=await recall(parent,notice['queued_id'])
+        state='recalled' if deleted is True else 'delivered' if deleted is False else 'recall_failed'
+        self.store.execute('UPDATE parent_notifications SET state=?,error=? WHERE id=?',(state,error,notice['id']))
 
     async def deliver(self, notice, run, parent):
         data={'notification_id':notice['id'],'scope':notice['scope'],'agent_id':run['agent_id'],
@@ -173,17 +210,52 @@ async def enqueue(parent, message):
     except asyncio.TimeoutError:
         error='Codex queue timed out; delivery unknown, not retried'
     finally:
-        if proc:
-            # The entrypoint may have exited while a child in our dedicated
-            # session still owns stdout. Reap the whole group and bound cleanup.
-            if group_members(proc.pid):
-                with contextlib.suppress(ProcessLookupError): os.killpg(proc.pid,signal.SIGKILL)
-            try:
-                await asyncio.wait_for(proc.communicate(),2)
-            except (asyncio.TimeoutError,RuntimeError):
-                for fd in (1,2):
-                    pipe=proc._transport.get_pipe_transport(fd)
-                    if pipe: pipe.close()
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(proc.wait(),1)
+        await finish_process(proc)
     return outcome,queued_id,error
+
+
+async def recall(parent, queued_id):
+    """Use the existing Codex API; no host code or database changes."""
+    proc=None
+    try:
+        if not parent['command'] or not queued_id: raise ValueError('No trusted queue receipt')
+        env={'HOME':parent['home'],'CODEX_HOME':parent['codex_home'],'PATH':parent['path'],
+             'LANG':os.environ.get('LANG','C.UTF-8')}
+        async with asyncio.timeout(RECALL_TIMEOUT_SECONDS):
+            proc=await asyncio.create_subprocess_exec(parent['command'],'app-server','--stdio',
+                cwd=parent['home'],env=env,stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,start_new_session=True)
+            async def rpc(identifier, method, params):
+                proc.stdin.write((dumps({'id':identifier,'method':method,'params':params})+'\n').encode())
+                await proc.stdin.drain()
+                for _ in range(64):
+                    response=await read_frame(proc.stdout)
+                    if isinstance(response,dict) and response.get('id')==identifier:
+                        if 'error' in response or not isinstance(response.get('result'),dict):
+                            raise ValueError('Codex queue recall API rejected the request')
+                        return response['result']
+                raise ValueError('Codex queue recall response limit exceeded')
+            await rpc(1,'initialize',{'clientInfo':{'name':'subagent-pi-recall','version':'1'},'capabilities':{'experimentalApi':True}})
+            proc.stdin.write(b'{"method":"initialized"}\n'); await proc.stdin.drain()
+            result=await rpc(2,'thread/queue/delete',{'threadId':parent['thread_id'],'queuedSubmissionId':queued_id})
+            if type(result.get('deleted')) is not bool: raise ValueError('Invalid Codex queue recall receipt')
+            return result['deleted'],None
+    except (AgentError,OSError,ValueError,asyncio.TimeoutError,asyncio.IncompleteReadError) as exc:
+        return None,f'Codex queue recall failed: {type(exc).__name__}; notification may still arrive'
+    finally:
+        await finish_process(proc)
+
+
+async def finish_process(proc):
+    if not proc: return
+    # Both queue and recall own their process groups, including wrapper children.
+    if group_members(proc.pid):
+        with contextlib.suppress(ProcessLookupError): os.killpg(proc.pid,signal.SIGKILL)
+    try:
+        await asyncio.wait_for(proc.communicate(),2)
+    except (asyncio.TimeoutError,RuntimeError):
+        for fd in (1,2):
+            pipe=proc._transport.get_pipe_transport(fd)
+            if pipe: pipe.close()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(proc.wait(),1)

@@ -734,6 +734,24 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(row['payload'])['error'],'BrokenPipeError')
 
 class StoreMigration(unittest.TestCase):
+    def test_v5_upgrade_preserves_queued_notification_receipts(self):
+        with tempfile.TemporaryDirectory(prefix='notification-migration-') as path:
+            base=Path(path)
+            with sqlite3.connect(base/'registry.sqlite') as db:
+                db.executescript('''
+                CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);
+                INSERT INTO meta VALUES('schema','5');
+                CREATE TABLE parent_notifications(id TEXT PRIMARY KEY,scope TEXT NOT NULL,run_id TEXT NOT NULL,kind TEXT NOT NULL,ui_id TEXT,state TEXT NOT NULL DEFAULT 'pending',queued_id TEXT,error TEXT,created REAL NOT NULL);
+                INSERT INTO parent_notifications(id,scope,run_id,kind,state,queued_id,created)
+                    VALUES('notice_old','scope_old','run_old','terminal','queued','receipt_old',1);
+                ''')
+            store=Store(base)
+            try:
+                row=store.one("SELECT state,queued_id,handled FROM parent_notifications WHERE id='notice_old'")
+                self.assertEqual(row,{'state':'queued','queued_id':'receipt_old','handled':0})
+                self.assertEqual(store.one("SELECT value FROM meta WHERE key='schema'")['value'],str(SCHEMA_VERSION))
+            finally: store.close()
+
     def test_v1_and_v2_databases_upgrade_without_losing_scope_data(self):
         # Schema 2 was written by 0.2.7; both old shapes must reach the current ledger.
         for version in (1, 2):

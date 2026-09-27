@@ -176,6 +176,7 @@ class Runtime:
         """A new daemon cannot recover old pipes; never claim a live orphan is
         reattached. Every resident row is re-judged from its owner record."""
         self.store.execute("UPDATE parent_notifications SET state='unknown',error='Daemon restarted during delivery; not retried' WHERE state='sending'")
+        self.store.execute("UPDATE parent_notifications SET state='queued',handled=1 WHERE state='recalling'")
         for a in self.store.all('SELECT * FROM agents'):
             verdict = ownership(self.home/'agents'/a['id'], a)
             if a['state'] in RESIDENT_AGENT_STATES:
@@ -563,7 +564,8 @@ class Runtime:
             if r['state'] not in TERMINAL: raise AgentError('not_terminal','Cannot acknowledge an active run')
             if p.get('result_sha256')!=r['result_sha']: raise AgentError('result_version_mismatch','Read and acknowledge the exact result hash')
             self.store.execute('UPDATE runs SET ack=1 WHERE id=?',(r['id'],)); self.store.bump(sid)
-            return {'run_id':r['id'],'acknowledged':True}
+            recalled=await self.parent_notifications.acknowledge(sid,r['id'])
+            return {'run_id':r['id'],'acknowledged':True,**({'notification_recall':recalled} if recalled!='complete' else {})}
         aid=identifier(p.get('agent_id'),'agent_id')
         async with self.agent_locks[aid]:
             a=self.store.agent(sid,aid)

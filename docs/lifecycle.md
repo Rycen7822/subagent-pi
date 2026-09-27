@@ -76,8 +76,12 @@ IPC 的连接、请求写入和响应读取共用调用预算；已写出结果�
 
 同一父会话对指定 run 的主动 wait 优先：等待期间暂缓对应通知，MCP/CLI 写出响应后通过 IPC 回执把该响应中的事件标为 observed，不再排队唤醒。取消、断连、写出失败或 10 秒内未收到交付回执时恢复通知资格。observed 只证明适配器已写出响应，不代表模型已处理，也不等于结果 ack；另一父会话的读取不能抑制原父会话通知。问题和终态分别记录，收到问题不会隐藏后续完成。正常使用始终等待明确的剩余 run_ids；未指定时仍返回未 ack 的任务，包括此前已读的终态。
 
-通知状态为 pending/sending/observed/queued/failed/unknown/superseded。queued 只是 Codex 入队回执；已发送或已入队的消息无法由插件撤回，主动 wait 开始前已排队的事件仍可能迟到，应忽略已处理事件。未发送的问题若已回答、结果若已 ack，则标为 superseded。独立父会话最多四路投递，每个父会话串行；待发问题优先，单次发送最多 30 秒。提交超时、异常退出或发送中的 daemon 重启记为 unknown，绝不盲重发。重启保留 observed 和未发通知，无可信父身份时仍以 wait/list 收取结果。
+queued 只是 Codex 入队回执。结果被精确 hash ack、同一父会话的 wait 响应交付成功、或待答问题失效后，插件会用绑定的 CODEX_HOME 调用 Codex 现有的 `thread/queue/delete` 接口，只撤回该通知回执对应的消息 ID，不匹配内容、不清空队列，也不修改宿主代码或数据库。交付意图单独持久化；若此时还在发送，收到入队回执后继续撤回。仅读 result/list 不撤回通知。wait 交付不等于结果 ack。
 
-此机制要求 Codex 支持 queue（实测 0.155.1），使用绑定时的本地 CODEX_HOME；远程会话不在本机消息存储中时不能据此承诺唤醒。未修改 Pi/Codex 宿主，也不模拟键盘或重启用户会话。
+通知状态包括 pending/sending/observed/queued/failed/unknown/superseded，以及 recalling/recalled/delivered/recall_failed。recalled 表示宿主确认删除；delivered 表示消息已不在队列（可能已消费或被手动删除），不能擦除已显示的消息。撤回接口缺失、超时或返回无效数据时记录 recall_failed，迟到通知仍可能出现，应忽略已处理事件。ack 最多等待撤回 20 秒，仍未结束或失败时额外返回 `notification_recall=pending/failed`；结果确认本身保持有效，文件不删除。单次撤回最多 10 秒，另有有界子进程清理。
+
+独立父会话最多四路投递，每个父会话串行；先处理待撤回通知，再处理待发问题和终态，单次发送最多 30 秒。未发送的问题若已回答、结果若已 ack，则标为 superseded。提交超时、异常退出或发送中的 daemon 重启记为 unknown，绝不盲重发；没有可信入队回执就无法安全撤回。重启只重试被中断的确切 ID 删除，并清理旧版本遗留的已 ack 排队通知，不重发消息。无可信父身份时仍以 wait/list 收取结果。
+
+此机制要求 Codex 支持 queue，撤回另需 app-server 的 `thread/queue/delete`（均已用本地模拟模型验证）。使用绑定时的本地 CODEX_HOME；远程会话不在本机消息存储中时不能据此承诺唤醒。未修改 Pi/Codex 宿主，也不模拟键盘或重启用户会话。
 
 等待接口不再接受 timeout_ms / --timeout-ms。IPC 协议升级为 v2；升级后需在旧任务清理完成时正常重启插件 daemon/MCP 连接，混用旧客户端或旧 daemon 会明确返回 version_mismatch，不自动停止用户进程。

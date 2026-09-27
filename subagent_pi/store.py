@@ -5,7 +5,7 @@ from pathlib import Path
 import sqlite3
 from .common import AgentError, TERMINAL, atomic_write, dumps, now, private_dir
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 # Applied in order to reach SCHEMA_VERSION from an older ledger. A fresh database
 # is created at the current version, so these statements never run on it.
 MIGRATIONS = {
@@ -15,6 +15,7 @@ MIGRATIONS = {
     3: ('ALTER TABLE scopes ADD COLUMN base_env TEXT',),
     4: ('ALTER TABLE scopes ADD COLUMN parent TEXT',),
     5: ('ALTER TABLE runs ADD COLUMN idle_timeout_seconds INTEGER',),
+    6: ('ALTER TABLE parent_notifications ADD COLUMN handled INTEGER NOT NULL DEFAULT 0',),
 }
 
 class Store:
@@ -35,7 +36,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS requests(scope TEXT NOT NULL,key TEXT NOT NULL,digest TEXT NOT NULL,op TEXT NOT NULL,state TEXT NOT NULL,response TEXT,created REAL NOT NULL,PRIMARY KEY(scope,key));
         CREATE TABLE IF NOT EXISTS receipts(id TEXT PRIMARY KEY,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,scope TEXT NOT NULL,message TEXT NOT NULL,state TEXT NOT NULL,created REAL NOT NULL,updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,agent_id TEXT NOT NULL,run_id TEXT,generation INTEGER NOT NULL,type TEXT NOT NULL,payload TEXT NOT NULL,created REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS parent_notifications(id TEXT PRIMARY KEY,scope TEXT NOT NULL REFERENCES scopes(id),run_id TEXT NOT NULL REFERENCES runs(id),kind TEXT NOT NULL,ui_id TEXT,state TEXT NOT NULL DEFAULT 'pending',queued_id TEXT,error TEXT,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS parent_notifications(id TEXT PRIMARY KEY,scope TEXT NOT NULL REFERENCES scopes(id),run_id TEXT NOT NULL REFERENCES runs(id),kind TEXT NOT NULL,ui_id TEXT,state TEXT NOT NULL DEFAULT 'pending',queued_id TEXT,error TEXT,created REAL NOT NULL,handled INTEGER NOT NULL DEFAULT 0);
         CREATE INDEX IF NOT EXISTS parent_notifications_state ON parent_notifications(state,created);
         CREATE INDEX IF NOT EXISTS runs_scope_state ON runs(scope,state,ack,created);
         CREATE INDEX IF NOT EXISTS runs_agent_state ON runs(agent_id,state,created);
@@ -52,6 +53,10 @@ class Store:
             self.db.execute('BEGIN IMMEDIATE')
             try:
                 for version in range(current+1, SCHEMA_VERSION+1):
+                    # Ledgers predating parent notifications get the current
+                    # table above; existing v5 tables still need this column.
+                    if version==6 and any(c['name']=='handled' for c in self.all('PRAGMA table_info(parent_notifications)')):
+                        continue
                     for statement in MIGRATIONS[version]:
                         self.db.execute(statement)
                 self.db.execute('COMMIT')

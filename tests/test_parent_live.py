@@ -92,6 +92,52 @@ class LiveParentWakeup(McpHarness, unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(event['params']['turn']['status'],'completed',event)
                     return event['params']
 
+    async def test_ack_retracts_busy_parent_notification_preserving_other_queue_entries(self):
+        # Hold the real host busy so it cannot consume the notification before
+        # the result is handled. All model traffic stays on the local mock.
+        release=threading.Event(); entered=threading.Event()
+        original=self.http.RequestHandlerClass.do_POST
+        def blocked(handler):
+            entered.set(); release.wait(40); original(handler)
+        self.http.RequestHandlerClass.do_POST=blocked
+        config=self.home/'config.toml'
+        config.write_text(config.read_text().replace('PI_MOCK_ASK_PARENT="1"\n',''))
+        try:
+            parent=(await self.app_rpc('thread/start',{'cwd':str(self.workspace),'model':'gpt-5.4',
+                'modelProvider':'offline','approvalPolicy':'never','sandbox':'read-only'}))['thread']['id']
+            await self.app_rpc('turn/start',{'threadId':parent,'input':[{'type':'text','text':'Hold this local mock turn.'}]})
+            self.assertTrue(await asyncio.to_thread(entered.wait,10))
+            await self.initialize()
+            context=await self.rpc('tools/call',{'name':'pi_context','arguments':{'cwd':str(self.workspace)},'_meta':{'threadId':parent}})
+            scope=self.unpack(context)['scope']
+            child=await self.tool('pi_spawn_agent',{'scope':scope,'request_id':'done','task':'Reply briefly.','access':'read'})
+            async with asyncio.timeout(20):
+                while True:
+                    rows=(await self.tool('pi_list_agents',{'scope':scope}))['parent_notifications']['recent']
+                    if rows and rows[0]['state']=='queued': break
+                    await asyncio.sleep(.05)
+            receipt=rows[0]['queued_id']
+            queued=(await self.app_rpc('thread/queue/list',{'threadId':parent}))['data']
+            self.assertEqual([item['id'] for item in queued],[receipt])
+            await self.app_rpc('thread/queue/add',{'threadId':parent,'clientUserMessageId':'unrelated-test-entry',
+                'input':[{'type':'text','text':'Unrelated user queue entry.'}]})
+            before=(await self.app_rpc('thread/queue/list',{'threadId':parent}))['data']
+            self.assertEqual(len(before),2)
+            result=await self.tool('pi_agent_result',{'scope':scope,'run_id':child['run_id']})
+            ack=await self.tool('pi_ack_result',{'scope':scope,'run_id':child['run_id'],'request_id':'ack',
+                'result_sha256':result['result_sha256']})
+            self.assertTrue(ack['acknowledged']); self.assertNotIn('notification_recall',ack)
+            after=(await self.app_rpc('thread/queue/list',{'threadId':parent}))['data']
+            self.assertEqual(after,[item for item in before if item['id']!=receipt])
+            rows=(await self.tool('pi_list_agents',{'scope':scope}))['parent_notifications']['recent']
+            self.assertEqual(rows[0]['state'],'recalled')
+            # Remove the test's unrelated entry, then let the parent finish.
+            await self.app_rpc('thread/queue/delete',{'threadId':parent,'queuedSubmissionId':after[0]['id']})
+            release.set(); await self.completed()
+            self.assertEqual(len(self.requests),1)
+        finally:
+            release.set()
+
     async def test_pi_question_and_completion_wake_original_idle_codex_parent(self):
         thread=await self.app_rpc('thread/start',{'cwd':str(self.workspace),'model':'gpt-5.4',
             'modelProvider':'offline','approvalPolicy':'never','sandbox':'read-only'})

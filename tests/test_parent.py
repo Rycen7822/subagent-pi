@@ -27,12 +27,26 @@ class ParentNotifications(McpHarness, unittest.IsolatedAsyncioTestCase):
 import json,os,sys,time,uuid
 from pathlib import Path
 home=Path(os.environ['CODEX_HOME']); args=sys.argv[1:]
-assert args[0]=='queue'
-thread=args[args.index('--thread')+1]; message=args[args.index('--message')+1]
-with (home/'queue.jsonl').open('a') as f: f.write(json.dumps({'thread':thread,'message':message})+'\\n')
-while (home/('hold-'+thread)).exists(): time.sleep(.01)
-if (home/'reject').exists(): sys.exit(2)
-print('Queued message '+str(uuid.uuid4())+' for thread '+thread+'.')
+if args[0]=='queue':
+    thread=args[args.index('--thread')+1]; message=args[args.index('--message')+1]; queued_id=str(uuid.uuid4())
+    with (home/'queue.jsonl').open('a') as f: f.write(json.dumps({'id':queued_id,'thread':thread,'message':message})+'\\n')
+    while (home/('hold-'+thread)).exists(): time.sleep(.01)
+    if (home/'reject').exists(): sys.exit(2)
+    print('Queued message '+queued_id+' for thread '+thread+'.')
+else:
+    assert args==['app-server','--stdio']
+    for line in sys.stdin:
+        request=json.loads(line)
+        if request['method']=='initialized': continue
+        if request['method']=='initialize': result={}
+        else:
+            assert request['method']=='thread/queue/delete'
+            params=request['params']
+            with (home/'recalls.jsonl').open('a') as f: f.write(json.dumps(params)+'\\n')
+            if (home/'recall-reject').exists():
+                print(json.dumps({'id':request['id'],'error':{'code':-32601,'message':'unsupported'}}),flush=True); continue
+            result={'deleted':not (home/'already-consumed').exists()}
+        print(json.dumps({'id':request['id'],'result':result}),flush=True)
 """)
         command.chmod(0o755)
         self.mcp_env={'CODEX_HOME':str(self.codex_home),'HOME':str(self.root),
@@ -51,7 +65,7 @@ print('Queued message '+str(uuid.uuid4())+' for thread '+thread+'.')
         while asyncio.get_running_loop().time()<until:
             state=await self.tool('pi_list_agents',{'scope':sid})
             rows=state['parent_notifications']['recent']
-            if len(rows)>=count and all(n['state'] not in ('pending','sending') for n in rows): return rows
+            if len(rows)>=count and all(n['state'] not in ('pending','sending','recalling') for n in rows): return rows
             await asyncio.sleep(.02)
         self.fail('Notifications did not settle')
 
@@ -89,6 +103,8 @@ print('Queued message '+str(uuid.uuid4())+' for thread '+thread+'.')
         await self.parent_tool('pi_close_agent',{'request_id':'stop','agent_id':run['agent_id']})
         rows=await self.settled_notifications(sid,2)
         self.assertEqual({r['kind'] for r in rows},{'question','terminal'})
+        self.assertEqual(next(r['state'] for r in rows if r['kind']=='question'),'recalled')
+        self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':self.queued()[0]['id']}])
         self.assertIn('interrupted',self.queued()[1]['message'])
         for notice in self.queued():
             data=json.loads(notice['message'].splitlines()[1])
@@ -145,6 +161,33 @@ print('Queued message '+str(uuid.uuid4())+' for thread '+thread+'.')
         rows=await self.settled_notifications(sid,1)
         self.assertEqual(rows[0]['state'],'unknown'); self.assertEqual(len(self.queued()),1)
 
+    async def test_interrupted_recall_resumes_without_ack_or_resending(self):
+        sid=await self.open_parent()
+        run=await self.parent_tool('pi_spawn_agent',{'request_id':'done','task':'done','access':'read'})
+        notice=(await self.settled_notifications(sid,1))[0]
+        # A delivered wait had requested recall, then the daemon died before
+        # recording the host response. Retrying this exact deletion is safe.
+        import sqlite3
+        with sqlite3.connect(self.home/'registry.sqlite') as db:
+            db.execute("UPDATE parent_notifications SET state='recalling',handled=1")
+        await self.restart_daemon()
+        await self.wait_notice_state(sid,'recalled')
+        self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':notice['queued_id']}])
+        result=await self.parent_tool('pi_agent_result',{'run_id':run['run_id']})
+        self.assertFalse(result['acknowledged']); self.assertEqual(len(self.queued()),1)
+
+    async def test_legacy_acknowledged_queue_is_recalled_on_restart(self):
+        sid=await self.open_parent()
+        await self.parent_tool('pi_spawn_agent',{'request_id':'done','task':'done','access':'read'})
+        notice=(await self.settled_notifications(sid,1))[0]
+        import sqlite3
+        with sqlite3.connect(self.home/'registry.sqlite') as db:
+            db.execute('UPDATE runs SET ack=1')
+        await self.restart_daemon()
+        await self.wait_notice_state(sid,'recalled')
+        self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':notice['queued_id']}])
+        self.assertEqual(len(self.queued()),1)
+
     async def test_unbound_clients_never_guess_the_parent(self):
         scope=await self.tool('pi_context',{'cwd':str(self.workspace)})
         self.assertFalse(scope['parent_notifications']['enabled'])
@@ -157,6 +200,96 @@ print('Queued message '+str(uuid.uuid4())+' for thread '+thread+'.')
     def trusted_source(self):
         from subagent_pi.parent import capture
         return {'env':{},'parent':capture(self.mcp_env,self.parent)}
+
+    def recalls(self):
+        path=self.codex_home/'recalls.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    async def wait_notice_state(self,sid,state):
+        async with asyncio.timeout(8):
+            while True:
+                rows=(await self.tool('pi_list_agents',{'scope':sid}))['parent_notifications']['recent']
+                if rows and rows[0]['state']==state: return rows
+                await asyncio.sleep(.02)
+
+    async def test_ack_recalls_only_its_queued_message_and_preserves_the_result(self):
+        sid=await self.open_parent()
+        run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'done','access':'read'})
+        notice=(await self.settled_notifications(sid,1))[0]
+        result=await self.parent_tool('pi_agent_result',{'run_id':run['run_id']})
+        ack=await self.parent_tool('pi_ack_result',{'run_id':run['run_id'],'request_id':'ack','result_sha256':result['result_sha256']})
+        self.assertTrue(ack['acknowledged'])
+        rows=await self.wait_notice_state(sid,'recalled')
+        self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':notice['queued_id']}])
+        again=await self.parent_tool('pi_agent_result',{'run_id':run['run_id']})
+        self.assertEqual(again['result_sha256'],result['result_sha256'])
+        await self.restart_daemon()
+        await self.tool('pi_list_agents',{'scope':sid})
+        self.assertEqual(len(self.queued()),1)
+        self.assertEqual(len(self.recalls()),1)
+
+    async def test_late_wait_recalls_queue_without_acknowledging_the_result(self):
+        sid=await self.open_parent()
+        run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'done','access':'read'})
+        notice=(await self.settled_notifications(sid,1))[0]
+        result=await self.parent_tool('pi_wait_agent',{'run_ids':[run['run_id']]})
+        self.assertEqual(result['runs'][0]['ack'],0)
+        await self.wait_notice_state(sid,'recalled')
+        self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':notice['queued_id']}])
+
+    async def test_wait_during_enqueue_preserves_observation_until_receipt_arrives(self):
+        sid=await self.open_parent(); hold=self.codex_home/('hold-'+self.parent); hold.touch()
+        try:
+            run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'done','access':'read'})
+            async with asyncio.timeout(8):
+                while not self.queued(): await asyncio.sleep(.02)
+            result=await self.parent_tool('pi_wait_agent',{'run_ids':[run['run_id']]})
+            self.assertEqual(result['runs'][0]['ack'],0)
+            hold.unlink()
+            await self.wait_notice_state(sid,'recalled')
+            self.assertEqual(len(self.queued()),1)
+            self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':self.queued()[0]['id']}])
+        finally: hold.unlink(missing_ok=True)
+
+    async def test_ack_during_enqueue_waits_for_receipt_then_recalls_it(self):
+        sid=await self.open_parent(); hold=self.codex_home/('hold-'+self.parent); hold.touch()
+        ack=None
+        try:
+            run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'done','access':'read'})
+            async with asyncio.timeout(8):
+                while not self.queued(): await asyncio.sleep(.02)
+            result=await self.parent_tool('pi_agent_result',{'run_id':run['run_id']})
+            ack=asyncio.create_task(request(self.home,'ack',{'scope':sid,'run_id':run['run_id'],'request_id':'ack','result_sha256':result['result_sha256']},source=self.trusted_source()))
+            await asyncio.sleep(.05)
+            self.assertFalse(ack.done(),'ack must settle its in-flight notification before reporting completion')
+            hold.unlink()
+            self.assertTrue((await ack)['acknowledged'])
+            await self.wait_notice_state(sid,'recalled')
+            self.assertEqual(len(self.queued()),1);self.assertEqual(len(self.recalls()),1)
+        finally:
+            hold.unlink(missing_ok=True)
+            if ack: await asyncio.gather(ack,return_exceptions=True)
+
+    async def test_unavailable_recall_is_reported_without_resending(self):
+        (self.codex_home/'recall-reject').touch()
+        sid=await self.open_parent()
+        run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'done','access':'read'})
+        await self.settled_notifications(sid,1)
+        result=await self.parent_tool('pi_agent_result',{'run_id':run['run_id']})
+        ack=await self.parent_tool('pi_ack_result',{'run_id':run['run_id'],'request_id':'ack','result_sha256':result['result_sha256']})
+        self.assertTrue(ack['acknowledged']); self.assertEqual(ack['notification_recall'],'failed')
+        rows=await self.wait_notice_state(sid,'recall_failed')
+        self.assertTrue(rows[0]['error']); self.assertEqual(len(self.queued()),1)
+
+    async def test_consumed_message_is_not_claimed_recalled_or_reenqueued(self):
+        (self.codex_home/'already-consumed').touch()
+        sid=await self.open_parent()
+        run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'done','access':'read'})
+        await self.settled_notifications(sid,1)
+        result=await self.parent_tool('pi_agent_result',{'run_id':run['run_id']})
+        await self.parent_tool('pi_ack_result',{'run_id':run['run_id'],'request_id':'ack','result_sha256':result['result_sha256']})
+        await self.wait_notice_state(sid,'delivered')
+        self.assertEqual(len(self.queued()),1);self.assertEqual(len(self.recalls()),1)
 
     async def test_active_parent_wait_delivers_once_without_acknowledging(self):
         sid=await self.open_parent()
@@ -279,7 +412,7 @@ class ParentScheduleBounds(unittest.TestCase):
     def test_shutdown_done_callback_does_not_start_another_delivery(self):
         binding={'codex_home':'/tmp/codex','thread_id':str(uuid.uuid4())}
         notice={'id':'n1','scope':'s','run_id':'r','agent_id':'a','run_state':'completed',
-                'ack':0,'kind':'terminal','ui_id':None,'parent':dumps(binding),'priority':1,'created':0}
+                'ack':0,'kind':'terminal','ui_id':None,'parent':dumps(binding),'priority':2,'created':0,'state':'pending','handled':0}
         class StoreStub:
             queries=0
             def all(self,sql,args=()):
@@ -355,6 +488,20 @@ class ParentScheduleBounds(unittest.TestCase):
 
 
 class ParentDeliveryProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_or_stalled_recall_is_bounded_and_reaps_its_process(self):
+        for failure in ("print('x'*100000,flush=True)","os.close(1)","pass"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(prefix='parent-recall-') as tmp:
+                root=Path(tmp); wrapper=root/'codex'; pidfile=root/'pid'
+                wrapper.write_text('#!'+sys.executable+'\nimport os,time\nfrom pathlib import Path\n'
+                    +f'Path({str(pidfile)!r}).write_text(str(os.getpid()))\n{failure}\ntime.sleep(30)\n')
+                wrapper.chmod(0o755)
+                bound={'command':str(wrapper),'home':tmp,'codex_home':tmp,
+                       'path':os.environ.get('PATH',''),'thread_id':str(uuid.uuid4())}
+                with mock.patch.object(parent,'RECALL_TIMEOUT_SECONDS',.3):
+                    deleted,error=await asyncio.wait_for(parent.recall(bound,str(uuid.uuid4())),5)
+                self.assertIsNone(deleted); self.assertIn('notification may still arrive',error)
+                self.assertEqual(group_members(int(pidfile.read_text())),[])
+
     async def test_exited_queue_wrapper_cannot_leave_pipe_holding_child(self):
         with tempfile.TemporaryDirectory(prefix='parent-queue-group-') as tmp:
             root=Path(tmp); codex_home=root/'codex'; codex_home.mkdir()

@@ -30,7 +30,7 @@ TOOLS=[
       {**AGENT,'after':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':100},'max_bytes':{'type':'integer','minimum':1024,'maximum':16384},'detail':{'type':'string','enum':['tools','full'],'default':'tools'}},['agent_id'],True),
  tool('pi_agent_result','result','Read a terminal result in UTF-8 byte pages. Reading never acknowledges the result. Retain result_sha256 for explicit acknowledgement.',
       {**SCOPE,'run_id':ID,'offset':{'type':'integer','minimum':0},'max_bytes':{'type':'integer','minimum':256,'maximum':16384}},['run_id'],True),
- tool('pi_ack_result','ack','Acknowledge an exact run result only after it has been incorporated or explicitly dismissed. Does not delete session or result files.',
+ tool('pi_ack_result','ack','Acknowledge an exact run result only after it has been incorporated or explicitly dismissed. Recalls its queued notification when supported; notification_recall reports pending/failed cleanup. Does not delete session or result files.',
       {**SCOPE,**REQ,'run_id':ID,'result_sha256':S},['request_id','run_id','result_sha256']),
  tool('pi_close_agent','close','Stop work and terminate the owned process group. Preserve durable session and results. Also reaps a verified orphan.',
       {**AGENT,**REQ},['agent_id','request_id']),
