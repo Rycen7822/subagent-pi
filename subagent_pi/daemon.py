@@ -55,6 +55,7 @@ async def serve(home: Path):
                         disconnected.cancel()
                         await asyncio.gather(disconnected,return_exceptions=True)
                     value=await asyncio.shield(job)
+                    if track_delivery: await runtime.parent_notifications.settle_wait(reservation,value)
                     reply={'ok':True,'result':value}
                 except AgentError as e: reply={'ok':False,'error':e.as_dict()}
                 except (json.JSONDecodeError,UnicodeDecodeError): reply={'ok':False,'error':{'code':'invalid_json','message':'Invalid JSON request'}}

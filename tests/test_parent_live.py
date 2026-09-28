@@ -93,6 +93,12 @@ class LiveParentWakeup(McpHarness, unittest.IsolatedAsyncioTestCase):
                     return event['params']
 
     async def test_ack_retracts_busy_parent_notification_preserving_other_queue_entries(self):
+        await self.assert_busy_parent_recall('ack')
+
+    async def test_wait_consumes_notification_before_parent_finishes_without_ack(self):
+        await self.assert_busy_parent_recall('wait')
+
+    async def assert_busy_parent_recall(self,consumer):
         # Hold the real host busy so it cannot consume the notification before
         # the result is handled. All model traffic stays on the local mock.
         release=threading.Event(); entered=threading.Event()
@@ -123,18 +129,28 @@ class LiveParentWakeup(McpHarness, unittest.IsolatedAsyncioTestCase):
                 'input':[{'type':'text','text':'Unrelated user queue entry.'}]})
             before=(await self.app_rpc('thread/queue/list',{'threadId':parent}))['data']
             self.assertEqual(len(before),2)
-            result=await self.tool('pi_agent_result',{'scope':scope,'run_id':child['run_id']})
-            ack=await self.tool('pi_ack_result',{'scope':scope,'run_id':child['run_id'],'request_id':'ack',
-                'result_sha256':result['result_sha256']})
-            self.assertTrue(ack['acknowledged']); self.assertNotIn('notification_recall',ack)
+            if consumer=='ack':
+                result=await self.tool('pi_agent_result',{'scope':scope,'run_id':child['run_id']})
+                ack=await self.tool('pi_ack_result',{'scope':scope,'run_id':child['run_id'],'request_id':'ack',
+                    'result_sha256':result['result_sha256']})
+                self.assertTrue(ack['acknowledged']); self.assertNotIn('notification_recall',ack)
+            else:
+                response=await self.rpc('tools/call',{'name':'pi_wait_agent',
+                    'arguments':{'scope':scope,'run_ids':[child['run_id']]},'_meta':{'threadId':parent}})
+                attention=self.unpack(response)
+                self.assertFalse(response['result'].get('isError'),attention)
+                self.assertEqual(attention['runs'][0]['ack'],0)
             after=(await self.app_rpc('thread/queue/list',{'threadId':parent}))['data']
             self.assertEqual(after,[item for item in before if item['id']!=receipt])
             rows=(await self.tool('pi_list_agents',{'scope':scope}))['parent_notifications']['recent']
-            self.assertEqual(rows[0]['state'],'recalled')
+            self.assertEqual(rows[0]['state'],'recalled' if consumer=='ack' else 'observed')
             # Remove the test's unrelated entry, then let the parent finish.
             await self.app_rpc('thread/queue/delete',{'threadId':parent,'queuedSubmissionId':after[0]['id']})
             release.set(); await self.completed()
+            await self.tool('pi_list_agents',{'scope':scope})
+            self.assertEqual((await self.app_rpc('thread/queue/list',{'threadId':parent}))['data'],[])
             self.assertEqual(len(self.requests),1)
+            self.assertNotIn(child['run_id'],self.requests[0])
         finally:
             release.set()
 

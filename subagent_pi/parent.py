@@ -17,6 +17,7 @@ from .common import AgentError, dumps, group_members, read_frame
 
 QUEUE_TIMEOUT_SECONDS=30
 RECALL_TIMEOUT_SECONDS=10
+WAIT_HANDOFF_SECONDS=8  # Fits the existing wait IPC budget (requested wait + 10s).
 
 
 def capture(environ, thread_id):
@@ -79,7 +80,32 @@ class ParentNotifications:
         token=object()
         self.waits[token]=(params['scope'],frozenset(ids))
         params['run_ids']=ids  # Freeze the same selection for waiting and delivery.
+        for rid in ids:
+            self.store.execute("UPDATE parent_notifications SET state='recalling',error=NULL WHERE scope=? AND run_id=? AND state='recall_failed' AND queued_id IS NOT NULL",
+                               (params['scope'],rid))
+        self.schedule()
         return token
+
+    async def settle_wait(self, token, response):
+        """A wait cannot deliver an event while its earlier wakeup can still arrive."""
+        reservation=self.waits.get(token)
+        if not reservation: return
+        sid,ids=reservation
+        events=[(r['id'],'terminal',None) for r in response['runs'] if r['id'] in ids and r.get('result')]
+        events.extend((q['run_id'],'question',q['id']) for q in response['questions'] if q['run_id'] in ids)
+        until=asyncio.get_running_loop().time()+WAIT_HANDOFF_SECONDS
+        while True:
+            self.schedule()
+            rows=[row for rid,kind,ui_id in events for row in self.store.all(
+                'SELECT state FROM parent_notifications WHERE scope=? AND run_id=? AND kind=? AND ui_id IS ?',
+                (sid,rid,kind,ui_id))]
+            if any(r['state'] in ('unknown','recall_failed') for r in rows):
+                raise AgentError('notification_handoff_failed','Wait result was not delivered: its earlier parent notification could not be settled. Inspect parent_notifications before retrying.')
+            if not any(r['state'] in ('sending','queued','recalling') for r in rows): return
+            remaining=until-asyncio.get_running_loop().time()
+            if remaining<=0 or not self.deliveries:
+                raise AgentError('notification_handoff_pending','Wait result was not delivered: an earlier parent notification is still being settled. Retry wait; the run was not cancelled.')
+            await asyncio.wait(tuple(self.deliveries.values()),timeout=remaining,return_when=asyncio.FIRST_COMPLETED)
 
     def release_wait(self, token, response=None):
         reservation=self.waits.pop(token,None)
@@ -117,7 +143,7 @@ class ParentNotifications:
     def schedule(self):
         """At most four independent parent queues; no sender blocks another parent."""
         if self.closing or len(self.deliveries)>=4: return
-        priority="CASE WHEN n.state='queued' THEN 0 WHEN n.kind='question' THEN 1 ELSE 2 END"
+        priority="CASE WHEN n.state IN ('queued','recalling') THEN 0 WHEN n.kind='question' THEN 1 ELSE 2 END"
         cursor=None
         while len(self.deliveries)<4:
             busy=tuple(self.deliveries)
@@ -128,8 +154,7 @@ class ParentNotifications:
             notices=self.store.all(
                 f'SELECT n.*,s.parent,r.agent_id,r.ack,r.state AS run_state,{priority} AS priority '
                 'FROM parent_notifications n JOIN scopes s ON s.id=n.scope '
-                f"JOIN runs r ON r.id=n.run_id AND r.scope=n.scope WHERE (n.state='pending' OR "
-                f"(n.state='queued' AND (n.handled=1 OR r.ack=1 OR n.kind='question'))){blocked}{after} "
+                f"JOIN runs r ON r.id=n.run_id AND r.scope=n.scope WHERE n.state IN ('pending','queued','recalling'){blocked}{after} "
                 f'ORDER BY {priority},n.created,n.id LIMIT 64',args)
             if not notices: break
             for notice in notices:
@@ -138,18 +163,21 @@ class ParentNotifications:
                      'state':notice['run_state'],'ack':notice['ack']}
                 worker=self.worker_for(run['agent_id'])
                 relevant=not notice['handled'] and ((not run['ack']) if notice['kind']=='terminal' else bool(worker and worker.run_id==run['id'] and notice['ui_id'] in worker.ui))
-                recalling=notice['state']=='queued'
-                if recalling and relevant: continue
+                waiting=any(sid==notice['scope'] and notice['run_id'] in ids for sid,ids in self.waits.values())
+                recalling=notice['state'] in ('queued','recalling')
+                if notice['state']=='queued' and relevant and not waiting: continue
                 if not recalling:
                     if not relevant:
                         self.store.execute("UPDATE parent_notifications SET state='superseded' WHERE id=?",(notice['id'],)); continue
-                    if any(sid==notice['scope'] and notice['run_id'] in ids for sid,ids in self.waits.values()): continue
+                    if waiting: continue
                 parent=json.loads(notice['parent'])
                 key=(parent['codex_home'],parent['thread_id'])
                 if key in self.deliveries: continue
                 # Claim before scheduling; subsequent notify() calls cannot send twice.
                 if recalling:
-                    self.store.execute("UPDATE parent_notifications SET state='recalling',handled=1 WHERE id=?",(notice['id'],))
+                    # A wait reservation is not consumption. Failed output must
+                    # leave its event eligible for a fresh automatic wakeup.
+                    self.store.execute("UPDATE parent_notifications SET state='recalling',handled=? WHERE id=?",(int(not relevant),notice['id']))
                     task=self.spawn_task(self.recall(notice,parent))
                 else:
                     self.store.execute("UPDATE parent_notifications SET state='sending' WHERE id=?",(notice['id'],))
@@ -167,9 +195,19 @@ class ParentNotifications:
         # retried after restart: deletion of the same ID is idempotent.
         deleted,error=await recall(parent,notice['queued_id'])
         state='recalled' if deleted is True else 'delivered' if deleted is False else 'recall_failed'
+        current=self.store.one('SELECT handled FROM parent_notifications WHERE id=?',(notice['id'],))
+        if deleted is True and not current['handled']: state='pending'
         self.store.execute('UPDATE parent_notifications SET state=?,error=? WHERE id=?',(state,error,notice['id']))
 
     async def deliver(self, notice, run, parent):
+        current=self.store.one('SELECT handled FROM parent_notifications WHERE id=?',(notice['id'],))
+        run=self.store.run(notice['scope'],notice['run_id'])
+        worker=self.worker_for(run['agent_id'])
+        relevant=not current['handled'] and ((not run['ack']) if notice['kind']=='terminal' else bool(worker and worker.run_id==run['id'] and notice['ui_id'] in worker.ui))
+        waiting=any(sid==notice['scope'] and run['id'] in ids for sid,ids in self.waits.values())
+        if not relevant or waiting:
+            self.store.execute('UPDATE parent_notifications SET state=? WHERE id=?',('pending' if relevant else 'superseded',notice['id']))
+            return
         data={'notification_id':notice['id'],'scope':notice['scope'],'agent_id':run['agent_id'],
               'name':self.store.agent(notice['scope'],run['agent_id'])['name'],
               'run_id':run['id'],'event':notice['kind'],'state':run['state']}

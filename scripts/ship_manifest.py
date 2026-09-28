@@ -18,7 +18,7 @@ EXCLUDED_DIRS = {
 }
 # Local agent-instruction files are gitignored but carry no runtime value.
 EXCLUDED_FILES = {
-    'CLAUDE.md', 'GEMINI.md', 'AGENTS.local.md', 'TODO.md', 'NOTES.md',
+    'CLAUDE.md', 'GEMINI.md', 'AGENTS.local.md', 'CODEX_STATE.md', 'TODO.md', 'NOTES.md',
     'daemon.log', 'daemon.previous.log', 'FILES.sha256',
 }
 EXCLUDED_SUFFIXES = {'.pyc', '.zip', '.sqlite', '.sqlite-wal', '.sqlite-shm'}

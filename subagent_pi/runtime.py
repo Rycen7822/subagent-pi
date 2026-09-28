@@ -176,7 +176,8 @@ class Runtime:
         """A new daemon cannot recover old pipes; never claim a live orphan is
         reattached. Every resident row is re-judged from its owner record."""
         self.store.execute("UPDATE parent_notifications SET state='unknown',error='Daemon restarted during delivery; not retried' WHERE state='sending'")
-        self.store.execute("UPDATE parent_notifications SET state='queued',handled=1 WHERE state='recalling'")
+        # Keep exact-ID recall intent across restart. A wait reservation does
+        # not imply delivered output; handled=0 must still permit a wakeup.
         for a in self.store.all('SELECT * FROM agents'):
             verdict = ownership(self.home/'agents'/a['id'], a)
             if a['state'] in RESIDENT_AGENT_STATES:
