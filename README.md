@@ -4,7 +4,7 @@
 
 让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、任务内有序续跑、排队 follow-up、检查工作轨迹、中断、关闭、恢复原会话、收取结果。
 
-这是完整源码版 `0.3.0`，针对 **Linux / WSL2，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
+这是完整源码版 `0.4.0`，针对 **Linux / WSL2，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
 
 受管子进程使用原版 Pi 的公开 SDK（本轮离线验证版本 0.99.1），无需修改 Pi。主代理使用 V2 风格的消息、后续任务和软中断操作；中断通常保留进程，无法确认整个任务退出时核验并终止进程组。空闲进程默认 30 分钟后自动卸载，session 和结果保留。详见 `docs/lifecycle.md`。
 

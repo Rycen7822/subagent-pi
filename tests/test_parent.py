@@ -63,7 +63,7 @@ else:
     async def settled_notifications(self,sid,count):
         until=asyncio.get_running_loop().time()+8
         while asyncio.get_running_loop().time()<until:
-            state=await self.tool('pi_list_agents',{'scope':sid})
+            state=await self.tool('pi_context',{'cwd':str(self.workspace),'scope':sid})
             rows=state['parent_notifications']['recent']
             if len(rows)>=count and all(n['state'] not in ('pending','sending','recalling') for n in rows): return rows
             await asyncio.sleep(.02)
@@ -220,7 +220,7 @@ else:
     async def wait_notice_state(self,sid,state):
         async with asyncio.timeout(8):
             while True:
-                rows=(await self.tool('pi_list_agents',{'scope':sid}))['parent_notifications']['recent']
+                rows=(await self.tool('pi_context',{'cwd':str(self.workspace),'scope':sid}))['parent_notifications']['recent']
                 if rows and rows[0]['state']==state: return rows
                 await asyncio.sleep(.02)
 
@@ -245,7 +245,7 @@ else:
         run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'done','access':'read'})
         notice=(await self.settled_notifications(sid,1))[0]
         result=await self.parent_tool('pi_wait_agent',{'run_ids':[run['run_id']]})
-        self.assertEqual(result['runs'][0]['ack'],0)
+        self.assertFalse((await self.parent_tool('pi_agent_result',{'scope':sid,'run_id':run['run_id']}))['acknowledged'])
         self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':notice['queued_id']}])
         await self.wait_notice_state(sid,'observed')
 
@@ -263,7 +263,7 @@ else:
             self.assertFalse(waiting.done())
             hold.unlink()
             result=await waiting
-            self.assertEqual(result['runs'][0]['ack'],0)
+            self.assertFalse((await self.parent_tool('pi_agent_result',{'scope':sid,'run_id':run['run_id']}))['acknowledged'])
             await self.wait_notice_state(sid,'observed')
             self.assertEqual(len(self.queued()),1)
             self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':self.queued()[0]['id']}])
@@ -329,6 +329,10 @@ else:
         self.assertTrue(ack['acknowledged']); self.assertEqual(ack['notification_recall'],'failed')
         rows=await self.wait_notice_state(sid,'recall_failed')
         self.assertTrue(rows[0]['error']); self.assertEqual(len(self.queued()),1)
+        listing=await self.tool('pi_list_agents',{'scope':sid})
+        self.assertEqual(listing['parent_notifications'],{'enabled':True,'failed':1})
+        full=await self.tool('pi_inspect_agent',{'scope':sid,'agent_id':run['agent_id'],'detail':'full','max_bytes':16384})
+        self.assertEqual(full['parent_notifications']['recent'][0]['state'],'recall_failed')
 
     async def test_consumed_message_is_not_claimed_recalled_or_reenqueued(self):
         (self.codex_home/'already-consumed').touch()
@@ -345,13 +349,13 @@ else:
         run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'delay=0.3|done','access':'read'})
         result=await self.parent_tool('pi_wait_agent',{'run_ids':[run['run_id']]})
         self.assertEqual(result['reason'],'completed')
-        self.assertEqual(result['runs'][0]['ack'],0)
+        self.assertFalse((await self.parent_tool('pi_agent_result',{'scope':sid,'run_id':run['run_id']}))['acknowledged'])
         rows=await self.settled_notifications(sid,1)
         self.assertEqual(rows[0]['state'],'observed'); self.assertEqual(self.queued(),[])
         await self.restart_daemon()
         again=await self.parent_tool('pi_wait_agent',{'scope':sid,'run_ids':[run['run_id']],'timeout_seconds':0})
         self.assertEqual(again['runs'][0]['result']['result_sha256'],result['runs'][0]['result']['result_sha256'])
-        self.assertEqual(again['runs'][0]['ack'],0); self.assertEqual(self.queued(),[])
+        self.assertFalse((await self.parent_tool('pi_agent_result',{'scope':sid,'run_id':run['run_id']}))['acknowledged']); self.assertEqual(self.queued(),[])
         await self.parent_tool('pi_ack_result',{'scope':sid,'run_id':run['run_id'],'request_id':'ack',
             'result_sha256':result['runs'][0]['result']['result_sha256']})
         self.assertEqual(self.queued(),[])
@@ -403,7 +407,7 @@ else:
         try:
             with self.assertRaises(BrokenPipeError):
                 await request(self.home,'wait',params,source=self.trusted_source(),on_result=broken_output)
-            state=await self.tool('pi_list_agents',{'scope':sid})
+            state=await self.tool('pi_context',{'cwd':str(self.workspace),'scope':sid})
             self.assertEqual(state['parent_notifications']['recent'][0]['state'],'pending')
             self.assertEqual(self.queued(),[])
         finally:
@@ -441,7 +445,7 @@ else:
             rows=await self.settled_notifications(second,1)
             self.assertEqual(rows[0]['state'],'queued')
             self.assertEqual([m['thread'] for m in self.queued()],[self.parent,other])
-            state=await self.tool('pi_list_agents',{'scope':sid})
+            state=await self.tool('pi_context',{'cwd':str(self.workspace),'scope':sid})
             self.assertEqual(state['parent_notifications']['recent'][0]['state'],'sending')
         finally: hold.unlink()
         await self.settled_notifications(sid,1)

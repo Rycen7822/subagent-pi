@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import time
 
+from . import parent
 from .common import TERMINAL, DEFAULT_WAIT_SECONDS, AgentError, crop, dumps, identifier, integer, text
 
 def model_settings(a):
@@ -19,7 +20,6 @@ def agent_status(store,a):
 def listed_agent(store,a,w=None):
     result={k:a[k] for k in ('id','name','state')}
     result['agent_status']=agent_status(store,a)
-    result.update({k:v for k,v in model_settings(a).items() if k!='available_thinking'})
     return result
 
 def brief_agent(a, w=None):
@@ -32,7 +32,9 @@ def brief_agent(a, w=None):
     return result
 
 def brief_run(r):
-    return {k:r[k] for k in ('id','agent_id','state','result_sha','ack','error','name')}
+    result={k:r[k] for k in ('id','agent_id','name','state')}
+    if r['error']: result['error']=r['error']
+    return result
 
 def runs_for_ids(store, sid, ids):
     if not ids: return []
@@ -59,10 +61,10 @@ def result_row(r, limit, offset=0):
         try: content=raw.decode('utf-8'); used=len(raw)
         except UnicodeDecodeError: raise AgentError('invalid_offset','Offset must be a UTF-8 boundary returned by this tool')
     usage=json.loads(r['usage'])
-    return {'run':{**brief_run(r),**{k:r[k] for k in ('created','started','ended','idle_timeout_seconds')}},'text':content,'result_sha256':r['result_sha'],
-            'offset':offset,'next_offset':offset+used,'has_more':offset+used<size,'total_bytes':size,
-            'artifact_path':str(path),'acknowledged':bool(r['ack']),
-            'result_truncated':usage.get('result_truncated',False),'usage':usage}
+    return {'run':brief_run(r),'text':content,'result_sha256':r['result_sha'],
+            'next_offset':offset+used,'has_more':offset+used<size,'total_bytes':size,
+            'acknowledged':bool(r['ack']),'result_truncated':usage.get('result_truncated',False)}
+
 
 def wait_run_ids(store,p):
     sid=p['scope']
@@ -86,7 +88,7 @@ class ReadViews:
         rows=self.store.all("""SELECT r.*, a.name FROM runs r JOIN agents a ON a.id=r.agent_id
                              WHERE r.scope=? AND r.ack=0 ORDER BY r.created DESC LIMIT ?""",(sid,limit))
         count=self.store.one("SELECT COUNT(*) n FROM runs WHERE scope=? AND ack=0",(sid,))['n']
-        return {'revision':self.store.scope(sid)['revision'],'runs':[brief_run(r) for r in rows], 'total':count,'omitted':max(0,count-len(rows))}
+        return {'runs':[brief_run(r) for r in rows], 'total':count,'omitted':max(0,count-len(rows))}
 
     def inspect(self,p):
         a=self.store.resolve_agent(p['scope'],text(p.get('agent_id'),'agent_id',128))
@@ -100,10 +102,19 @@ class ReadViews:
         rows=self.store.all(sql+' ORDER BY seq LIMIT ?',(a['id'],after,limit+1))
         receipts=self.store.all('SELECT id,run_id,state,updated FROM receipts WHERE agent_id=? ORDER BY created DESC LIMIT 5',(a['id'],))
         result={'agent':brief_agent(a,self.worker_for(a['id'])),'events':[],'next_cursor':after,'has_more':False,'receipts':receipts}
-        current=a['current_run']
-        if current:
-            run=self.store.run(p['scope'],current)
-            result['run']={k:run[k] for k in ('id','created','started','ended','idle_timeout_seconds')}
+        run=self.store.run(p['scope'],a['current_run']) if a['current_run'] else self.store.one(
+            "SELECT * FROM runs WHERE agent_id=? AND state!='queued' ORDER BY created DESC LIMIT 1",(a['id'],))
+        if run:
+            result['run']={k:run[k] for k in ('id','state')}
+            if detail=='full':
+                result['run'].update({k:run[k] for k in ('created','started','ended','idle_timeout_seconds')})
+                result['run'].update(artifact_path=run['result_path'],usage=json.loads(run['usage']),acknowledged=bool(run['ack']))
+        if detail=='full': result['parent_notifications']=parent.status(self.store,p['scope'])
+        # Large diagnostic metadata must not consume the event page's budget.
+        if len(dumps(result).encode())>budget:
+            if run: result['run']={k:run[k] for k in ('id','state')}
+            result.pop('parent_notifications',None)
+            result['diagnostics_truncated']=True
         earliest=self.store.one('SELECT MIN(seq) n FROM events WHERE agent_id=?',(a['id'],))['n']
         result['history_pruned']=bool(after and earliest and after<earliest-1)
         # Grow the page one event at a time and measure the increment, so the byte
@@ -124,6 +135,10 @@ class ReadViews:
         if len(dumps(result).encode())>budget:
             result['agent']={k:a[k] for k in ('id','state','generation','current_run')}
             result['receipts']=result['receipts'][:1]
+            if detail=='full':
+                if run: result['run']={k:run[k] for k in ('id','state')}
+                result.pop('parent_notifications',None)
+                result['diagnostics_truncated']=True
         while len(dumps(result).encode())>budget and result['events']:
             if len(result['events'])==1:
                 result['events'][0]['data']={'truncated':True}
@@ -172,7 +187,6 @@ class ReadViews:
                                                  for question in list(worker.ui.values())[:4])
                         runs.append(item)
                     reason='timeout' if not ready else 'needs_input' if attention else 'failed_or_stopped' if failures else 'completed' if done else 'empty' if not ids else 'timeout'
-                    return {'scope':sid,'timed_out':not ready,'reason':reason,'runs':runs,'questions':questions,
-                            'outstanding_revision':self.store.scope(sid)['revision']}
+                    return {'scope':sid,'timed_out':not ready,'reason':reason,'runs':runs,'questions':questions}
                 try: await asyncio.wait_for(self.changed.wait(),until-time.monotonic())
                 except asyncio.TimeoutError: pass

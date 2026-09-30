@@ -70,11 +70,11 @@ respawn 是幂等的确保加载：worker 仍存活时不改变任何状态并�
 
 `questions` 带 agent_id、run_id、问题 id、正文和选择项，供 `pi_answer_agent` 使用；模型可调用仅在受管子进程注册的 `ask_parent`，暂停工具执行直到显式回答。回答不会自动批准其他请求。标准安装使用 Codex 原生清单，为本插件设置 3630 秒 MCP 超时，覆盖一小时等待及传输余量；其他 MCP 客户端或手动使用通用清单时，仍需保证外层工具超时足够长。
 
-wait 的每个终态结果最多预读 2 KiB，整页文本共用 8 KiB 预算；`has_more` 时从 next_offset 调 result。读结果不 ack，仍需精确 hash 确认。时间戳等轨迹细节留在 inspect 和 result，默认 run 摘要不重复输出。
+wait 的每个终态结果最多预读 2 KiB，整页文本共用 8 KiB 预算；`has_more` 时从 next_offset 调 result。读结果不 ack，仍需精确 hash 确认。result 仅返回 run 身份/状态/非空错误、正文、单个 result_sha256、分页、acknowledged 和截断标记；不回显 offset，不重复整数 ack。时间戳、用量和结果路径在 inspect(detail=full)，包括空闲 agent 的最近一次任务。list 的 outstanding 保留未确认任务身份、状态、total/omitted；不返回 revision。
 
 IPC 的连接、请求写入和响应读取共用调用预算；已写出结果后的交付回执最多等 1 秒，连接关闭最多再等 1 秒，不会因回执失败重复返回结果。daemon 响应写入和交付确认共用 10 秒预算。MCP stdout 非阻塞串行写入，单帧最多等 45 秒；半帧输出被取消或写失败时关闭该连接，避免后续 JSON 拼接损坏。上述传输失败不取消后台任务，不自动重发操作。
 
-父会话身份来自 Codex 每次 MCP 调用的 `_meta.threadId`（CLI 则读自身 CODEX_THREAD_ID），不接受模型参数指定父代理。scope 默认值按父会话隔离；绑定后不能静默改指另一个父会话。其他会话仍可用显式 scope 读取旧结果，创建新任务需使用自己的 scope。parent_notifications 在 context/list 返回绑定及最近投递状态。
+父会话身份来自 Codex 每次 MCP 调用的 `_meta.threadId`（CLI 则读自身 CODEX_THREAD_ID），不接受模型参数指定父代理。scope 默认值按父会话隔离；绑定后不能静默改指另一个父会话。其他会话仍可用显式 scope 读取旧结果，创建新任务需使用自己的 scope。list 的 parent_notifications 只返回 enabled，以及存在 unknown/recall_failed 时的 failed 数量。完整绑定和最近投递状态在 inspect(detail=full) 或显式管理 context 返回。
 
 完成、失败、崩溃、取消、中断、超时或问题产生持久通知；插件调用 `codex queue --thread … --message …`，由原 Codex 进程读取队列。父会话已完成回合但仍加载时会自动开启后续回合；忙碌时等到空闲，跨进程检查通常约 10 秒。不会强制打断正在工作的父代理，也不会复活已经关闭或明确中断的父会话。通知只带任务定位和事件类型，明确标为自动子代理事件，不构成用户授权。
 

@@ -54,8 +54,13 @@ def bind(store,sid,source,allow_new=True):
         store.execute('UPDATE scopes SET parent=? WHERE id=?',(dumps(parent),sid))
 
 
-def status(store,sid):
+def status(store,sid,compact=False):
     raw=store.scope(sid)['parent']
+    if compact:
+        result={'enabled':bool(raw and json.loads(raw)['command'])}
+        failed=store.one("SELECT COUNT(*) n FROM parent_notifications WHERE scope=? AND state IN ('unknown','recall_failed')",(sid,))['n']
+        if failed: result['failed']=failed
+        return result
     if not raw: return {'enabled':False,'reason':'no_parent_identity'}
     parent=json.loads(raw)
     return {'enabled':bool(parent['command']),'thread_id':parent['thread_id'],'transport':'codex_queue',

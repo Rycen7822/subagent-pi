@@ -48,7 +48,7 @@ tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
 # thinking = "medium"
 ```
 
-默认不硬编码任何模型。首先使用 spawn 显式 model，其次 profile model，最后由 Pi 自行选择；启动完成后保存 Pi 报告的 provider/model ID，后续恢复继续使用。`thinking` 同样支持 spawn / CLI `--thinking` 覆盖 profile；未指定时由 Pi 的模型默认/全局设置决定。插件用实际 session.getAvailableThinkingLevels() 校验显式等级，不支持则在提交任务前报错并列出可用项；不会静默钳制。spawn/inspect/list 返回 thinking 与 available_thinking，恢复固定已选等级。它不会固定 API 服务端模型权重，也不会锁定可执行文件的全部依赖字节。
+默认不硬编码任何模型。首先使用 spawn 显式 model，其次 profile model，最后由 Pi 自行选择；启动完成后保存 Pi 报告的 provider/model ID，后续恢复继续使用。`thinking` 同样支持 spawn / CLI `--thinking` 覆盖 profile；未指定时由 Pi 的模型默认/全局设置决定。插件用实际 session.getAvailableThinkingLevels() 校验显式等级，不支持则在提交任务前报错并列出可用项；不会静默钳制。spawn/inspect 返回 thinking 与 available_thinking；list 仅返回身份和状态，恢复固定已选等级。它不会固定 API 服务端模型权重，也不会锁定可执行文件的全部依赖字节。
 
 受管子代理加载 Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes 与 settings，然后继承 Codex 的 skills 与 MCP。上下文文件采用固定规则：Pi 全局 `AGENTS.md`（包括 Pi 的同目录 override/CLAUDE 优先级）仍加载；子代理 cwd 的项目 AGENTS/CLAUDE 不加载；项目指令来自 `pi_context` 绑定目录的 `SUBAGENT-PI.md`，每次新建/respawn 重新读取。Pi 用来定位自己配置目录的 `PI_CODING_AGENT_DIR` 会随 scope 绑定：CLI/MCP 客户端进程里的取值经 scope 快照传到子进程，daemon 重启后仍按记录恢复；未设置时保持 Pi 默认（`$HOME/.pi/agent`），profile 的 `[profiles.x.env] PI_CODING_AGENT_DIR` 仍然优先。`ambient_extensions` / `ambient_skills` 默认 `true`，是**显式退出开关**（设为 `false` 会重新加上 `--no-extensions` / `--no-skills`）。
 

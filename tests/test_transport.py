@@ -318,7 +318,7 @@ class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         done=await self.tool('pi_wait_agent',{'run_ids':[run['run_id']],'timeout_seconds':4})
         result=done['runs'][0]['result']
         self.assertEqual(result['text'],'Completed: bound scope')
-        self.assertFalse(result['has_more']); self.assertFalse(done['runs'][0]['ack'])
+        self.assertFalse(result['has_more']); self.assertFalse((await self.tool('pi_agent_result',{'run_id':run['run_id']}))['acknowledged'])
         await self.tool('pi_ack_result',{'request_id':'ack-bound','run_id':run['run_id'],'result_sha256':result['result_sha256']})
         await self.tool('pi_close_agent',{'agent_id':run['agent_id'],'request_id':'stop-bound'})
         self.mcp.stdin.close(); await self.mcp.wait(); await self.stderr_task

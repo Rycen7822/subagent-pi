@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio
+import hashlib
+from pathlib import Path
 import json
 import os
 import sys
@@ -171,3 +173,57 @@ class V2TransportTests(McpHarness,unittest.IsolatedAsyncioTestCase):
             r=await self.rpc('tools/call',{'name':name,'arguments':args}); value=self.unpack(r)
             self.assertFalse(r['result']['isError'],value); self.assertEqual(value,r['result']['structuredContent'])
             validate(value,BY_NAME[name]['outputSchema'])
+
+    async def test_compact_read_contract_preserves_paging_ack_and_diagnostics(self):
+        await self.initialize()
+        async def checked(name,args):
+            response=await self.rpc('tools/call',{'name':name,'arguments':args})
+            value=self.unpack(response)
+            self.assertFalse(response['result']['isError'],value)
+            self.assertEqual(value,response['result']['structuredContent'])
+            validate(value,BY_NAME[name]['outputSchema'])
+            return value
+        args={'cwd':str(self.workspace),'task':'BIG','name':'results','access':'read','request_id':'big'}
+        a=await checked('pi_spawn_agent',args)
+        retried=await checked('pi_spawn_agent',args)
+        self.assertEqual(retried['run_id'],a['run_id']); self.assertTrue(retried['replayed'])
+        done=await checked('pi_wait_agent',{'run_ids':[a['run_id']],'timeout_seconds':8})
+        summary=done['runs'][0]
+        self.assertEqual(summary['state'],'completed')
+        self.assertNotIn('ack',summary); self.assertNotIn('result_sha',summary); self.assertNotIn('error',summary)
+        preview=summary['result']; self.assertTrue(preview['has_more'])
+        page=await checked('pi_agent_result',{'run_id':a['run_id'],'offset':preview['next_offset'],'max_bytes':16384})
+        self.assertFalse(page['acknowledged']); self.assertNotIn('offset',page)
+        self.assertNotIn('usage',page); self.assertNotIn('artifact_path',page)
+        self.assertNotIn('created',page['run'])
+        contents=preview['text']+page['text']
+        while page['has_more']:
+            page=await checked('pi_agent_result',{'run_id':a['run_id'],'offset':page['next_offset'],'max_bytes':16384})
+            self.assertFalse(page['acknowledged']); contents+=page['text']
+        self.assertEqual(hashlib.sha256(contents.encode()).hexdigest(),page['result_sha256'])
+        self.assertEqual(preview['result_sha256'],page['result_sha256'])
+        listing=await checked('pi_list_agents',{})
+        self.assertEqual(listing['parent_notifications'],{'enabled':False})
+        self.assertNotIn('resolved_model',listing['agents'][0]); self.assertNotIn('thinking',listing['agents'][0])
+        self.assertEqual(listing['outstanding']['runs'][0]['id'],a['run_id'])
+        normal=await checked('pi_inspect_agent',{'agent_id':'results','max_bytes':16384})
+        self.assertNotIn('parent_notifications',normal)
+        self.assertEqual(normal['agent']['resolved_model'],a['resolved_model'])
+        self.assertEqual(normal['agent'].get('thinking'),a.get('thinking'))
+        full=await checked('pi_inspect_agent',{'agent_id':'results','detail':'full','max_bytes':16384})
+        self.assertEqual(full['run']['id'],a['run_id']); self.assertEqual(full['run']['state'],'completed')
+        self.assertFalse(full['run']['acknowledged']); self.assertIsNotNone(full['run']['ended'])
+        self.assertTrue(full['run']['usage'])
+        self.assertEqual(Path(full['run']['artifact_path']).read_text(),contents)
+        self.assertIn('parent_notifications',full)
+        ack_args={'run_id':a['run_id'],'result_sha256':page['result_sha256'],'request_id':'ack-big'}
+        ack=await checked('pi_ack_result',ack_args); self.assertTrue(ack['acknowledged'])
+        self.assertTrue((await checked('pi_ack_result',ack_args))['replayed'])
+        self.assertTrue((await checked('pi_agent_result',{'run_id':a['run_id']}))['acknowledged'])
+        self.assertEqual((await checked('pi_list_agents',{}))['outstanding']['total'],0)
+        await checked('pi_send_message',{'agent_id':'results','message':'idle history','request_id':'idle-msg'})
+        asking=await checked('pi_followup_task',{'agent_id':'results','message':'UI_CONFIRM','request_id':'ask'})
+        question=(await checked('pi_wait_agent',{'run_ids':[asking['run_id']],'timeout_seconds':8}))['questions'][0]
+        await checked('pi_answer_agent',{'agent_id':'results','ui_request_id':question['id'],'answer':True,'request_id':'answer'})
+        await checked('pi_wait_agent',{'run_ids':[asking['run_id']],'timeout_seconds':8})
+        await checked('pi_interrupt_agent',{'agent_id':'results','request_id':'idle-stop'})

@@ -66,7 +66,7 @@ async def serve_mcp(home):
                 initialized=True
                 result={'protocolVersion':version,'capabilities':{'tools':{'listChanged':False}},
                         'serverInfo':{'name':'subagent-pi','version':__version__},
-                        'instructions':'Start pi_spawn_agent with the actual workspace cwd to bind this connection. Management scope/recovery operations remain available through the CLI or explicit legacy calls. Tasks run outside the Codex native subagent runtime. Bound Codex parents receive queued attention on completion, failure, stop or questions. Check parent_notifications in pi_context; unbound callers must use wait. Keep mutation request_id stable for retries.'}
+                        'instructions':'Start pi_spawn_agent with the actual workspace cwd to bind this connection. Management scope/recovery operations remain available through the CLI or explicit legacy calls. Tasks run outside the Codex native subagent runtime. Bound Codex parents receive queued attention on completion, failure, stop or questions. Use inspect detail=full for notification diagnostics; unbound callers must use wait. Keep mutation request_id stable for retries.'}
             elif method=='ping': result={}
             elif not initialized: await error(rid,-32002,'Initialize first'); return
             elif method=='tools/list': result={'tools':[{k:v for k,v in t.items() if k!='_op'} for t in TOOLS]}

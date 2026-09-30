@@ -119,7 +119,7 @@ class LiveParentWakeup(McpHarness, unittest.IsolatedAsyncioTestCase):
             child=await self.tool('pi_spawn_agent',{'scope':scope,'request_id':'done','task':'Reply briefly.','access':'read'})
             async with asyncio.timeout(20):
                 while True:
-                    rows=(await self.tool('pi_list_agents',{'scope':scope}))['parent_notifications']['recent']
+                    rows=(await self.tool('pi_context',{'cwd':str(self.workspace),'scope':scope}))['parent_notifications']['recent']
                     if rows and rows[0]['state']=='queued': break
                     await asyncio.sleep(.05)
             receipt=rows[0]['queued_id']
@@ -139,15 +139,15 @@ class LiveParentWakeup(McpHarness, unittest.IsolatedAsyncioTestCase):
                     'arguments':{'scope':scope,'run_ids':[child['run_id']]},'_meta':{'threadId':parent}})
                 attention=self.unpack(response)
                 self.assertFalse(response['result'].get('isError'),attention)
-                self.assertEqual(attention['runs'][0]['ack'],0)
+                self.assertFalse((await self.tool('pi_agent_result',{'scope':scope,'run_id':child['run_id']}))['acknowledged'])
             after=(await self.app_rpc('thread/queue/list',{'threadId':parent}))['data']
             self.assertEqual(after,[item for item in before if item['id']!=receipt])
-            rows=(await self.tool('pi_list_agents',{'scope':scope}))['parent_notifications']['recent']
+            rows=(await self.tool('pi_context',{'cwd':str(self.workspace),'scope':scope}))['parent_notifications']['recent']
             self.assertEqual(rows[0]['state'],'recalled' if consumer=='ack' else 'observed')
             # Remove the test's unrelated entry, then let the parent finish.
             await self.app_rpc('thread/queue/delete',{'threadId':parent,'queuedSubmissionId':after[0]['id']})
             release.set(); await self.completed()
-            await self.tool('pi_list_agents',{'scope':scope})
+            await self.tool('pi_context',{'cwd':str(self.workspace),'scope':scope})
             self.assertEqual((await self.app_rpc('thread/queue/list',{'threadId':parent}))['data'],[])
             self.assertEqual(len(self.requests),1)
             self.assertNotIn(child['run_id'],self.requests[0])

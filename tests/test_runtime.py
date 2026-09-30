@@ -127,7 +127,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         terminal=await self.wait(s['run_id'])
         self.assertFalse(terminal['timed_out'])
         self.assertEqual(terminal['runs'][0]['state'],'completed')
-        self.assertIsNone(terminal['runs'][0]['error'])
+        self.assertNotIn('error',terminal['runs'][0])
         self.assertEqual((await self.result(s['run_id']))['text'],'Completed: work')
         retries=[json.loads(e['payload']) for e in self.events(s['agent_id'],'agent_end')]
         self.assertIn(True,[e.get('willRetry') for e in retries])
@@ -140,7 +140,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         s=await self.spawn('compact=1|settle=0.3|work')
         terminal=await self.wait(s['run_id'])
         self.assertFalse(terminal['timed_out'])
-        self.assertIsNone(terminal['runs'][0]['error'])
+        self.assertNotIn('error',terminal['runs'][0])
         self.assertEqual((await self.result(s['run_id']))['text'],'Completed: work')
         kinds=[e['type'] for e in self.rt.store.all('SELECT type FROM events WHERE agent_id=? ORDER BY created',(s['agent_id'],))]
         self.assertEqual(kinds.count('run_terminal'),1)
@@ -1030,6 +1030,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         a=await self.spawn('BIG'); await self.wait(a['run_id'])
         r=await self.rt.dispatch('inspect',{'scope':self.scope,'agent_id':a['agent_id'],'max_bytes':1024,'detail':'full'})
         self.assertLessEqual(len(dumps(r).encode()),1024)
+        # Stored diagnostics can be much larger than the requested event page.
+        self.rt.store.execute('UPDATE runs SET usage=? WHERE id=?',(dumps({'large':'x'*20000}),a['run_id']))
+        r=await self.rt.dispatch('inspect',{'scope':self.scope,'agent_id':a['agent_id'],'max_bytes':1024,'detail':'full'})
+        self.assertLessEqual(len(dumps(r).encode()),1024)
+        self.assertTrue(r['diagnostics_truncated'])
+        self.assertEqual(r['run']['id'],a['run_id'])
     async def test_pending_request_never_blindly_reexecutes(self):
         params={'scope':self.scope,'request_id':'uncertain','cwd':str(self.workspace),'task':'simple','access':'read'}
         self.rt.store.request_begin(self.scope,'uncertain','spawn',params)

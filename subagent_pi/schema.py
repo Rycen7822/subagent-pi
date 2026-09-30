@@ -2,8 +2,8 @@
 from .common import AgentError, DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS
 S={'type':'string'}
 ID={'type':'string','minLength':1,'maxLength':128}
-SCOPE={'scope':{**ID,'description':'Optional after pi_context binds this MCP connection or pi_spawn_agent opens it from cwd; pass explicitly to address another scope.'}}
-REQ={'request_id':{**ID,'description':'Stable key for this mutation; reuse only for identical retries.'}}
+SCOPE={'scope':{**ID,'description':'Omit for the bound scope; set to address another scope.'}}
+REQ={'request_id':{**ID,'description':'Reuse this key only for identical retries.'}}
 AGENT={**SCOPE,'agent_id':ID}
 
 def obj(properties,required=()):
@@ -12,53 +12,59 @@ def tool(name,op,description,properties,required,read=False):
     return {'name':name,'description':description,'inputSchema':obj(properties,required),
             'outputSchema':OUTPUTS[op],
             'annotations':{'readOnlyHint':read,'destructiveHint':not read,'idempotentHint':read or 'request_id' in properties,'openWorldHint':not read},'_op':op}
-# Stable success contracts; diagnostic maps stay explicitly open.
-def output(properties,required=()):
-    return {**obj({**properties,'replayed':{'type':'boolean'},'request_id':ID},required),'additionalProperties':True}
+# Shared summaries are closed contracts; diagnostic maps stay explicitly open.
+def output(properties,required=(),mutation=False):
+    if mutation: properties={**properties,'replayed':{'type':'boolean'},'request_id':ID}
+    return obj(properties,required)
 NULLABLE={'anyOf':[S,{'type':'null'}]}
-BOOL={'type':'boolean'}; NUM={'type':'number'}; INT={'type':'integer'}
+BOOL={'type':'boolean'}; INT={'type':'integer'}
 MAP={'type':'object','additionalProperties':True}
-RUN=output({'id':ID,'agent_id':ID,'state':S,'result_sha':NULLABLE,'ack':INT,'error':NULLABLE,'name':S},['id','agent_id','state'])
 ARR=lambda item:{'type':'array','items':item}
+RUN_FIELDS={'id':ID,'agent_id':ID,'name':S,'state':S,'error':S}
+RUN=output(RUN_FIELDS,['id','agent_id','name','state'])
+PREVIEW=output({'text':S,'result_sha256':S,'next_offset':INT,'has_more':BOOL,'total_bytes':INT,'result_truncated':BOOL},['result_sha256','next_offset','has_more'])
+WAIT_RUN=output({**RUN_FIELDS,'result':PREVIEW},RUN['required'])
+OUTSTANDING=output({'runs':ARR(RUN),'total':INT,'omitted':INT},['runs','total','omitted'])
 MODEL=output({'id':S,'provider':NULLABLE},['id'])
+NOTIFICATIONS=output({'enabled':BOOL,'failed':INT},['enabled'])
 OUTPUTS={
- 'scope_open':output({'scope':ID,'cwd':S,'outstanding':MAP,'parent_notifications':MAP},['scope','cwd']),
- 'spawn':output({'agent_id':ID,'name':S,'run_id':ID,'scope':ID,'state':S,'cwd':S,'resolved_model':MODEL,'thinking':S,'available_thinking':ARR(S)},['agent_id','name','run_id','scope']),
- 'send':output({'agent_id':ID,'name':S,'run_id':ID,'receipt_id':ID,'state':S,'delivery':S,'execution':S,'queue_owner':S},['agent_id','run_id']),
- 'message':output({'agent_id':ID,'name':S,'run_id':NULLABLE,'receipt_id':ID,'delivery':S},['agent_id','name','run_id','delivery']),
- 'followup':output({'agent_id':ID,'name':S,'run_id':ID,'receipt_id':ID,'delivery':S,'state':S},['agent_id','name','run_id']),
- 'interrupt':output({'agent_id':ID,'previous_status':S,'runtime_retained':BOOL,'forced':BOOL},['agent_id','previous_status','runtime_retained']),
- 'close':output({'agent_id':ID,'state':S,'cleanup':S,'session_retained':BOOL},['agent_id','state','cleanup','session_retained']),
- 'respawn':output({'agent_id':ID,'generation':INT,'run_id':NULLABLE,'state':S,'scope':ID,'already_running':BOOL,'name':S},['agent_id','generation','state','scope']),
- 'list':output({'scope':ID,'agents':ARR(output({'id':ID,'name':S,'state':S,'agent_status':S,'resolved_model':MODEL,'thinking':S},['id','name','state','agent_status'])),'total':INT,'omitted':INT,'outstanding':MAP,'parent_notifications':MAP},['scope','agents','total','omitted']),
- 'inspect':output({'agent':MAP,'events':ARR(MAP),'next_cursor':INT,'has_more':BOOL,'receipts':ARR(MAP),'run':MAP,'history_pruned':BOOL},['agent','events','next_cursor','has_more','receipts']),
- 'wait':output({'scope':ID,'timed_out':BOOL,'reason':S,'runs':ARR(RUN),'questions':ARR(MAP),'outstanding_revision':INT},['scope','timed_out','reason','runs','questions']),
- 'result':output({'run':RUN,'text':S,'result_sha256':S,'offset':INT,'next_offset':INT,'has_more':BOOL,'total_bytes':INT,'artifact_path':S,'acknowledged':BOOL,'result_truncated':BOOL,'usage':MAP},['run','text','result_sha256','next_offset','has_more','result_truncated']),
- 'ack':output({'run_id':ID,'acknowledged':BOOL,'notification_recall':S},['run_id','acknowledged']),
- 'answer':output({'agent_id':ID,'sent':BOOL,'ui_request_id':S},['agent_id','sent','ui_request_id']),
+ 'scope_open':output({'scope':ID,'cwd':S,'outstanding':OUTSTANDING,'parent_notifications':MAP},['scope','cwd']),
+ 'spawn':output({'agent_id':ID,'name':S,'run_id':ID,'scope':ID,'state':S,'cwd':S,'resolved_model':MODEL,'thinking':S,'available_thinking':ARR(S)},['agent_id','name','run_id','scope'],mutation=True),
+ 'send':output({'agent_id':ID,'name':S,'run_id':ID,'receipt_id':ID,'state':S,'delivery':S,'execution':S,'queue_owner':S},['agent_id','run_id'],mutation=True),
+ 'message':output({'agent_id':ID,'name':S,'run_id':NULLABLE,'receipt_id':ID,'delivery':S},['agent_id','name','run_id','delivery'],mutation=True),
+ 'followup':output({'agent_id':ID,'name':S,'run_id':ID,'receipt_id':ID,'delivery':S,'state':S},['agent_id','name','run_id'],mutation=True),
+ 'interrupt':output({'agent_id':ID,'previous_status':S,'runtime_retained':BOOL,'forced':BOOL},['agent_id','previous_status','runtime_retained'],mutation=True),
+ 'close':output({'agent_id':ID,'state':S,'cleanup':S,'session_retained':BOOL},['agent_id','state','cleanup','session_retained'],mutation=True),
+ 'respawn':output({'agent_id':ID,'generation':INT,'run_id':NULLABLE,'state':S,'scope':ID,'already_running':BOOL,'name':S},['agent_id','generation','state','scope'],mutation=True),
+ 'list':output({'scope':ID,'agents':ARR(output({'id':ID,'name':S,'state':S,'agent_status':S},['id','name','state','agent_status'])),'total':INT,'omitted':INT,'outstanding':OUTSTANDING,'parent_notifications':NOTIFICATIONS},['scope','agents','total','omitted','outstanding','parent_notifications']),
+ 'inspect':output({'agent':MAP,'events':ARR(MAP),'next_cursor':INT,'has_more':BOOL,'receipts':ARR(MAP),'run':MAP,'history_pruned':BOOL,'parent_notifications':MAP,'diagnostics_truncated':BOOL},['agent','events','next_cursor','has_more','receipts']),
+ 'wait':output({'scope':ID,'timed_out':BOOL,'reason':S,'runs':ARR(WAIT_RUN),'questions':ARR(MAP)},['scope','timed_out','reason','runs','questions']),
+ 'result':output({'run':RUN,'text':S,'result_sha256':S,'next_offset':INT,'has_more':BOOL,'total_bytes':INT,'acknowledged':BOOL,'result_truncated':BOOL},['run','text','result_sha256','next_offset','has_more','total_bytes','acknowledged','result_truncated']),
+ 'ack':output({'run_id':ID,'acknowledged':BOOL,'notification_recall':S},['run_id','acknowledged'],mutation=True),
+ 'answer':output({'agent_id':ID,'sent':BOOL,'ui_request_id':S},['agent_id','sent','ui_request_id'],mutation=True),
 }
 OUTPUTS['soft_interrupt']=OUTPUTS['interrupt']
-OUTPUTS['interrupt']=output({'agent_id':ID,'state':S,'cleanup':S,'process_retained':BOOL},['agent_id','state','cleanup','process_retained'])
+OUTPUTS['interrupt']=output({'agent_id':ID,'state':S,'cleanup':S,'process_retained':BOOL},['agent_id','state','cleanup','process_retained'],mutation=True)
 TOOLS=[
  tool('pi_context','scope_open','Open a Pi delegation scope in an explicit workspace, or resume a known scope. Reuse it for subsequent calls. Optional: pi_spawn_agent with a cwd opens this scope implicitly.',
       {'cwd':{**S,'description':'Absolute current workspace directory, never the daemon directory.'},'scope':ID,'label':S,
        'inheritance':{'type':'boolean','description':'Explicitly enable or disable Codex skill/MCP inheritance for this scope.'},
        'codex_home':{**S,'description':'Explicit trusted Codex home directory; rebinds this scope as a management action.'}},['cwd']),
- tool('pi_spawn_agent','spawn','Start an independent Pi session and asynchronous task. Parent Codex conversation and sandbox are not inherited. Returns named agent/run IDs; no native Codex /agents integration. scope is optional: with cwd and no bound scope the connection opens or resumes that workspace scope first. Settled idle agents are parked automatically when the resident limit is reached.',
-      {**SCOPE,**REQ,'cwd':{**S,'description':'Absolute existing child working directory; defaults to the Codex scope cwd but may be elsewhere. Instructions always come from the scope cwd SUBAGENT-PI.md.'},'task':{**S,'description':'Self-contained delegation: goal, relevant findings and file paths, authorized actions/edit boundaries, constraints, acceptance checks and expected report. Distinguish confirmed facts from hypotheses; do not assume Pi saw the parent conversation.'},'name':{**ID,'description':'Short role/task label, unique within this scope (e.g. git-stats-fix). Returned as name; use agent_id/run_id for operations. Omit to use agent_id as the name.'},'profile':S,'model':S,'thinking':{**ID,'description':'Pi thinking level for the selected model. Omit to inherit Pi settings. Unsupported values return that model’s available levels.'},'access':{'type':'string','enum':['read','write'],'default':'write','description':'Managed tool policy, not an OS sandbox. Ambient Pi extensions retain their own capabilities.'},'idle_timeout_seconds':{'type':'integer','minimum':1,'maximum':604800,'description':'Model inactivity limit, default 1800 seconds. Text/thinking/tool-call deltas reset it; active tools and parent questions pause it. No total task deadline.'}},
+ tool('pi_spawn_agent','spawn','Start a Pi task with its own session. Parent conversation and sandbox are not inherited. Supply cwd to bind an unbound connection. Returns agent/run IDs and selected model/thinking. Idle sessions park automatically.',
+      {**SCOPE,**REQ,'cwd':{**S,'description':'Absolute child directory; defaults to scope cwd. SUBAGENT-PI.md comes from scope cwd.'},'task':{**S,'description':'Self-contained goal, context, paths, permissions, constraints and acceptance checks.'},'name':{**ID,'description':'Scope-unique label; defaults to agent ID. Agent operations accept ID or name.'},'profile':S,'model':S,'thinking':{**ID,'description':'Pi reasoning level; omit to inherit settings. Unsupported levels are rejected.'},'access':{'type':'string','enum':['read','write'],'default':'write','description':'Managed tool policy, not an OS sandbox. Ambient Pi extensions retain their own capabilities.'},'idle_timeout_seconds':{'type':'integer','minimum':1,'maximum':604800,'description':'Inactivity limit, default 1800s; progress resets it, tools/questions pause it.'}},
       ['request_id','task']),
  tool('pi_send_input','send','Submit input to an existing Pi session. Queued is not consumed. send/follow_up wakes a cleanly stopped (dormant or closed, verified) agent from its persisted session and boots it; steer still needs an active run on a live worker. interrupt=true terminates and verifies the owned process before starting a replacement with this message; it does not roll back effects.',
       {**AGENT,**REQ,'message':{**S,'description':'New work or a correction, with any changed facts, permissions and acceptance criteria. The child retains its own Pi history, but cannot see new parent conversation.'},'mode':{'type':'string','enum':['send','steer','follow_up'],'default':'steer','description':'send: new run on an idle agent. steer: same-run continuation after the current SDK call finishes, not a mid-call interruption. follow_up: separate run after the active task and all its continuations.'},'interrupt':{'type':'boolean','default':False}},
       ['agent_id','request_id','message']),
- tool('pi_wait_agent','wait','Event-driven wait, default 10 minutes, maximum 1 hour. Returns immediately on any completion (default any mode), failure, stop or question; all mode waits for all normal completions but still returns early for problems/questions. No polling or fixed sleep. Includes bounded results and exact hashes; never acknowledges. A successful bound-parent delivery consumes the event wakeup, settling any earlier queued notice before output. Cancelling the wait does not stop agents.',
-      {**SCOPE,'run_ids':{'type':'array','items':ID,'maxItems':100},'mode':{'type':'string','enum':['any','all'],'default':'any'},'timeout_seconds':{'type':'integer','minimum':0,'maximum':MAX_WAIT_SECONDS,'default':DEFAULT_WAIT_SECONDS,'description':'Maximum wait, not a fixed delay. 0 checks immediately. Host MCP timeout can impose a shorter limit.'}},[],True),
- tool('pi_list_agents','list','List this scope and outstanding runs, including completed results not yet acknowledged.',
+ tool('pi_wait_agent','wait','Wait for completion, failure, stop or questions. all waits for every normal completion, but returns early for problems/questions. Returns bounded previews and hashes without acknowledgement. Settles earlier parent notifications before output. Cancelling the wait does not stop agents.',
+      {**SCOPE,'run_ids':{'type':'array','items':ID,'maxItems':100},'mode':{'type':'string','enum':['any','all'],'default':'any'},'timeout_seconds':{'type':'integer','minimum':0,'maximum':MAX_WAIT_SECONDS,'default':DEFAULT_WAIT_SECONDS,'description':'Maximum wait; 0 checks immediately. Host MCP timeout may be shorter.'}},[],True),
+ tool('pi_list_agents','list','List agent identities, task/residency states and unacknowledged runs. Notification details: inspect with detail=full.',
       {**SCOPE,'limit':{'type':'integer','minimum':1,'maximum':50,'default':20}},[],True),
- tool('pi_inspect_agent','inspect','Read a bounded incremental trace and steering receipts. Reuse next_cursor as after. No raw reasoning or unlimited transcript dump.',
+ tool('pi_inspect_agent','inspect','Read bounded events and input receipts; pass next_cursor as after. full adds current/latest run diagnostics and notification details.',
       {**AGENT,'after':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':100},'max_bytes':{'type':'integer','minimum':1024,'maximum':16384},'detail':{'type':'string','enum':['tools','full'],'default':'tools'}},['agent_id'],True),
- tool('pi_agent_result','result','Read a terminal result in UTF-8 byte pages. Reading never acknowledges the result. Retain result_sha256 for explicit acknowledgement.',
+ tool('pi_agent_result','result','Read UTF-8 byte pages of a terminal result without acknowledgement. Keep result_sha256 for ACK; paginate with next_offset.',
       {**SCOPE,'run_id':ID,'offset':{'type':'integer','minimum':0},'max_bytes':{'type':'integer','minimum':256,'maximum':16384}},['run_id'],True),
- tool('pi_ack_result','ack','Acknowledge an exact run result only after it has been incorporated or explicitly dismissed. Recalls its queued notification when supported; notification_recall reports pending/failed cleanup. Does not delete session or result files.',
+ tool('pi_ack_result','ack','Acknowledge the exact result hash after incorporating or dismissing it. notification_recall reports pending/failed notification cleanup. Files remain.',
       {**SCOPE,**REQ,'run_id':ID,'result_sha256':S},['request_id','run_id','result_sha256']),
  tool('pi_close_agent','close','Stop work and terminate the owned process group. Preserve durable session and results. Also reaps a verified orphan. Capacity is managed automatically: settled idle agents are parked when the resident limit is reached.',
       {**AGENT,**REQ},['agent_id','request_id']),
@@ -71,11 +77,11 @@ TOOLS=[
 MANAGEMENT=[t for t in TOOLS if t['_op'] in {'scope_open','close','respawn','send'}]
 TOOLS=[t for t in TOOLS if t not in MANAGEMENT]
 TOOLS += [
- tool('pi_send_message','message','Send a message by agent ID or scope-unique name. Active tasks accept native steering input before a later model call; idle messages persist in Pi history without starting a model turn. Cleanly parked sessions load automatically. Accepted is not consumed.',
+ tool('pi_send_message','message','Message by agent ID or name. Active tasks receive steering before a later model call; idle messages persist without a model turn. Parked sessions load automatically. Accepted is not consumed.',
       {**AGENT,**REQ,'message':S},['agent_id','request_id','message']),
- tool('pi_followup_task','followup','Give an agent a new task by ID or scope-unique name. Active tasks receive native input in the same run; idle agents start a new run and cleanly parked sessions load automatically. Use the legacy follow_up mode for independently queued runs.',
+ tool('pi_followup_task','followup','Assign work by agent ID or name. Active tasks receive input in the same run; idle agents start a new run. Parked sessions load automatically. Accepted is not consumed.',
       {**AGENT,**REQ,'message':S},['agent_id','request_id','message']),
- tool('pi_interrupt_agent','soft_interrupt','Interrupt the current managed task, preserving its session and normally its runtime. Waits for task/preflight exit; uncooperative activity falls back to verified process termination. Idle/unloaded agents are unchanged. Returns previous task status and whether runtime was retained.',
+ tool('pi_interrupt_agent','soft_interrupt','Interrupt the task and preserve its session. Normally retains the runtime; uncooperative activity requires verified process termination. Idle/unloaded agents are unchanged.',
       {**AGENT,**REQ},['agent_id','request_id']),
 ]
 BY_NAME={t['name']:t for t in [*TOOLS,*MANAGEMENT]}
