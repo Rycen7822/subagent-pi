@@ -222,7 +222,7 @@ class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
     async def test_mcp_initialize_and_list(self):
         init=await self.initialize(); self.assertEqual(init['result']['protocolVersion'],'2025-06-18')
         result=await self.rpc('tools/list'); tools=result['result']['tools']
-        self.assertEqual(len(tools),11)
+        self.assertEqual(len(tools),10)
         self.assertTrue(all('_op' not in t for t in tools))
     async def test_named_agents_keep_labels_across_runs_and_results(self):
         await self.initialize()
@@ -843,6 +843,143 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         first=(await self.payloads(scope,done['runs']))[0]
         self.assertIn('without producing',first['run']['error'])
 
+    async def test_v2_native_input_reaches_the_next_tool_loop(self):
+        self.write_config(PI_MOCK_TOOL_MS='"1000"',PI_MOCK_WIRE='"1"')
+        scope,a,path=await self.start_case()
+        await self.wait_marker(path,'PI_MOCK_TOOL_START')
+        sent=await self.tool('pi_followup_task',{'scope':scope,'agent_id':a['name'],
+            'message':'NATIVE_TEXT','request_id':'native'})
+        self.assertEqual(sent['run_id'],a['run_id'])
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':8})
+        self.assertEqual(done['runs'][0]['state'],'completed',done)
+        wires=[json.loads(line.split(' ',2)[2]) for line in path.read_text().splitlines() if line.startswith('PI_MOCK_WIRE ')]
+        self.assertNotIn('NATIVE_TEXT',wires[0]['texts']); self.assertIn('NATIVE_TEXT',wires[1]['texts'])
+        self.assertEqual(await self.results(scope,done['runs']),['MOCK_REPLY_2'])
+
+    async def test_v2_cooperative_interrupt_retains_pid_and_accepts_new_task(self):
+        self.write_config(PI_MOCK_STREAM_MS='"10000"',PI_MOCK_SLOW_FIRST='"1"',PI_MOCK_ABORT_SIGNAL='"1"')
+        scope,a,path=await self.start_case()
+        await self.wait_marker(path,'PI_MOCK_REPLY 1')
+        before=(await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']}))['agent']
+        owner_path=self.home/'agents'/a['agent_id']/'owner.json'
+        pid=json.loads(owner_path.read_text())['pi_pid']
+        stopped=await self.tool('pi_interrupt_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'stop'})
+        self.assertTrue(stopped['runtime_retained'],stopped)
+        after=(await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']}))['agent']
+        self.assertEqual((pid,before['generation']),(json.loads(owner_path.read_text())['pi_pid'],after['generation']))
+        b=await self.tool('pi_followup_task',{'scope':scope,'agent_id':a['agent_id'],'message':'NEW_TASK','request_id':'next'})
+        old=await self.tool('pi_agent_result',{'scope':scope,'run_id':a['run_id']})
+        self.assertEqual(old['run']['state'],'interrupted')
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[b['run_id']],'timeout_seconds':8})
+        self.assertEqual(done['runs'][0]['state'],'completed',done)
+
+    async def test_v2_idle_message_persists_across_unload_without_a_model_turn(self):
+        self.write_config(PI_MOCK_WIRE='"1"',PI_MOCK_THINKING='"1"')
+        scope,a,path=await self.start_case()
+        await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':8})
+        before=(await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']}))['agent']
+        sent=await self.tool('pi_send_message',{'scope':scope,'agent_id':a['agent_id'],
+            'message':'IDLE_HISTORY','request_id':'store'})
+        self.assertEqual((sent['run_id'],sent['delivery']),(None,'stored'))
+        self.assertEqual(path.read_text().count('PI_MOCK_REPLY'),1)
+        await self.tool('pi_close_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'unload'})
+        b=await self.tool('pi_followup_task',{'scope':scope,'agent_id':a['agent_id'],
+            'message':'READ_HISTORY','request_id':'wake'})
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[b['run_id']],'timeout_seconds':8})
+        self.assertEqual(done['runs'][0]['state'],'completed',done)
+        after=(await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']}))['agent']
+        self.assertEqual((before['resolved_model'],before['thinking']),(after['resolved_model'],after['thinking']))
+        wire=json.loads([line for line in path.read_text().splitlines() if line.startswith('PI_MOCK_WIRE ')][-1].split(' ',2)[2])
+        self.assertIn('IDLE_HISTORY',wire['texts'])
+
+    async def test_v2_parent_question_interrupt_retains_runtime_and_rejects_old_answer(self):
+        self.write_config(PI_MOCK_ASK_PARENT='"1"')
+        scope,a,path=await self.start_case()
+        waiting=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':8})
+        self.assertEqual(waiting['reason'],'needs_input')
+        stopped=await self.tool('pi_interrupt_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'stop'})
+        self.assertTrue(stopped['runtime_retained'],stopped)
+        stale=await self.rpc('tools/call',{'name':'pi_answer_agent','arguments':{
+            'scope':scope,'agent_id':a['agent_id'],'request_id':'answer',
+            'ui_request_id':waiting['questions'][0]['id'],'answer':'late'}})
+        self.assertTrue(stale['result']['isError'])
+        state=(await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']}))['agent']
+        self.assertEqual(state['state'],'idle'); self.assertNotIn('pending_input',state)
+
+    async def test_v2_finite_primary_preflight_cannot_start_work_after_interrupt(self):
+        self.write_config(PI_MOCK_BLOCK_INPUT='"BLOCK"',PI_MOCK_BLOCK_MS='"900"')
+        scope,a,path=await self.start_case('BLOCK')
+        await self.wait_marker(path,'PI_MOCK_INPUT_BLOCKED_START')
+        stopped=await self.tool('pi_interrupt_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'stop'})
+        self.assertEqual((stopped['runtime_retained'],stopped['forced']),(False,True))
+        self.assertNotIn('PI_MOCK_REPLY',path.read_text())
+        state=(await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']}))['agent']
+        self.assertEqual(state['cleanup'],'verified')
+
+    async def test_v2_finite_native_preflight_cannot_repopulate_cancelled_sdk_queue(self):
+        self.write_config(PI_MOCK_STREAM_MS='"10000"',PI_MOCK_SLOW_FIRST='"1"',PI_MOCK_ABORT_SIGNAL='"1"',
+                          PI_MOCK_BLOCK_INPUT='"BLOCK_NATIVE"',PI_MOCK_BLOCK_MS='"900"')
+        scope,a,path=await self.start_case()
+        await self.wait_marker(path,'PI_MOCK_REPLY 1')
+        await self.tool('pi_send_message',{'scope':scope,'agent_id':a['agent_id'],
+            'message':'BLOCK_NATIVE','request_id':'native'})
+        await self.wait_marker(path,'PI_MOCK_INPUT_BLOCKED_START')
+        stopped=await self.tool('pi_interrupt_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'stop'})
+        self.assertEqual((stopped['runtime_retained'],stopped['forced']),(False,True))
+        self.assertEqual(path.read_text().count('PI_MOCK_REPLY'),1)
+        b=await self.tool('pi_followup_task',{'scope':scope,'agent_id':a['agent_id'],
+            'message':'REPLACEMENT','request_id':'wake'})
+        # The restored mock's first call is slow; confirm the old native input was never replayed, then stop it.
+        await self.wait_marker(path,'PI_MOCK_REPLY 1',count=2)
+        await self.tool('pi_interrupt_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'stop-next'})
+        result=await self.tool('pi_agent_result',{'scope':scope,'run_id':b['run_id']})
+        self.assertEqual(result['run']['state'],'interrupted')
+        self.assertEqual(path.read_text().count('PI_MOCK_INPUT_BLOCKED_START'),1)
+
+    async def test_v2_late_cancelled_owner_cannot_add_custom_history_or_question(self):
+        release=self.root/'release-late-ui'
+        self.write_config(PI_MOCK_STREAM_MS='"10000"',PI_MOCK_ABORT_SIGNAL='"1"',
+                          PI_MOCK_LATE_UI_RELEASE=json.dumps(str(release)))
+        scope,a,path=await self.start_case()
+        await self.wait_marker(path,'PI_MOCK_REPLY 1')
+        stopped=await self.tool('pi_interrupt_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'stop'})
+        self.assertTrue(stopped['runtime_retained'])
+        release.touch(); await self.wait_marker(path,'PI_MOCK_LATE_UI_FINISHED')
+        state=(await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']}))['agent']
+        self.assertEqual(state['state'],'idle'); self.assertNotIn('pending_input',state)
+        sessions=list((self.home/'agents'/a['agent_id']/'sessions').glob('*.jsonl'))
+        self.assertTrue(sessions); self.assertNotIn('STALE_CUSTOM',sessions[0].read_text())
+
+    async def test_v2_queued_nextturn_custom_input_is_not_retained_after_cancel(self):
+        once=self.root/'nextturn-once'
+        self.write_config(PI_MOCK_STREAM_MS='"10000"',PI_MOCK_ABORT_SIGNAL='"1"',PI_MOCK_WIRE='"1"',
+                          PI_MOCK_NEXTTURN='"CANCELLED_NEXTTURN_SENTINEL"',PI_MOCK_NEXTTURN_ONCE_FILE=json.dumps(str(once)))
+        scope,a,path=await self.start_case()
+        await self.wait_marker(path,'PI_MOCK_NEXTTURN_QUEUED'); await self.wait_marker(path,'PI_MOCK_REPLY 1')
+        stopped=await self.tool('pi_interrupt_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'stop'})
+        self.assertEqual((stopped['runtime_retained'],stopped['forced']),(False,True))
+        await self.tool('pi_followup_task',{'scope':scope,'agent_id':a['agent_id'],
+            'message':'CLEAN_REPLACEMENT','request_id':'wake'})
+        await self.wait_marker(path,'PI_MOCK_REPLY 1',count=2)
+        wire=json.loads([line for line in path.read_text().splitlines() if line.startswith('PI_MOCK_WIRE ')][-1].split(' ',2)[2])
+        self.assertNotIn('CANCELLED_NEXTTURN_SENTINEL',wire['texts']); self.assertIn('CLEAN_REPLACEMENT',wire['texts'])
+
+    async def test_v2_native_preflight_finishes_before_legacy_continuation(self):
+        self.write_config(PI_MOCK_STREAM_MS='"200"',PI_MOCK_EXT_FOLLOWUP='"LEGACY"',PI_MOCK_WIRE='"1"',
+                          PI_MOCK_BLOCK_INPUT='"NATIVE"',PI_MOCK_BLOCK_MS='"800"')
+        scope,a,path=await self.start_case()
+        await self.wait_marker(path,'PI_MOCK_REPLY 1')
+        sent=await self.tool('pi_send_message',{'scope':scope,'agent_id':a['agent_id'],
+            'message':'NATIVE','request_id':'native'})
+        await self.wait_marker(path,'PI_MOCK_INPUT_BLOCKED_START')
+        done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':8})
+        self.assertEqual(done['runs'][0]['state'],'completed',done)
+        wires=[json.loads(line.split(' ',2)[2]) for line in path.read_text().splitlines() if line.startswith('PI_MOCK_WIRE ')]
+        self.assertIn('NATIVE',wires[1]['texts']); self.assertNotIn('LEGACY',wires[1]['texts'])
+        self.assertIn('LEGACY',wires[2]['texts'])
+        inspected=await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id'],'limit':100,'max_bytes':16384})
+        self.assertEqual([r['state'] for r in inspected['receipts'] if r['id']==sent['receipt_id']],['consumed'])
+
     async def start_case(self,task='FIRST'):
         await self.initialize()
         scope=(await self.tool('pi_context',{'cwd':str(self.workspace)}))['scope']
@@ -906,12 +1043,15 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         release=self.root/'release'
         self.write_config(PI_MOCK_BLOCK_INPUT='"BLOCK"',PI_MOCK_BLOCK_MS='"60000"',
                           PI_MOCK_RELEASE_FILE=json.dumps(str(release)))
+        config=self.home/'config.toml'; config.write_text(config.read_text().replace('rpc_timeout_seconds=20','rpc_timeout_seconds=1'))
         scope,a,path=await self.start_case('BLOCK')
         await self.wait_marker(path,'PI_MOCK_INPUT_BLOCKED_START')
         q=await self.tool('pi_send_input',{'scope':scope,'agent_id':a['agent_id'],'mode':'follow_up',
             'message':'CANCELLED_FOLLOW','request_id':'queued'})
         stop=await self.tool('pi_interrupt_agent',{'scope':scope,'agent_id':a['agent_id'],'request_id':'interrupt'})
-        self.assertEqual((stop['state'],stop['cleanup'],stop['process_retained']),('dormant','verified',False))
+        self.assertEqual((stop['runtime_retained'],stop['forced']),(False,True))
+        state=await self.tool('pi_inspect_agent',{'scope':scope,'agent_id':a['agent_id']})
+        self.assertEqual((state['agent']['state'],state['agent']['cleanup']),('dormant','verified'))
         release.touch()
         self.assertNotIn('PI_MOCK_REPLY',path.read_text())
         done=await self.tool('pi_wait_agent',{'scope':scope,'run_ids':[a['run_id'],q['run_id']],'timeout_seconds':1})

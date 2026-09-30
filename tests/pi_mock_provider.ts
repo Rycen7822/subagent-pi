@@ -71,7 +71,7 @@ export default function (pi) {
     models: [{ id: "mock", name: "Offline Mock", reasoning: Boolean(env.PI_MOCK_THINKING),
       ...(env.PI_MOCK_THINKING ? { thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" } } : {}), input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 1024 }],
-    streamSimple(model, context) {
+    streamSimple(model, context, options) {
       const stream = createAssistantMessageEventStream();
       const call = ++calls;
       mark(`PI_MOCK_REPLY ${call}`);
@@ -94,7 +94,16 @@ export default function (pi) {
         message.stopReason = "toolUse";
       }
       if (env.PI_MOCK_FAIL) { message.stopReason = "error"; (message as any).errorMessage = "Mock provider failed"; }
-      const finish = () => { stream.push({ type: message.stopReason === "error" ? "error" : "done", reason: message.stopReason, message, error: message } as any); stream.end(); };
+      let ended = false, timer;
+      const finish = () => {
+        if (ended) return;
+        ended = true; clearTimeout(timer);
+        stream.push({ type: ["error", "aborted"].includes(message.stopReason) ? "error" : "done", reason: message.stopReason, message, error: message } as any);
+        stream.end();
+      };
+      if (env.PI_MOCK_ABORT_SIGNAL) options?.signal?.addEventListener("abort", () => {
+        message.stopReason = "aborted"; finish();
+      }, { once: true });
       if (env.PI_MOCK_PROGRESS) void (async () => {
         const kind = env.PI_MOCK_PROGRESS;
         const partial = { ...message, content: [{ type: kind, [kind]: "" }] };
@@ -106,7 +115,7 @@ export default function (pi) {
         }
         finish();
       })();
-      else setTimeout(finish, Number(env.PI_MOCK_STREAM_MS || 30));
+      else timer = setTimeout(finish, Number(env.PI_MOCK_SLOW_FIRST && call > 1 ? 30 : env.PI_MOCK_STREAM_MS || 30));
       return stream;
     },
   });
@@ -166,9 +175,14 @@ export default function (pi) {
   });
 
   let started = false;
-  pi.on("agent_start", () => {
+  pi.on("agent_start", (_event, ctx) => {
     if (started) return;
     started = true;
+    if (env.PI_MOCK_NEXTTURN && !existsSync(env.PI_MOCK_NEXTTURN_ONCE_FILE || "")) {
+      if (env.PI_MOCK_NEXTTURN_ONCE_FILE) writeFileSync(env.PI_MOCK_NEXTTURN_ONCE_FILE, "queued");
+      pi.sendMessage({ customType: "cancel-next", content: env.PI_MOCK_NEXTTURN, display: false }, { deliverAs: "nextTurn" });
+      mark("PI_MOCK_NEXTTURN_QUEUED");
+    }
     for (const text of (env.PI_MOCK_EXT_FOLLOWUP || "").split(",").filter(Boolean)) {
       pi.sendUserMessage(text, { deliverAs: "followUp" });
     }
@@ -176,6 +190,12 @@ export default function (pi) {
       while (!existsSync(env.PI_MOCK_LATE_RELEASE)) await sleep(20);
       pi.sendUserMessage("STALE_TIMER_INPUT");
       mark("PI_MOCK_LATE_ATTEMPTED");
+    })();
+    if (env.PI_MOCK_LATE_UI_RELEASE) void (async () => {
+      while (!existsSync(env.PI_MOCK_LATE_UI_RELEASE)) await sleep(20);
+      pi.sendMessage({ customType: "stale", content: "STALE_CUSTOM", display: false }, { triggerTurn: false });
+      await ctx.ui.confirm("STALE_OLD_TASK", "Proceed?");
+      mark("PI_MOCK_LATE_UI_FINISHED");
     })();
   });
 }

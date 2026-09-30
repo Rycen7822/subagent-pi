@@ -28,10 +28,14 @@ subagent-pi codex [-- CODEX_ARGS...]
 
 ```text
 subagent-pi spawn [--scope ID] [--cwd DIR] [--name NAME]
-  [--profile PROFILE] [--model PROVIDER/MODEL] [--access read|write]
+  [--profile PROFILE] [--model PROVIDER/MODEL] [--thinking LEVEL] [--access read|write]
   [--idle-timeout-seconds N] [--request-id KEY]
   (--task TEXT | --task-file FILE_OR_DASH)
 
+subagent-pi send-message AGENT_ID_OR_NAME --scope ID (--message TEXT | --message-file FILE_OR_DASH)
+  [--request-id KEY]
+subagent-pi followup-task AGENT_ID_OR_NAME --scope ID (--message TEXT | --message-file FILE_OR_DASH)
+  [--request-id KEY]
 subagent-pi send AGENT_ID --scope ID (--message TEXT | --message-file FILE_OR_DASH)
   [--interrupt] [--request-id KEY]
 subagent-pi steer AGENT_ID --scope ID (--message TEXT | --message-file FILE_OR_DASH)
@@ -39,6 +43,8 @@ subagent-pi steer AGENT_ID --scope ID (--message TEXT | --message-file FILE_OR_D
 subagent-pi follow-up AGENT_ID --scope ID (--message TEXT | --message-file FILE_OR_DASH)
   [--request-id KEY]
 ```
+
+send-message 活动时原生 steering，空闲时持久写入 history 而不启动模型；followup-task 活动时接入同一 run，空闲时启动新 run，均自动加载干净卸载的 session。以下 legacy 操作保留独立调度语义。
 
 task 应包含目标、必要上下文、授权范围和验收要求；Pi 不复制父 Codex 对话。steer 等当前 SDK 调用结束后在同一 run 续跑，回执 execution=after_current_sdk_call 不代表消费；follow-up 创建独立 run；send 用于空闲 agent。要立即停止工作用 close，替换工作用 send --interrupt。具体委派示例见 [lifecycle.md](lifecycle.md#spawn)。
 
@@ -66,7 +72,7 @@ subagent-pi answer AGENT_ID UI_REQUEST_ID --scope ID --answer TEXT_OR_TRUE_FALSE
   [--request-id KEY]
 ```
 
-interrupt 停止并核验子进程，保留 session；再次使用可直接用 send 自动唤醒，或显式 respawn。interrupt+message 显式替换为新进程。resume 为 respawn 别名，对存活 agent 幂等返回现状。close 保留 session；daemon stop --force 会影响所有 scope 的 resident agents，而非当前 scope。
+interrupt 取消当前受管任务并尽量保留子进程，无法确认退出时硬清理；返回 previous_status/runtime_retained。close 显式卸载子进程；再次使用可由 followup-task 自动唤醒，或显式 respawn。send --interrupt 显式替换为新进程。resume 为 respawn 别名，对存活 agent 幂等返回现状。close 保留 session；daemon stop --force 会影响所有 scope 的 resident agents，而非当前 scope。
 
 ## Runtime / docs
 

@@ -10,7 +10,35 @@ def obj(properties,required=()):
     return {'type':'object','properties':properties,'required':list(required),'additionalProperties':False}
 def tool(name,op,description,properties,required,read=False):
     return {'name':name,'description':description,'inputSchema':obj(properties,required),
+            'outputSchema':OUTPUTS[op],
             'annotations':{'readOnlyHint':read,'destructiveHint':not read,'idempotentHint':read or 'request_id' in properties,'openWorldHint':not read},'_op':op}
+# Stable success contracts; diagnostic maps stay explicitly open.
+def output(properties,required=()):
+    return {**obj({**properties,'replayed':{'type':'boolean'},'request_id':ID},required),'additionalProperties':True}
+NULLABLE={'anyOf':[S,{'type':'null'}]}
+BOOL={'type':'boolean'}; NUM={'type':'number'}; INT={'type':'integer'}
+MAP={'type':'object','additionalProperties':True}
+RUN=output({'id':ID,'agent_id':ID,'state':S,'result_sha':NULLABLE,'ack':INT,'error':NULLABLE,'name':S},['id','agent_id','state'])
+ARR=lambda item:{'type':'array','items':item}
+MODEL=output({'id':S,'provider':NULLABLE},['id'])
+OUTPUTS={
+ 'scope_open':output({'scope':ID,'cwd':S,'outstanding':MAP,'parent_notifications':MAP},['scope','cwd']),
+ 'spawn':output({'agent_id':ID,'name':S,'run_id':ID,'scope':ID,'state':S,'cwd':S,'resolved_model':MODEL,'thinking':S,'available_thinking':ARR(S)},['agent_id','name','run_id','scope']),
+ 'send':output({'agent_id':ID,'name':S,'run_id':ID,'receipt_id':ID,'state':S,'delivery':S,'execution':S,'queue_owner':S},['agent_id','run_id']),
+ 'message':output({'agent_id':ID,'name':S,'run_id':NULLABLE,'receipt_id':ID,'delivery':S},['agent_id','name','run_id','delivery']),
+ 'followup':output({'agent_id':ID,'name':S,'run_id':ID,'receipt_id':ID,'delivery':S,'state':S},['agent_id','name','run_id']),
+ 'interrupt':output({'agent_id':ID,'previous_status':S,'runtime_retained':BOOL,'forced':BOOL},['agent_id','previous_status','runtime_retained']),
+ 'close':output({'agent_id':ID,'state':S,'cleanup':S,'session_retained':BOOL},['agent_id','state','cleanup','session_retained']),
+ 'respawn':output({'agent_id':ID,'generation':INT,'run_id':NULLABLE,'state':S,'scope':ID,'already_running':BOOL,'name':S},['agent_id','generation','state','scope']),
+ 'list':output({'scope':ID,'agents':ARR(output({'id':ID,'name':S,'state':S,'agent_status':S,'resolved_model':MODEL,'thinking':S},['id','name','state','agent_status'])),'total':INT,'omitted':INT,'outstanding':MAP,'parent_notifications':MAP},['scope','agents','total','omitted']),
+ 'inspect':output({'agent':MAP,'events':ARR(MAP),'next_cursor':INT,'has_more':BOOL,'receipts':ARR(MAP),'run':MAP,'history_pruned':BOOL},['agent','events','next_cursor','has_more','receipts']),
+ 'wait':output({'scope':ID,'timed_out':BOOL,'reason':S,'runs':ARR(RUN),'questions':ARR(MAP),'outstanding_revision':INT},['scope','timed_out','reason','runs','questions']),
+ 'result':output({'run':RUN,'text':S,'result_sha256':S,'offset':INT,'next_offset':INT,'has_more':BOOL,'total_bytes':INT,'artifact_path':S,'acknowledged':BOOL,'result_truncated':BOOL,'usage':MAP},['run','text','result_sha256','next_offset','has_more','result_truncated']),
+ 'ack':output({'run_id':ID,'acknowledged':BOOL,'notification_recall':S},['run_id','acknowledged']),
+ 'answer':output({'agent_id':ID,'sent':BOOL,'ui_request_id':S},['agent_id','sent','ui_request_id']),
+}
+OUTPUTS['soft_interrupt']=OUTPUTS['interrupt']
+OUTPUTS['interrupt']=output({'agent_id':ID,'state':S,'cleanup':S,'process_retained':BOOL},['agent_id','state','cleanup','process_retained'])
 TOOLS=[
  tool('pi_context','scope_open','Open a Pi delegation scope in an explicit workspace, or resume a known scope. Reuse it for subsequent calls. Optional: pi_spawn_agent with a cwd opens this scope implicitly.',
       {'cwd':{**S,'description':'Absolute current workspace directory, never the daemon directory.'},'scope':ID,'label':S,
@@ -39,11 +67,20 @@ TOOLS=[
  tool('pi_answer_agent','answer','Answer a pending Pi extension input request explicitly. Confirmations require a boolean; select/input/editor use text.',
       {**AGENT,**REQ,'ui_request_id':S,'answer':{'anyOf':[{'type':'string'},{'type':'boolean'}]}},['agent_id','request_id','ui_request_id','answer']),
 ]
-BY_NAME={t['name']:t for t in TOOLS}
-BY_OP={t['_op']:t for t in TOOLS}
-# Keep existing callers/CLI compatible without advertising two stop tools.
-BY_NAME['pi_interrupt_agent']={**BY_NAME['pi_close_agent'],'name':'pi_interrupt_agent','_op':'interrupt'}
-BY_OP['interrupt']=BY_NAME['pi_interrupt_agent']
+# Keep explicit management/legacy calls available without advertising them.
+MANAGEMENT=[t for t in TOOLS if t['_op'] in {'scope_open','close','respawn','send'}]
+TOOLS=[t for t in TOOLS if t not in MANAGEMENT]
+TOOLS += [
+ tool('pi_send_message','message','Send a message by agent ID or scope-unique name. Active tasks accept native steering input before a later model call; idle messages persist in Pi history without starting a model turn. Cleanly parked sessions load automatically. Accepted is not consumed.',
+      {**AGENT,**REQ,'message':S},['agent_id','request_id','message']),
+ tool('pi_followup_task','followup','Give an agent a new task by ID or scope-unique name. Active tasks receive native input in the same run; idle agents start a new run and cleanly parked sessions load automatically. Use the legacy follow_up mode for independently queued runs.',
+      {**AGENT,**REQ,'message':S},['agent_id','request_id','message']),
+ tool('pi_interrupt_agent','soft_interrupt','Interrupt the current managed task, preserving its session and normally its runtime. Waits for task/preflight exit; uncooperative activity falls back to verified process termination. Idle/unloaded agents are unchanged. Returns previous task status and whether runtime was retained.',
+      {**AGENT,**REQ},['agent_id','request_id']),
+]
+BY_NAME={t['name']:t for t in [*TOOLS,*MANAGEMENT]}
+BY_OP={t['_op']:t for t in BY_NAME.values()}
+BY_OP['interrupt']={**BY_OP['soft_interrupt'],'_op':'interrupt','outputSchema':OUTPUTS['interrupt']}
 
 def validate(value,schema,path='arguments'):
     if 'anyOf' in schema:
@@ -54,7 +91,8 @@ def validate(value,schema,path='arguments'):
     kind=schema.get('type')
     valid={'object':lambda:isinstance(value,dict),'array':lambda:isinstance(value,list),
            'string':lambda:isinstance(value,str),'integer':lambda:isinstance(value,int) and not isinstance(value,bool),
-           'boolean':lambda:isinstance(value,bool)}
+           'boolean':lambda:isinstance(value,bool),'null':lambda:value is None,
+           'number':lambda:isinstance(value,(int,float)) and not isinstance(value,bool)}
     if kind in valid and not valid[kind](): raise AgentError('invalid_argument',f'{path} must be {kind}')
     if 'enum' in schema and value not in schema['enum']: raise AgentError('invalid_argument',f'{path} is not an allowed value')
     if kind=='object':

@@ -24,18 +24,18 @@ def parser():
     s=sub.add_parser('scope'); ss=s.add_subparsers(dest='action',required=True)
     so=ss.add_parser('open'); so.add_argument('--cwd',default=os.getcwd()); so.add_argument('--scope'); so.add_argument('--label',default='CLI delegation')
     ss.add_parser('list')
-    for name in ('list','spawn','send','steer','follow-up','wait','inspect','result','ack','interrupt','close','respawn','resume','answer'):
+    for name in ('list','spawn','send','steer','follow-up','send-message','followup-task','wait','inspect','result','ack','interrupt','close','respawn','resume','answer'):
         q=sub.add_parser(name)
         q.add_argument('--scope',default=os.environ.get('PI_AGENTS_SCOPE'))
-        if name in {'spawn','send','steer','follow-up','ack','interrupt','close','respawn','resume','answer'}:
+        if name in {'spawn','send','steer','follow-up','send-message','followup-task','ack','interrupt','close','respawn','resume','answer'}:
             q.add_argument('--request-id',default=None,help='Stable key for safe retries; generated if omitted')
-        if name in {'send','steer','follow-up','inspect','interrupt','close','respawn','resume','answer'}: q.add_argument('agent_id')
+        if name in {'send','steer','follow-up','send-message','followup-task','inspect','interrupt','close','respawn','resume','answer'}: q.add_argument('agent_id')
         if name=='spawn':
             q.add_argument('--cwd',default=os.getcwd()); q.add_argument('--name'); q.add_argument('--profile'); q.add_argument('--model'); q.add_argument('--thinking',help='A level supported by the selected Pi model; defaults to Pi settings')
             q.add_argument('--access',choices=['read','write'],default='write'); q.add_argument('--idle-timeout-seconds',type=int,help='Model inactivity limit; active tools and parent questions pause it. No total task deadline')
             g=q.add_mutually_exclusive_group(required=True); g.add_argument('--task'); g.add_argument('--task-file',help='UTF-8 file, or - for stdin')
-        if name in {'send','steer','follow-up','respawn','resume'}:
-            g=q.add_mutually_exclusive_group(required=name in {'send','steer','follow-up'}); g.add_argument('--message'); g.add_argument('--message-file')
+        if name in {'send','steer','follow-up','send-message','followup-task','respawn','resume'}:
+            g=q.add_mutually_exclusive_group(required=name in {'send','steer','follow-up','send-message','followup-task'}); g.add_argument('--message'); g.add_argument('--message-file')
             if name=='send': q.add_argument('--interrupt',action='store_true')
         if name=='list': q.add_argument('--limit',type=int,default=20)
         if name=='wait':
@@ -153,7 +153,7 @@ async def execute(args):
     if cmd=='answer' and data['answer'] in {'true','false'}: data['answer']=data['answer']=='true'
     if cmd=='wait' and not data['run_ids']: data.pop('run_ids')
     data={k:v for k,v in data.items() if v is not None}
-    op={'steer':'send','follow-up':'send','resume':'respawn'}.get(cmd,cmd)
+    op={'steer':'send','follow-up':'send','send-message':'message','followup-task':'followup','interrupt':'soft_interrupt','resume':'respawn'}.get(cmd,cmd)
     if op=='wait':
         from .parent import capture
         async def write_result(value): print(dumps(value),flush=True)

@@ -43,7 +43,7 @@ scopes、agents、runs、requests、receipts、events 是独立表。执行终�
 
 账本不依赖主模型记住全部 agent。未确认任务通过 list/outstanding 可恢复，wait 仅关注结果、失败、停止与输入问题，并返回有界结果与问题正文；all 模式遇到异常也提前返回。parent.py 将已绑定父会话的终态/问题投递到 Codex 官方消息队列；通知账本与任务终态同事务持久化，等待输入事件同样去重记录。父会话继续由原 Codex 进程拥有，不创建 competing resume，也不修改宿主。
 
-工具 surface 是 11 个专用 MCP 工具（停止统一使用 pi_close_agent，旧 interrupt 调用与 CLI 仍兼容），避免复用 Codex 保留的 collaboration 名称。schema 不随当前 agent 列表变化。是否 deferred 取决于 Codex，不由 server 宣称。
+工具 surface 是 10 个日常 MCP 工具，提供 V2 风格 message/followup/interrupt。管理工具不在 tools/list 广告，但显式调用及 CLI 保留。schema.py 同时提供 inputSchema/outputSchema；tools/call 的 structuredContent 与 text JSON 相同。list 分开提供 agent_status（最近任务）和 state（驻留状态），并保留有效 model/thinking；轨迹和清理细节在 inspect。schema 不随 agent 列表变化。是否 deferred 取决于 Codex，不由 server 宣称。
 
 ## 安全与限制
 

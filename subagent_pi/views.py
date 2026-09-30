@@ -6,11 +6,21 @@ import json
 from pathlib import Path
 import time
 
-from .common import TERMINAL, DEFAULT_WAIT_SECONDS, AgentError, crop, dumps, identifier, integer
+from .common import TERMINAL, DEFAULT_WAIT_SECONDS, AgentError, crop, dumps, identifier, integer, text
 
 def model_settings(a):
     spec=json.loads(a['launch'])
     return {k:spec[k] for k in ('resolved_model','thinking','available_thinking') if k in spec}
+
+def agent_status(store,a):
+    row=store.one("SELECT state FROM runs WHERE id=?",(a['current_run'],)) if a['current_run'] else store.one("SELECT state FROM runs WHERE agent_id=? AND state!='queued' ORDER BY created DESC LIMIT 1",(a['id'],))
+    return row['state'] if row else 'idle'
+
+def listed_agent(store,a,w=None):
+    result={k:a[k] for k in ('id','name','state')}
+    result['agent_status']=agent_status(store,a)
+    result.update({k:v for k,v in model_settings(a).items() if k!='available_thinking'})
+    return result
 
 def brief_agent(a, w=None):
     result={k:a[k] for k in ('id','name','scope','cwd','state','generation','current_run','cleanup')}
@@ -79,7 +89,7 @@ class ReadViews:
         return {'revision':self.store.scope(sid)['revision'],'runs':[brief_run(r) for r in rows], 'total':count,'omitted':max(0,count-len(rows))}
 
     def inspect(self,p):
-        a=self.store.agent(p['scope'],identifier(p.get('agent_id'),'agent_id'))
+        a=self.store.resolve_agent(p['scope'],text(p.get('agent_id'),'agent_id',128))
         limit=integer(p.get('limit',20),'limit',1,100)
         budget=integer(p.get('max_bytes',4096),'max_bytes',1024,16384)
         after=integer(p.get('after',0),'after',0,2**63-1)

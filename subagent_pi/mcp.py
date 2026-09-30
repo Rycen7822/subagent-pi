@@ -66,7 +66,7 @@ async def serve_mcp(home):
                 initialized=True
                 result={'protocolVersion':version,'capabilities':{'tools':{'listChanged':False}},
                         'serverInfo':{'name':'subagent-pi','version':__version__},
-                        'instructions':'Use pi_context with the actual workspace cwd to bind this connection; pi_spawn_agent with a cwd opens that scope implicitly when none is bound. Tasks run outside the Codex native subagent runtime. Bound Codex parents receive queued attention on completion, failure, stop or questions. Check parent_notifications in pi_context; unbound callers must use wait. Keep mutation request_id stable for retries.'}
+                        'instructions':'Start pi_spawn_agent with the actual workspace cwd to bind this connection. Management scope/recovery operations remain available through the CLI or explicit legacy calls. Tasks run outside the Codex native subagent runtime. Bound Codex parents receive queued attention on completion, failure, stop or questions. Check parent_notifications in pi_context; unbound callers must use wait. Keep mutation request_id stable for retries.'}
             elif method=='ping': result={}
             elif not initialized: await error(rid,-32002,'Initialize first'); return
             elif method=='tools/list': result={'tools':[{k:v for k,v in t.items() if k!='_op'} for t in TOOLS]}
@@ -104,14 +104,14 @@ async def serve_mcp(home):
                     source=scope_source_snapshot(home,{k:v for k,v in os.environ.items() if k!='CODEX_THREAD_ID'})
                     source['parent']=parent
                 async def write_result(value):
-                    await output({'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':dumps(value)}],'isError':False}})
+                    await output({'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':dumps(value)}],'structuredContent':value,'isError':False}})
                 if spec['_op']=='wait':
                     await request(home,'wait',args,timeout=timeout,source=source,on_result=write_result)
                     return
                 value=await request(home,spec['_op'],args,timeout=timeout,source=source)
                 if spec['_op']=='scope_open':
                     active_scopes[caller]=value['scope']; bound_scopes[(caller,args['cwd'])]=value['scope']
-                result={'content':[{'type':'text','text':dumps(value)}],'isError':False}
+                result={'content':[{'type':'text','text':dumps(value)}],'structuredContent':value,'isError':False}
             else: await error(rid,-32601,'Method not found'); return
             await output({'jsonrpc':'2.0','id':rid,'result':result})
         except AgentError as e:

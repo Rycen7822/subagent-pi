@@ -46,7 +46,7 @@ Pi 的项目 trust、环境初始化或扩展装载行为可能影响 RPC 启动
 
 ## Codex 看不到工具
 
-插件安装后开始新会话；确认没有同时通过全局 MCP 又注册同一个服务。使用 `/mcp` 检查连接，并实际尝试 pi_context。deferred/tool-search 能否发现属于 Codex 版本和 provider 行为，不是本插件保证。
+插件安装后开始新会话；确认没有同时通过全局 MCP 又注册同一个服务。使用 `/mcp` 检查连接，并实际尝试带 cwd 的 pi_spawn_agent。deferred/tool-search 能否发现属于 Codex 版本和 provider 行为，不是本插件保证。
 
 安装后的 MCP 配置是绝对路径。如果移动或删除安装源目录，Codex 缓存中的配置可能仍指向旧位置，需要重新安装。CLI 被移除不一定影响已经使用绝对 Python 路径的 MCP，但不能依赖残留环境。
 

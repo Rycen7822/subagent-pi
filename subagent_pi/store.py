@@ -77,9 +77,15 @@ class Store:
         return row
     def agent(self, sid, aid):
         self.scope(sid)
-        row = self.one("SELECT * FROM agents WHERE id=? AND scope=?", (aid,sid))
-        if not row: raise AgentError("agent_not_found", "Agent not found in this scope")
+        row=self.one("SELECT * FROM agents WHERE id=? AND scope=?",(aid,sid))
+        if not row: raise AgentError('agent_not_found','Agent not found in this scope')
         return row
+    def resolve_agent(self,sid,target):
+        self.scope(sid)
+        rows=self.all("SELECT * FROM agents WHERE scope=? AND (id=? OR name=?)",(sid,target,target))
+        if len(rows)>1: raise AgentError('ambiguous_agent','Target matches different ID and name; use an unambiguous name/ID')
+        if not rows: raise AgentError('agent_not_found','Agent not found in this scope')
+        return rows[0]
     def run(self, sid, rid):
         self.scope(sid)
         row = self.one("SELECT * FROM runs WHERE id=? AND scope=?", (rid,sid))

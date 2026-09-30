@@ -22,6 +22,8 @@ class ClientTimeoutBudget(unittest.TestCase):
         self.assertGreaterEqual(call_timeout('spawn',{},None),budget)
         self.assertGreaterEqual(call_timeout('respawn',{},None),budget)
         self.assertGreaterEqual(call_timeout('close',{},None),budget)
+        for op in ('soft_interrupt','message','followup','send'):
+            self.assertGreaterEqual(call_timeout(op,{},None),budget)
         self.assertGreater(budget,45)                  # the old flat 45s was the bug
     def test_boot_timeout_ignores_model_inactivity_limit(self):
         self.assertEqual(call_timeout('spawn',{'idle_timeout_seconds':604800},None),

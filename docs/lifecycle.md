@@ -2,7 +2,7 @@
 
 ## 身份与状态
 
-scope 是父任务集合；agent_id 是长期身份；run_id 是一项委托任务；generation 是一次受管子进程；request_id 是控制操作的幂等身份。MCP 与 CLI 使用同一份账本。 创建时用 name 标注角色或任务（如 git-stats-fix），同一 scope 内唯一；省略时使用 agent_id。创建、任务摘要、等待、问题、结果和通知均携带该名称；名称不用于寻址，后续操作仍使用 ID。
+scope 是父任务集合；agent_id 是长期身份；run_id 是一项委托任务；generation 是一次受管子进程；request_id 是控制操作的幂等身份。MCP 与 CLI 使用同一份账本。 创建时用 name 标注角色或任务（如 git-stats-fix），同一 scope 内唯一；省略时使用 agent_id。创建、任务摘要、等待、问题、结果和通知均携带该名称；后续操作可使用 ID 或 scope 内唯一名称；名称与另一 ID 冲突时拒绝歧义目标。
 
 agent 状态包括 starting、running、needs_input、idle、stopping、dormant、closed、orphaned、crashed。run 状态包括 queued、starting、running、needs_input、completed、failed、interrupted、crashed、cancelled、timed_out。completed 表示执行正常结束，不证明答案正确或可以发布。
 
@@ -10,7 +10,7 @@ agent 状态包括 starting、running、needs_input、idle、stopping、dormant�
 
 插件的 SDK 子进程拥有任务内输入队列。一个 run 可以包含多次 SDK prompt，以及 Pi 自己在 prompt 内完成的工具调用、重试、自动压缩和 before-settle 续跑。插件逐项 await SDK 调用，队列排空才发出携带 run_id 的 `managed_task_end`；Pi 的 `agent_end` / `agent_settled` 只描述宿主活动，不能结算任务。
 
-扩展的 `pi.sendUserMessage` 及会触发执行的 `pi.sendMessage` 接入该队列；SDK 的公开 ExtensionRuntime action bindings 仅在受管子进程内绑定，未修改 AgentSession、原型或安装文件。输入按接受顺序串行执行，包含 input hook、认证及 before_agent_start，所以不会出现并发预处理抢占底层 run。队列最多积压 256 条、8 MiB；扩展超过上限时专属子进程退出，daemon 记录崩溃并取消后继任务。每次用户消息续跑走完整 SDK prompt 路径，重新应用当前扩展的提示与工具规则；custom message 续跑沿用 SDK 的 sendCustomMessage 语义。
+扩展的 `pi.sendUserMessage` 及会触发执行的 `pi.sendMessage` 接入该队列；SDK 的公开 ExtensionRuntime action bindings 仅在受管子进程内绑定，未修改 AgentSession、原型或安装文件。传统输入按接受顺序串行执行，包含 input hook、认证及 before_agent_start；V2 外部活动消息使用 SDK 原生 steering，原生消息预处理也按接受顺序执行并计入任务所有权。队列最多积压 256 条、8 MiB；扩展超过上限时专属子进程退出，daemon 记录崩溃并取消后继任务。每次用户消息续跑走完整 SDK prompt 路径，重新应用当前扩展的提示与工具规则；custom message 续跑沿用 SDK 的 sendCustomMessage 语义。
 
 每条任务链用 AsyncLocalStorage 保留归属。任务结束后的异步输入会被拒绝并记录诊断，不能混入后继任务；没有活动任务时扩展不能自动启动模型任务。启动阶段显式启用命令展开的、已注册的本地 slash command 会在接收任务前串行执行完毕，仅调用命令 handler，不回退到模型 prompt。扩展自己创建其他 SDK session 或独立进程不受此队列管理，扩展仍是受信任的代码，插件不是沙箱。
 
@@ -24,7 +24,7 @@ daemon 在 agent 锁内校验当前 Worker 身份、generation、run_id 和 stop
 
 `pi_context` 绑定父 Codex 的 workspace；同一 MCP 连接后续可省略 scope，spawn 的 cwd 默认该目录，也可显式指定另一个现有目录的绝对路径。首次 `pi_spawn_agent` 带 cwd 且尚无绑定时，MCP adapter 会自动打开/恢复该目录的 scope（等价于先调 `pi_context`）；CLI 仍需显式 `--scope`。子代理指令始终读取 scope 目录的 `SUBAGENT-PI.md`，与子代理 cwd 无关；新建与唤醒/respawn 重新读取。新的 MCP 连接不会按 cwd 猜测旧 scope，需显式恢复。guard 启动插件自己的 Node SDK 入口，它加载所选 Pi 安装旁的 SDK。SessionManager 创建独立持久会话，后续恢复沿用同一路径。
 
-默认最多 4 个 resident agent，每个 scope 最多 16 个历史 agent。resident 上限满时自动 park 最久未活动的已结算 idle agent：无活动 run、无待答问题、generation 一致才入选，走核验过的 interrupt 路径并保留会话；cleanup 非 verified 时记为 orphaned 并尝试下一个候选，无可 park 候选才返回 capacity_exceeded。writer 独占同一或嵌套 cwd，跨 scope 检查；parent Codex 不受此锁约束。
+默认最多 4 个 resident agent，每个 scope 最多 16 个历史 agent。resident 上限满时自动 park 最久未活动的已结算 idle agent：无活动 run、无待答问题、generation 一致才入选，走核验过的 interrupt 路径并保留会话；cleanup 非 verified 时记为 orphaned 并尝试下一个候选，无可 park 候选才返回 capacity_exceeded。writer 独占同一或嵌套 cwd，跨 scope 检查；新 writer 可核验并卸载已结算、无问题的冲突 writer，活动或未核验的 writer 仍阻止准入。parent Codex 不受此锁约束。空闲 resident 默认 1800 秒后卸载；专用 idle 时间戳在结算或空闲消息写入时更新，读取和后台遥测不会续期，未 ACK 的持久结果不阻止卸载。
 
 Pi 不会获得父 Codex 的对话历史。把任务所需的上下文显式写入 task；继承 skills/MCP 不等于继承对话或授权。按任务需要简短说明以下内容即可，不要求固定格式，也不自动注入提示：
 
@@ -36,7 +36,7 @@ Pi 不会获得父 Codex 的对话历史。把任务所需的上下文显式写�
 交付：说明根因、修改和实际验证结果；遇到超出授权范围的决定时向父代理提问。
 ```
 
-复用 agent 时，它保留自己的 Pi 历史；后续 message 只需补充新任务、变化的事实和边界，不能假定它看到了父会话的新消息。只需补充当前任务时用 steer；新任务用 follow_up 或空闲时的 send。
+复用 agent 时，它保留自己的 Pi 历史；后续 message 只需补充新任务、变化的事实和边界，不能假定它看到了父会话的新消息。补充当前任务用 pi_send_message；pi_followup_task 在活动任务内接入同一 run，空闲时创建新 run。需要独立排队的任务仍可通过 CLI follow-up。
 
 ## Steering 与 follow-up
 
@@ -46,15 +46,19 @@ steer 回执的 execution=after_current_sdk_call 表示调度方式，不是已�
 
 `mode="follow_up"` 由 daemon 持久排队，每项有独立 run_id，前一个任务及其续跑全部结束后才开始。`mode="send"` 只用于 idle agent。
 
+## V2 消息与任务
+
+`pi_send_message` 在活动 SDK prompt 中使用公开 native steering，进入下一次模型调用；SDK 尚在主输入预处理时，先作为同一任务的有序续跑。空闲时调用公开 sendCustomMessage 写入 history，不启动模型、不创建 run。`pi_followup_task` 活动时与消息相同，空闲时创建新 run。两者都可自动加载已核验卸载的 session，并保留有效 model/thinking。接受不证明消费，诊断回执仍由 inspect 返回。
+
 ## Interrupt
 
-interrupt 取消 daemon 排队任务，并终止、核验插件自己拥有的进程组。这也停止输入 hook、认证预处理和扩展计时器；不会靠 Pi 的瞬时 idle 声称停止成功。返回 `process_retained=false`、state=dormant，cleanup 如实报告 verified/unknown。不会向普通 Pi 会话发信号。
+`pi_interrupt_agent` 和 CLI interrupt 是软任务中断：取消 daemon 后继任务、插件输入、SDK queues 和待答 UI，调用公开 abort，并等待完整 managed task（包括原生输入和 hook 预处理）退出。合作式中断保留 PID/generation；空闲或已卸载 agent 返回原状态、不重新加载。返回 previous_status、runtime_retained，硬清理 fallback 另有 forced=true。原生 SDK 瞬时 idle 不能作为任务退出证明。
 
-session 和结果保留；park 后的 agent 可直接用 `pi_send_input` 的 send/follow_up 自动唤醒（确保加载），也可显式 respawn。`pi_send_input(interrupt=true, message=...)` 明确要求替换工作：只有旧进程清理 verified 后才启动新 generation 执行该新消息，不重放旧任务。清理无法确认则拒绝替换；新建、恢复和中断替换共用容量准入锁，不允许并发启动突破驻留上限。
+SDK 不在 streaming、原生预处理尚未退出，或任务曾排入无法用公开 API 清除的 nextTurn custom 输入时，直接要求硬清理（nextTurn 是否已消费无法可靠判断，采取保守处理）。其他 abort 无法在 rpc_timeout_seconds 内确认任务退出时，也改为终止并核验受管进程组；清理 unknown 时保留 orphaned 并拒绝自动恢复。中断不撤销已发生的文件或外部副作用，也不自动重放旧任务。软中断后的空闲时间从退出确认开始计时。
 
 ## Close 与 respawn
 
-MCP 只列出 pi_close_agent 作为停止工具；旧 pi_interrupt_agent 与 CLI interrupt 仍兼容。close 先 TERM 再 KILL 并核验受管进程组，保留会话和结果。无法确认归属/清理时阻止恢复，不对猜测 PID 发信号。
+普通 MCP discovery 只广告 10 个日常工具（含软 interrupt）；context、close、respawn、legacy send 保留为显式管理调用和 CLI 操作。close、容量/闲置卸载、静默超时和 shutdown 仍使用先 TERM 后 KILL 的核验清理。底层 legacy interrupt RPC 保留硬停止语义；CLI interrupt 映射到 soft_interrupt。`pi_send_input(interrupt=true, message=...)` 保留显式硬替换语义，只有 cleanup verified 后才启动新 generation。
 
 respawn 是幂等的确保加载：worker 仍存活时不改变任何状态并返回当前 state（already_running；带 message 会替换活 writer，因此明确拒绝并指向 pi_send_input），需要启动时才要求旧 writer 已消失、退出结算已完成且会话存在；agent_id 不变、generation 增加。自然退出尚在结算时明确返回 worker_alive，不在内部自动重试。进程退出后最多等待 2 秒读取末尾事件；即使后代仍持有输出管道，旧 run 和队列也会结算，残留进程组的 cleanup 仍如实为 unknown。所有停止路径在允许换代前将旧队列取消；旧完成回调既不能改写新进程，也不能在死进程上推进队列。可附加新消息，不附加则恢复为 idle。CLI resume 是其别名。dormant/closed 且 cleanup verified 的 agent 由 send/follow_up 直接唤醒（记录 auto_wake 事件，generation 增加）；orphaned、crashed、tainted 与 cleanup 未核验时仍要求显式 respawn，绝不静默启动。
 

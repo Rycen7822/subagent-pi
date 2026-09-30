@@ -48,6 +48,8 @@ class Worker:
         self.active_tools = {}
         self.last_activity = now()
         self.last_progress = time.monotonic()
+        self.idle_since = None
+        self.cancelled_run = False
         self.idle_timeout_seconds = idle_timeout
         self.events_written = 0
         self.tasks = []

@@ -75,9 +75,12 @@ function bindManagedActions() {
   };
   resources.runtime.sendMessage = (message, options = {}) => {
     const owner = queue.context.getStore();
-    if (owner && owner !== queue.active) { report('Custom message rejected: its managed task ended'); return; }
+    if (owner && (owner !== queue.active || owner.cancelled)) { report('Custom message rejected: its managed task ended or was cancelled'); return; }
     if (options.deliverAs === 'nextTurn' || options.triggerTurn === false ||
         (!queue.active && !options.triggerTurn)) {
+      // SDK clearQueue does not clear nextTurn custom input. Retention cannot
+      // safely cancel it through public APIs, even if consumption is uncertain.
+      if (owner && options.deliverAs === 'nextTurn') owner.pendingCustomNextTurn = true;
       void session.sendCustomMessage(message, { ...options, triggerTurn: false }).catch(report);
     } else {
       try { queue.enqueue({ kind: 'custom', message }); } catch (error) { report(error); }
@@ -149,12 +152,17 @@ if (args.apiKey && resolved.model) await services.modelRuntime.setRuntimeApiKey(
 session.subscribe(event => {
   queue.observe(event);
   // A host per-run boundary has no authority over the daemon task.
-  if (event.type !== 'agent_settled') output(event);
+  if (event.type !== 'agent_settled') output({ ...event, originRunId: queue.context.getStore()?.id });
 });
 
 sdk.initTheme(settingsManager.getTheme(), false);
 const dialogs = new Map();
 function dialog(method, fields, options) {
+  const owner = queue.context.getStore();
+  if (!owner || owner !== queue.active || owner.cancelled) {
+    report('Question rejected: no active managed task owns it');
+    return Promise.resolve(undefined);
+  }
   const id = randomUUID();
   return new Promise(resolve => {
     let timer;
@@ -162,14 +170,14 @@ function dialog(method, fields, options) {
     const finish = value => {
       if (!dialogs.delete(id)) return;
       clearTimeout(timer); options?.signal?.removeEventListener('abort', cancel);
-      output({ type: 'extension_ui_closed', id });
+      output({ type: 'extension_ui_closed', id, originRunId: owner.id });
       resolve(value);
     };
     if (options?.signal?.aborted) { resolve(undefined); return; }
-    dialogs.set(id, finish);
+    dialogs.set(id, { finish, owner });
     options?.signal?.addEventListener('abort', cancel, { once: true });
     if (options?.timeout) timer = setTimeout(() => finish(undefined), options.timeout);
-    output({ type: 'extension_ui_request', id, method, ...fields });
+    output({ type: 'extension_ui_request', id, method, originRunId: owner.id, ...fields });
   });
 }
 const ui = { ...session.extensionRunner.getUIContext(),
@@ -179,8 +187,26 @@ const ui = { ...session.extensionRunner.getUIContext(),
   editor: (title, prefill) => dialog('editor', { title, prefill }),
   notify: (message, type) => output({ type: 'extension_ui_request', method: 'notify', message, notifyType: type }),
 };
+function discardTask(task) {
+  session.clearQueue();
+  for (const entry of [...dialogs.values()]) if (entry.owner === task) entry.finish(undefined);
+}
+const abortTask = () => {
+  const owner = queue.context.getStore();
+  if (owner && owner !== queue.active) return Promise.reject(new Error('Abort rejected: its task ended'));
+  // Public SDK input hooks have no cancellation boundary after their awaits.
+  // Abort before they return cannot prevent a later model call; force cleanup.
+  if (queue.active && (!session.isStreaming || queue.active.controls.size || queue.active.pendingCustomNextTurn)) {
+    const error = new Error('SDK preflight cannot be safely cancelled; terminate the managed process');
+    error.code = 'managed_preflight_active';
+    return Promise.reject(error);
+  }
+  return queue.cancel(() => session.abort(), discardTask);
+};
 await session.bindExtensions({ mode: 'rpc', uiContext: ui, onError: report,
-  abortHandler: () => process.exit(130), shutdownHandler: () => process.exit(0),
+  abortHandler: () => { void abortTask().catch(error => {
+    report(error); if (error?.code === 'managed_preflight_active') process.exit(130);
+  }); }, shutdownHandler: () => process.exit(0),
   commandContextActions: { waitForIdle: () => session.waitForIdle(), newSession: unsupported,
     fork: unsupported, navigateTree: unsupported, switchSession: unsupported, reload: unsupported },
 });
@@ -215,9 +241,29 @@ async function command(request) {
         queue.enqueue({ content: request.message, source: 'rpc', deliverAs: 'steer' }, queue.active);
         reply({});
         break;
+      case 'native_input': {
+        const input = { content: request.message, source: 'rpc', deliverAs: 'steer', receiptId: request.receiptId };
+        if (!queue.active) throw new Error('No managed task owns native input');
+        if (!session.isStreaming) queue.enqueue(input, queue.active);
+        else queue.native(input, async (item, owner) => {
+          if (!session.isStreaming) { queue.enqueue(item, owner); return; }
+          await session.prompt(item.content, { source: 'rpc', expandPromptTemplates: false, streamingBehavior: 'steer' });
+        });
+        reply({});
+        break;
+      }
+      case 'store_message':
+        if (queue.active) throw new Error('Store-only message requires an idle managed task queue');
+        await session.sendCustomMessage({ customType: 'subagent-pi-message', content: request.message, display: false }, { triggerTurn: false });
+        reply({ stored: true });
+        break;
+      case 'abort':
+        // Keep the protocol reader available while waiting for hooks to exit.
+        void abortTask().then(reply, error => output({ type: 'response', id, command: type, success: false, error: String(error) }));
+        break;
       case 'extension_ui_response': {
         const value = request.cancelled ? undefined : request.value ?? request.confirmed;
-        dialogs.get(id)?.(value);
+        dialogs.get(id)?.finish(value);
         break;
       }
       default: throw new Error(`Unsupported managed command: ${type}`);

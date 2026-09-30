@@ -242,7 +242,7 @@ export function assertDiscoverResult(result: unknown): void {
       `has no common version with this bridge (${MODERN_VERSION})`);
   }
 }
-export const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.2.9" };
+export const CLIENT_INFO = { name: "subagent-pi-bridge", version: "0.3.0" };
 export const LEGACY_INIT = { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: CLIENT_INFO };
 const MODERN_META = {
   "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,

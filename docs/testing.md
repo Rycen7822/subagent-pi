@@ -23,7 +23,7 @@ npm run typecheck
 SUBAGENT_PI_LIVE_PI=1 python3 -m unittest discover -s tests -v
 ```
 
-使用原版 Pi 0.87.0 的 SDK，隔离 HOME、PI_CODING_AGENT_DIR、workspace 和 daemon。`SUBAGENT_PI_LIVE_PI_BIN` 可选择另一份官方 Pi 安装。无需宿主补丁，不改安装缓存。
+使用原版 Pi 的 SDK（本轮本机为 0.99.1；CI 固定版本见 workflow），隔离 HOME、PI_CODING_AGENT_DIR、workspace 和 daemon。`SUBAGENT_PI_LIVE_PI_BIN` 可选择另一份官方 Pi 安装。无需宿主补丁，不改安装缓存。
 
 真实 MCP → daemon → SDK 子进程使用离线 mock provider，fetch 被替换为抛错函数。覆盖正常任务、before-settle/native continuation、多条及嵌套扩展输入、串行预处理与 FIFO、强制 system prompt、handled 输入、有序 steer、中断预处理、替换进程、迟到计时器隔离与显式 UI 确认；另验证启动期本地命令完成、无归属消息拒绝和扩展 stdout 不破坏协议事件。provider context、结果/hash 和进程清理是行为证据。父通知测试另覆盖 MCP 元数据归属、共享连接隔离、终态/问题投递及不确定提交不重试。
 

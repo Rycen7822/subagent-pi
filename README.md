@@ -4,9 +4,9 @@
 
 让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、任务内有序续跑、排队 follow-up、检查工作轨迹、中断、关闭、恢复原会话、收取结果。
 
-这是完整源码版 `0.2.9`，针对 **Linux / WSL2，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
+这是完整源码版 `0.3.0`，针对 **Linux / WSL2，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
 
-受管子进程使用 **原版 Pi 0.87.0 的 SDK**，无需修改或补丁化 Pi。插件拥有串行输入队列及任务完成协议；steer 在当前 SDK 调用完成后有序续跑，仍归属原任务。interrupt 终止并核验自己的子进程，保留 session 供恢复。正常交互式 Pi 不受影响，详见 `docs/lifecycle.md`。
+受管子进程使用原版 Pi 的公开 SDK（本轮离线验证版本 0.99.1），无需修改 Pi。主代理使用 V2 风格的消息、后续任务和软中断操作；中断通常保留进程，无法确认整个任务退出时核验并终止进程组。空闲进程默认 30 分钟后自动卸载，session 和结果保留。详见 `docs/lifecycle.md`。
 
 受管子代理加载 Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes 与 settings（SDK 的 settings 更新仅在子进程内存中保存）；`ambient_extensions`/`ambient_skills` 默认 `true`。上下文文件单独处理：保留 Pi 配置目录的全局 `AGENTS.md`，不加载子代理工作目录及其父目录的 `AGENTS.md`；改为读取打开 scope 的 Codex 工作目录下的 `SUBAGENT-PI.md`。新建与 respawn 时重新读取，即使子代理在另一个 cwd 执行也一样。Pi 配置目录沿用打开 scope 的客户端进程里的 `PI_CODING_AGENT_DIR`（未设置即 Pi 默认 `$HOME/.pi/agent`，跨 daemon 重启保持）。在此之上按需继承 Codex 全局 skills（`~/.codex/skills`）与 MCP（`~/.codex/config.toml` 的 `mcp_servers`）；普通 `pi` 不受影响。
 
@@ -44,11 +44,11 @@ subagent-pi codex
 | 能力 | 方式 |
 |---|---|
 | 当前项目异步启动 | `pi_spawn_agent` / `subagent-pi spawn`，记录明确的绝对 cwd |
-| 任务内有序续跑 | `pi_send_input(mode="steer")`，区分 queued / consumed / not_consumed / unknown |
-| 后续任务 | `mode="follow_up"`，daemon 持久排队，每项拥有独立 run ID |
+| 消息 / 后续任务 | `pi_send_message` / `pi_followup_task`，支持 ID 或 scope 内唯一名称；活动输入使用原生 steering |
+| 空闲消息 | 写入 Pi history，不启动模型；后续任务自动唤醒已卸载 session |
 | 等待一个或多个任务 | `pi_wait_agent`，携带小结果与 hash；失败、停止、问题在 all 模式也立即返回 |
 | 检查工作轨迹 | `pi_inspect_agent`，有界输出、增量 cursor、控制回执 |
-| 中断 / 关闭 | `pi_close_agent` 取消排队工作，终止并核验受管理的进程组 |
+| 中断 / 卸载 | `pi_interrupt_agent` 取消任务并尽量保留进程；CLI close 显式清理进程组 |
 | 恢复 / respawn | 保留 agent ID，增加 generation，重新加载已持久化 Pi session |
 | 防重复执行 | scope + request_id + 参数摘要，持久保存已完成回执 |
 | 结果交接 | 读取不等于确认；按 run ID + SHA-256 显式确认 |
@@ -86,7 +86,7 @@ subagent-pi close AGENT_ID --scope SCOPE_ID
 - **Pi worker 不继承 Codex 的沙箱或逐工具批准机制。** 它使用当前 OS 用户和 Pi 自身权限。受管子代理默认加载 Pi 自身 extensions/skills（可用 profile 的 `ambient_extensions`/`ambient_skills` 显式关闭）；`access=read` 只把本插件控制的 builtin 限制为 read/grep/find/ls（由 `extensions/managed-surface.ts` 按 Pi 报告的来源应用、并回读验证后才算生效；扩展注册的同名工具不受影响）并收窄继承 MCP 的暴露面，Pi 自己的扩展、其工具与代码不受约束，因此这不是 OS 安全隔离。
 - 不安装 hooks。pi_context 从 Codex 的调用元数据绑定父会话；任务结束或提问时，通过官方 codex queue 入队提醒。仍在运行且空闲的父会话会自动续跑，跨进程通常约 10 秒检查一次；忙碌时排队，不强制打断。没有父会话身份的客户端仍使用 wait。
 - MCP 进程退出不终止 Pi。**daemon 崩溃后不能重新接回旧 stdin/stdout**；先确认并关闭遗留进程，再显式恢复。
-- interrupt/close 会终止并验证受管理进程组；主动脱离该组的后代不受绝对保证。恢复需显式 respawn。
+- interrupt 等待整个受管任务退出；不合作的 SDK hook 可触发硬清理。close 和自动卸载核验受管进程组；主动脱离该组的后代不受绝对保证。清理状态 unknown 时拒绝自动恢复。
 - 同一或嵌套 cwd 只允许一个受管理 writer；不能阻止 Codex 主 agent、编辑器或其他进程同时改文件。
 - 没有自动重试已执行的 shell，没有自动 model fallback，没有工作流脚本引擎、自动 review、worktree 管理或 clone。
 - 内部 SQLite/原始 Pi session/结果可能含敏感代码和文本。目录为当前用户私有；这不是对同一用户的恶意进程的安全边界。

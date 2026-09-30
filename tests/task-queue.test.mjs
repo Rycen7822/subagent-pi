@@ -85,3 +85,43 @@ test('accepted extension inputs have both count and byte limits', async () => {
   bytes.release.resolve(); await bytes.done.promise;
   assert.equal(bytes.queue.active, undefined);
 });
+
+
+test('abort returning idle does not release a blocked SDK preflight', async () => {
+  const started=gate(), release=gate(), ended=gate();
+  const queue=new TaskQueue(async () => { started.resolve(); await release.promise; }, ended.resolve);
+  queue.start('old','blocked'); await started.promise;
+  let completed=false; const canceled=queue.cancel(async () => {}).then(x => { completed=true; return x; });
+  await Promise.resolve(); assert.equal(completed,false);
+  assert.throws(() => queue.start('new','next'),/already active/);
+  assert.throws(() => queue.enqueue('late',queue.active),/cancelled/);
+  release.resolve(); const result=await canceled;
+  assert.deepEqual(result,{runId:'old',taskExited:true}); assert.equal((await ended.promise).cancelled,true);
+});
+
+test('cancel waits for a native input preflight and discards later controls', async () => {
+  const root=gate(), native=gate(), entered=gate(), done=gate(); let calls=0;
+  const queue=new TaskQueue(async () => { await root.promise; },event => {
+    if (event.type === 'managed_task_end') done.resolve(event);
+  });
+  queue.start('a','root');
+  queue.native('first',async () => { calls++; entered.resolve(); await native.promise; });
+  queue.native('second',async () => { calls++; });
+  await entered.promise;
+  const stopped=queue.cancel(async () => {}); root.resolve(); await Promise.resolve();
+  assert.ok(queue.active); native.resolve(); await stopped;
+  assert.equal(calls,1); assert.equal((await done.promise).cancelled,true);
+});
+
+test('native preflight drains before the next serialized SDK call starts', async () => {
+  const root=gate(), native=gate(), entered=gate(), done=gate(); const calls=[];
+  const queue=new TaskQueue(async input => { calls.push(input); if (input==='root') await root.promise;
+    queue.observe({type:'message_end',message:{role:'assistant'}}); },event => {
+    if (event.type==='managed_task_end') done.resolve(event);
+  });
+  queue.start('a','root'); queue.enqueue('legacy',queue.active);
+  queue.native('native',async () => { entered.resolve(); await native.promise; calls.push('native'); });
+  await entered.promise; root.resolve(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls,['root']); native.resolve(); await done.promise;
+  assert.deepEqual(calls,['root','native','legacy']);
+});

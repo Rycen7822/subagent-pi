@@ -25,6 +25,7 @@ p.add_argument('--skill',action='append'); p.add_argument('--extension',action='
 p.add_argument('--handle-prompt',action='store_true')
 p.add_argument('--hold-prompt-ms',type=int,default=0)
 p.add_argument('--no-managed-protocol',action='store_true')
+p.add_argument('--reject-abort',action='store_true')
 a,_=p.parse_known_args()
 if a.no_context_files and any(Path(path).name=='managed-context.ts' for path in a.extension or []):
     print('subagent-pi-context ready',file=sys.stderr,flush=True)
@@ -273,6 +274,20 @@ async def main():
                 current=asyncio.create_task(held_prompt(r))
             else: response(r); current=asyncio.create_task(run(r['message'],r['runId']))
         elif kind=='steer': queue.append(r['message']); response(r)
+        elif kind=='native_input': queue.append(r['message']); response(r)
+        elif kind=='store_message':
+            msg('custom',r['message'],customType='subagent-pi-message'); response(r,data={'stored':True})
+        elif kind=='abort':
+            if a.reject_abort: response(r,False,error='Uncooperative abort'); continue
+            if current and not current.done():
+                current.cancel()
+                with contextlib.suppress(asyncio.CancelledError): await current
+            queue.clear()
+            for f in ui.values():
+                if not f.done(): f.cancel()
+            ui.clear()
+            emit({'type':'managed_task_end','runId':r.get('runId'),'cancelled':True})
+            response(r,data={'runId':r.get('runId'),'taskExited':True})
         elif kind=='get_commands':
             response(r,data={'commands':[{'name':'skill:'+n,'source':'skill','sourceInfo':{'path':p}}
                                          for n,p in sorted(SKILLS.items())]})

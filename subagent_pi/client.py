@@ -15,19 +15,20 @@ BASE_TIMEOUT = 45
 # reaps a process group with TERM then KILL. The daemon budgets those stages from
 # startup_timeout_seconds, so the client must scale with it instead of reporting a
 # committed mutation as a failure while the daemon is still working.
-BOOT_OPS = frozenset({'spawn','respawn','close','interrupt'})
+BOOT_OPS = frozenset({'spawn','respawn','close','interrupt','soft_interrupt','send','message','followup'})
 
 def boot_budget(home):
     """Daemon worst case for a boot/reap call: handshake + receipt (capped at 20s)
     + rpc + terminate reap, with headroom for a slow interpreter start."""
-    startup = 30
+    startup = 30; rpc = 20
     if home is not None:
         try:
             from .config import load_config
-            startup = load_config(home)['startup_timeout_seconds']
+            config = load_config(home)
+            startup = config['startup_timeout_seconds']; rpc = config['rpc_timeout_seconds']
         except Exception:
             pass
-    return 2 * startup + 30
+    return 2 * startup + rpc + 10
 
 def call_timeout(op, params, home=None):
     """Client-side wait for one IPC call, derived from the daemon's own budget.

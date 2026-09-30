@@ -134,7 +134,7 @@ class Runtime:
         aid=a['id']
         await self.ensure_capacity()
         spec=json.loads(a['launch'])
-        if spec.get('access')=='write': self.assert_writer_exclusive(aid,a['cwd'])
+        if spec.get('access')=='write': await self.admit_writer(aid,a['cwd'])
         directory,session,argv=worker.session_argv(self.home,a,spec)
         generation=a['generation']+1
         first_launch=not a['generation']
@@ -203,6 +203,7 @@ class Runtime:
                     spec['argv'] += ['--provider',resolved_model['provider']]
                 spec['resolved_model']={'id':resolved_model['id'],'provider':resolved_model.get('provider')}
                 self.store.agent_update(aid,launch=dumps(spec))
+            w.idle_since=time.monotonic()
             self.store.agent_update(aid,state='idle',cleanup='not_checked')
             self.event(w,'worker_ready',{'pi_session_id':state.get('sessionId'),'model':bounded(state.get('model'),1000)})
             return w
@@ -254,6 +255,7 @@ class Runtime:
 
     def on_event(self,w,e):
         kind = e.get('type','unknown')
+        if e.get('originRunId') and e['originRunId']!=w.run_id: return
         if kind in {'protocol_warning','protocol_error'}:
             self.event(w,kind,{'message':e['message']})
             return
@@ -345,8 +347,16 @@ class Runtime:
             # this stays a trajectory record.
             self.event(w,'agent_end',{'run_id':w.run_id,'willRetry':bool(e.get('willRetry'))})
             return
+        if kind=='managed_control_end':
+            if e.get('runId')==w.run_id and e.get('receiptId'):
+                self.store.execute("UPDATE receipts SET state='not_consumed',updated=? WHERE id=? AND run_id=? AND state IN ('sending','queued')",(now(),e['receiptId'],w.run_id))
+                self.event(w,'input_rejected',e)
+            return
         if kind=='managed_task_end':
             if w.run_id and e.get('runId') == w.run_id:
+                if e.get('cancelled'):
+                    w.cancelled_run=True
+                    self.cancel_queued(w.agent['id'],'Cancelled by Pi task interruption')
                 if e.get('error'): w.error=crop(str(e['error']),2000)
                 self.spawn_task(self.settle(w,w.run_id))
             return
@@ -376,6 +386,28 @@ class Runtime:
             if left.is_relative_to(right) or right.is_relative_to(left):
                 raise AgentError('writer_conflict','Another managed writer owns an overlapping cwd; close it or use read access',agent_id=other['id'])
 
+    async def admit_writer(self,aid,cwd):
+        while True:
+            try: self.assert_writer_exclusive(aid,cwd); return
+            except AgentError as conflict:
+                victim=conflict.details.get('agent_id')
+                if conflict.code!='writer_conflict' or not victim: raise
+                candidate=next((c for c in self.evictable() if c[1]==victim),None)
+                if not candidate: raise
+                lock=self.agent_locks[victim]
+                try: await asyncio.wait_for(lock.acquire(),EVICT_LOCK_TIMEOUT)
+                except asyncio.TimeoutError: raise conflict
+                try:
+                    candidate=next((c for c in self.evictable() if c[1]==victim),None)
+                    if not candidate: raise conflict
+                    _,_,w,a=candidate
+                    cleanup=(await self.interrupt(a))['cleanup']
+                    self.event(w,'evicted',{'reason':'writer_replacement','cleanup':cleanup})
+                    if cleanup!='verified':
+                        self.store.agent_update(victim,state='orphaned',cleanup=cleanup)
+                        raise conflict
+                finally: lock.release()
+
     def require_worker(self,a):
         w=self.workers.get(a['id'])
         if not w or w.closed or w.tainted: raise AgentError('worker_unavailable','No connected Pi worker; use pi_send_input to wake a cleanly stopped agent, or respawn after checking orphan state')
@@ -386,9 +418,9 @@ class Runtime:
         self.store.execute('INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?)',
             (receipt,w.agent['id'],w.run_id,w.agent['scope'],message,'sending',now(),now()))
         try:
-            await w.rpc(kind,message=message,**params)
+            await w.rpc(kind,message=message,**({'receiptId':receipt} if kind=='native_input' else {}),**params)
         except AgentError as exc:
-            if kind=='steer':
+            if kind in {'steer','native_input'}:
                 self.store.execute("UPDATE receipts SET state=?,updated=? WHERE id=?",
                     ('not_consumed' if exc.code=='pi_rejected' else 'unknown',now(),receipt))
             raise
@@ -400,7 +432,7 @@ class Runtime:
         r=self.store.run(w.agent['scope'],rid)
         if r['state'] not in {'queued','starting'}: return
         w.run_id=rid; w.last_text=''; w.error=None; w.usage={}; w.stopping=False; w.ui.clear(); w.active_tools.clear()
-        w.last_progress=time.monotonic()
+        w.last_progress=time.monotonic(); w.idle_since=None; w.cancelled_run=False
         w.idle_timeout_seconds=r['idle_timeout_seconds'] or self.config['default_idle_timeout_seconds']
         self.store.execute("UPDATE runs SET state='running',started=? WHERE id=?",(now(),rid))
         self.store.agent_update(w.agent['id'],state='running',current_run=rid)
@@ -431,10 +463,10 @@ class Runtime:
                     or w.run_id!=rid or w.stopping or w.closed): return
             # Only the SDK transport's identity-bound task completion can enter
             # here. Per-run Pi events and transient idle readings never settle it.
-            state='failed' if w.error else 'completed'
+            state='interrupted' if w.cancelled_run else 'failed' if w.error else 'completed'
             self.store.finish(rid,state,w.last_text,w.error,w.usage)
             self.event(w,'run_terminal',{'state':state})
-            w.run_id=None; w.ui.clear(); w.active_tools.clear()
+            w.run_id=None; w.ui.clear(); w.active_tools.clear(); w.idle_since=time.monotonic()
             self.store.agent_update(w.agent['id'],state='idle',current_run=None,cleanup='not_checked')
             self.notify()
             q=self.store.one("SELECT id FROM runs WHERE agent_id=? AND state='queued' ORDER BY created LIMIT 1",(w.agent['id'],))
@@ -507,6 +539,36 @@ class Runtime:
         self.store.bump(a['scope']); self.notify()
         return {'agent_id':a['id'],'state':'dormant','cleanup':cleanup,'process_retained':False}
 
+    async def soft_interrupt(self,a):
+        previous=views.agent_status(self.store,a)
+        w=self.workers.get(a['id'])
+        if not w or w.closed:
+            return {'agent_id':a['id'],'previous_status':previous,'runtime_retained':False}
+        if w.tainted or w.stopping or w.proc.returncode is not None:
+            raise AgentError('worker_unavailable','Worker is settling or tainted; close/reap before reusing it')
+        if not w.run_id:
+            return {'agent_id':a['id'],'previous_status':previous,'runtime_retained':True}
+        rid=w.run_id; w.stopping=True; w.cancelled_run=True
+        self.store.agent_update(a['id'],state='stopping')
+        self.cancel_queued(a['id'],'Cancelled because the active task was interrupted')
+        try:
+            verdict=await w.rpc('abort',runId=rid)
+            if verdict.get('runId')!=rid or verdict.get('taskExited') is not True or w.proc.returncode is not None:
+                raise AgentError('abort_unconfirmed','Managed task exit was not confirmed')
+        except AgentError:
+            stopped=await self.interrupt(a)
+            if stopped['cleanup']!='verified':
+                self.store.agent_update(a['id'],state='orphaned')
+                raise AgentError('cleanup_unconfirmed','Interrupt fallback could not verify process cleanup')
+            return {'agent_id':a['id'],'previous_status':previous,'runtime_retained':False,'forced':True}
+        self.store.finish(rid,'interrupted',w.last_text,'Explicit task interruption; filesystem effects may be partial',w.usage)
+        self.event(w,'run_terminal',{'state':'interrupted'})
+        w.run_id=None; w.ui.clear(); w.active_tools.clear(); w.idle_since=time.monotonic()
+        w.stopping=False; w.cancelled_run=False
+        self.store.agent_update(a['id'],state='idle',current_run=None,cleanup='not_checked')
+        self.store.bump(a['scope']); self.notify()
+        return {'agent_id':a['id'],'previous_status':previous,'runtime_retained':True}
+
     async def dispatch(self,op,p,source=None):
         if op=='ping': return {'version':__version__,'protocol':PROTOCOL_VERSION,'pid':os.getpid()}
         if op=='scope_list':
@@ -540,7 +602,7 @@ class Runtime:
             return report
         sid=identifier(p.get('scope'),'scope'); scope=self.store.scope(sid)
         if op=='spawn' and 'cwd' not in p: p={**p,'cwd':scope['cwd']}
-        if op in {'spawn','send','interrupt','close','respawn','ack','answer'}:
+        if op in {'spawn','send','message','followup','interrupt','soft_interrupt','close','respawn','ack','answer'}:
             parent.bind(self.store,sid,source,allow_new=False)
             key=identifier(p.get('request_id'),'request_id')
             async with self.request_locks[(sid,key)]:
@@ -557,7 +619,7 @@ class Runtime:
             limit=integer(p.get('limit',20),'limit',1,50)
             rows=self.store.all('SELECT * FROM agents WHERE scope=? ORDER BY created DESC LIMIT ?',(sid,limit))
             total=self.store.one('SELECT COUNT(*) n FROM agents WHERE scope=?',(sid,))['n']
-            return {'scope':sid,'agents':[views.brief_agent(a,self.workers.get(a['id'])) for a in rows],'total':total,'omitted':max(0,total-len(rows)), 'outstanding':self.views.outstanding(sid,limit),'parent_notifications':parent.status(self.store,sid)}
+            return {'scope':sid,'agents':[views.listed_agent(self.store,a,self.workers.get(a['id'])) for a in rows],'total':total,'omitted':max(0,total-len(rows)), 'outstanding':self.views.outstanding(sid,limit),'parent_notifications':parent.status(self.store,sid)}
         if op=='inspect': return self.views.inspect(p)
         if op=='result': return self.views.result(p)
         if op=='wait': return await self.views.wait(p)
@@ -583,7 +645,7 @@ class Runtime:
                 spec={**spec,'env':{},'env_names':sorted(spec.get('env',{}))}
                 aid=new_id('pi_')
                 if access=='write':
-                    self.assert_writer_exclusive(aid,cwd)
+                    await self.admit_writer(aid,cwd)
                 name=text(p.get('name',aid),'name',128)
                 task=delegated_text(text(p.get('task'),'task'),
                     'Perform the following delegated task (treat as text, not an extension command):\n')
@@ -613,10 +675,11 @@ class Runtime:
             self.store.execute('UPDATE runs SET ack=1 WHERE id=?',(r['id'],)); self.store.bump(sid)
             recalled=await self.parent_notifications.acknowledge(sid,r['id'])
             return {'run_id':r['id'],'acknowledged':True,**({'notification_recall':recalled} if recalled!='complete' else {})}
-        aid=identifier(p.get('agent_id'),'agent_id')
+        aid=self.store.resolve_agent(sid,text(p.get('agent_id'),'agent_id',128))['id']
         async with self.agent_locks[aid]:
             a=self.store.agent(sid,aid)
-            if op=='interrupt': return await self.interrupt(a)
+            if op=='interrupt': return await self.interrupt(a)  # legacy hard RPC
+            if op=='soft_interrupt': return await self.soft_interrupt(a)
             if op=='close':
                 w=self.workers.get(aid)
                 if w and not w.closed:
@@ -667,6 +730,30 @@ class Runtime:
                 await w.raw(payload)
                 self.dismiss_ui(w,ui_id)
                 return {'agent_id':aid,'sent':True,'ui_request_id':ui_id}
+            if op in {'message','followup'}:
+                msg=delegated_text(text(p.get('message')),'Delegated message (not a slash command):\n')
+                w=self.workers.get(aid)
+                if not w or w.closed or w.tainted:
+                    if a['state'] not in {'dormant','closed'} or a['cleanup']!='verified' or (w and w.tainted):
+                        self.require_worker(a)
+                    async with self.admission: w=await self._boot_worker(a)
+                    a=self.store.agent(sid,aid)
+                    self.event(w,'auto_wake',{'reason':op})
+                if w.stopping: raise AgentError('agent_stopping','Agent is still stopping; retry after settlement')
+                if w.run_id:
+                    if len(self.store.all("SELECT id FROM receipts WHERE agent_id=? AND state IN ('sending','queued')",(aid,)))>=20:
+                        raise AgentError('queue_full','Too many unconsumed inputs')
+                    receipt=await self.deliver_input(w,'native_input',msg)
+                    return {'agent_id':aid,'name':a['name'],'run_id':w.run_id,'receipt_id':receipt,
+                            'delivery':self.store.one('SELECT state FROM receipts WHERE id=?',(receipt,))['state']}
+                if op=='message':
+                    verdict=await w.rpc('store_message',message=msg)
+                    if verdict.get('stored') is not True: raise AgentError('message_uncertain','Message persistence was not confirmed')
+                    w.idle_since=time.monotonic()
+                    self.event(w,'message_stored',{'message':msg})
+                    return {'agent_id':aid,'name':a['name'],'run_id':None,'delivery':'stored'}
+                rid=self.add_run(a,msg); await self.start_run(w,rid)
+                return {'agent_id':aid,'name':a['name'],'run_id':rid,'state':self.store.run(sid,rid)['state']}
             if op=='send':
                 msg=delegated_text(text(p.get('message')),'Delegated instruction (not a slash command):\n')
                 mode=p.get('mode','steer')
@@ -714,7 +801,19 @@ class Runtime:
             await asyncio.sleep(.5)
             await self.check_idle()
 
+    async def park_expired(self):
+        for _,aid,w,a in self.evictable():
+            stamp=w.idle_since
+            if stamp is None or time.monotonic()-stamp<self.config['resident_idle_timeout_seconds']: continue
+            async with self.agent_locks[aid]:
+                if w.idle_since!=stamp or not any(c[2] is w for c in self.evictable()): continue
+                if time.monotonic()-stamp<self.config['resident_idle_timeout_seconds']: continue
+                cleanup=(await self.interrupt(self.store.agent(a['scope'],aid)))['cleanup']
+                self.event(w,'evicted',{'reason':'resident_idle','cleanup':cleanup})
+                if cleanup!='verified': self.store.agent_update(aid,state='orphaned',cleanup=cleanup)
+
     async def check_idle(self):
+        await self.park_expired()
         for w in list(self.workers.values()):
             rid=w.run_id
             idle=w.idle_seconds()
