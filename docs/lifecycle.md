@@ -22,9 +22,9 @@ daemon 在 agent 锁内校验当前 Worker 身份、generation、run_id 和 stop
 
 ## Spawn
 
-`pi_context` 绑定父 Codex 的 workspace；同一 MCP 连接后续可省略 scope，spawn 的 cwd 默认该目录，也可显式指定另一个现有目录的绝对路径。子代理指令始终读取 scope 目录的 `SUBAGENT-PI.md`，与子代理 cwd 无关；新建与 respawn 重新读取。新的 MCP 连接不会按 cwd 猜测旧 scope，需显式恢复。guard 启动插件自己的 Node SDK 入口，它加载所选 Pi 安装旁的 SDK。SessionManager 创建独立持久会话，后续恢复沿用同一路径。
+`pi_context` 绑定父 Codex 的 workspace；同一 MCP 连接后续可省略 scope，spawn 的 cwd 默认该目录，也可显式指定另一个现有目录的绝对路径。首次 `pi_spawn_agent` 带 cwd 且尚无绑定时，MCP adapter 会自动打开/恢复该目录的 scope（等价于先调 `pi_context`）；CLI 仍需显式 `--scope`。子代理指令始终读取 scope 目录的 `SUBAGENT-PI.md`，与子代理 cwd 无关；新建与唤醒/respawn 重新读取。新的 MCP 连接不会按 cwd 猜测旧 scope，需显式恢复。guard 启动插件自己的 Node SDK 入口，它加载所选 Pi 安装旁的 SDK。SessionManager 创建独立持久会话，后续恢复沿用同一路径。
 
-默认最多 4 个 resident agent，每个 scope 最多 16 个历史 agent。writer 独占同一或嵌套 cwd，跨 scope 检查；parent Codex 不受此锁约束。
+默认最多 4 个 resident agent，每个 scope 最多 16 个历史 agent。resident 上限满时自动 park 最久未活动的已结算 idle agent：无活动 run、无待答问题、generation 一致才入选，走核验过的 interrupt 路径并保留会话；cleanup 非 verified 时记为 orphaned 并尝试下一个候选，无可 park 候选才返回 capacity_exceeded。writer 独占同一或嵌套 cwd，跨 scope 检查；parent Codex 不受此锁约束。
 
 Pi 不会获得父 Codex 的对话历史。把任务所需的上下文显式写入 task；继承 skills/MCP 不等于继承对话或授权。按任务需要简短说明以下内容即可，不要求固定格式，也不自动注入提示：
 
@@ -50,13 +50,13 @@ steer 回执的 execution=after_current_sdk_call 表示调度方式，不是已�
 
 interrupt 取消 daemon 排队任务，并终止、核验插件自己拥有的进程组。这也停止输入 hook、认证预处理和扩展计时器；不会靠 Pi 的瞬时 idle 声称停止成功。返回 `process_retained=false`、state=dormant，cleanup 如实报告 verified/unknown。不会向普通 Pi 会话发信号。
 
-session 和结果保留；单独 interrupt 后需显式 respawn。`pi_send_input(interrupt=true, message=...)` 明确要求替换工作：只有旧进程清理 verified 后才启动新 generation 执行该新消息，不重放旧任务。清理无法确认则拒绝替换；新建、恢复和中断替换共用容量准入锁，不允许并发启动突破驻留上限。
+session 和结果保留；park 后的 agent 可直接用 `pi_send_input` 的 send/follow_up 自动唤醒（确保加载），也可显式 respawn。`pi_send_input(interrupt=true, message=...)` 明确要求替换工作：只有旧进程清理 verified 后才启动新 generation 执行该新消息，不重放旧任务。清理无法确认则拒绝替换；新建、恢复和中断替换共用容量准入锁，不允许并发启动突破驻留上限。
 
 ## Close 与 respawn
 
 MCP 只列出 pi_close_agent 作为停止工具；旧 pi_interrupt_agent 与 CLI interrupt 仍兼容。close 先 TERM 再 KILL 并核验受管进程组，保留会话和结果。无法确认归属/清理时阻止恢复，不对猜测 PID 发信号。
 
-respawn 要求旧 writer 已消失、退出结算已完成且会话存在；agent_id 不变、generation 增加。自然退出尚在结算时明确返回 worker_alive，不在内部自动重试。进程退出后最多等待 2 秒读取末尾事件；即使后代仍持有输出管道，旧 run 和队列也会结算，残留进程组的 cleanup 仍如实为 unknown。所有停止路径在允许换代前将旧队列取消；旧完成回调既不能改写新进程，也不能在死进程上推进队列。可附加新消息，不附加则恢复为 idle。CLI resume 是其别名。已存活的 idle agent 使用 send。
+respawn 是幂等的确保加载：worker 仍存活时不改变任何状态并返回当前 state（already_running；带 message 会替换活 writer，因此明确拒绝并指向 pi_send_input），需要启动时才要求旧 writer 已消失、退出结算已完成且会话存在；agent_id 不变、generation 增加。自然退出尚在结算时明确返回 worker_alive，不在内部自动重试。进程退出后最多等待 2 秒读取末尾事件；即使后代仍持有输出管道，旧 run 和队列也会结算，残留进程组的 cleanup 仍如实为 unknown。所有停止路径在允许换代前将旧队列取消；旧完成回调既不能改写新进程，也不能在死进程上推进队列。可附加新消息，不附加则恢复为 idle。CLI resume 是其别名。dormant/closed 且 cleanup verified 的 agent 由 send/follow_up 直接唤醒（记录 auto_wake 事件，generation 增加）；orphaned、crashed、tainted 与 cleanup 未核验时仍要求显式 respawn，绝不静默启动。
 
 受管会话不允许扩展切换、fork、reload 或导航到其他 session；关闭/恢复是唯一替换入口。Pi 配置、技能、provider、工具和普通生命周期扩展仍加载，TUI 专用界面按 headless 模式处理。
 

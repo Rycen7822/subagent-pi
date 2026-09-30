@@ -47,7 +47,7 @@ subagent-pi codex
 
 启动器创建一个 scope，将 `PI_AGENTS_SCOPE`、`PI_AGENTS_CWD` 传给 Codex。不要在这个启动命令后再用 Codex 的目录切换参数改变项目；先 `cd` 到目标目录。
 
-Codex 使用 `pi_context(cwd="/absolute/path/to/repository")` 获取并复用该 scope。若宿主没有把环境变量传给 MCP，则仍然可以显式传入 scope。不依赖未经验证的父线程 ID 环境变量。
+Codex 使用 `pi_context(cwd="/absolute/path/to/repository")` 获取并复用该 scope；也可以直接 `pi_spawn_agent(..., cwd="...")`，adapter 会在无绑定时自动打开/恢复该 cwd 的 scope，等价于先调 pi_context。若宿主没有把环境变量传给 MCP，则仍然可以显式传入 scope。不依赖未经验证的父线程 ID 环境变量。
 
 也可以在普通 Codex 会话里直接调用 pi_context。相同 MCP adapter 进程会记住该 cwd 最近绑定的 scope。adapter 重新启动后，没有显式恢复 ID 就不会自动猜测旧会话归属。通过 CLI 查找：
 

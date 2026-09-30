@@ -28,6 +28,12 @@ def delegated_text(value: str, envelope: str) -> str:
     entry point that sends text into a session."""
     return envelope + value if value.lstrip().startswith('/') else value
 
+# Capacity eviction holds the admission lock while briefly waiting for a victim's
+# agent lock. A send(interrupt=true) or respawn path may hold that agent lock and
+# itself wait for admission, so the wait is bounded: a busy victim is skipped,
+# never awaited forever. Eviction itself still goes through verified interrupt.
+EVICT_LOCK_TIMEOUT=0.5
+
 class LockPool(WeakValueDictionary):
     """Holders and waiters keep a lock alive; idle keys need no daemon cache."""
     def __getitem__(self, key):
@@ -82,11 +88,51 @@ class Runtime:
         self.store.agent_update(w.agent['id'],cleanup=cleanup)
         return cleanup
 
+    def evictable(self):
+        """Settled residents that LRU capacity eviction may park; a pending
+        question, active run or unverified worker is never a candidate."""
+        out=[]
+        for aid,w in self.workers.items():
+            if w.closed or w.stopping or w.tainted or w.run_id or w.ui: continue
+            a=self.store.one('SELECT * FROM agents WHERE id=?',(aid,))
+            if not a or a['generation']!=w.generation or a['state']!='idle': continue
+            out.append((w.last_activity or 0,aid,w,a))
+        return sorted(out)
+
+    async def ensure_capacity(self):
+        """Park the least recently active settled agent before refusing a boot.
+
+        Eviction is a normal verified interrupt that keeps the session; every
+        candidate is re-checked under its agent lock. A busy candidate is skipped
+        (bounded wait, see EVICT_LOCK_TIMEOUT) and an unverified cleanup becomes an
+        orphan, so a caller without a parkable agent still gets capacity_exceeded
+        instead of a silent overshoot."""
+        attempted=set()
+        while sum(not w.closed for w in self.workers.values()) >= self.config['max_resident_agents']:
+            candidates=[c for c in self.evictable() if c[1] not in attempted]
+            if not candidates:
+                raise AgentError('capacity_exceeded','Resident Pi limit reached and no settled idle agent is evictable; close an agent or answer its pending question first')
+            _,eaid,w,a=candidates[0]
+            attempted.add(eaid)
+            lock=self.agent_locks[eaid]
+            try: await asyncio.wait_for(lock.acquire(),timeout=EVICT_LOCK_TIMEOUT)
+            except asyncio.TimeoutError: continue
+            try:
+                fresh=self.store.agent(a['scope'],eaid)
+                if (self.workers.get(eaid) is not w or w.closed or w.stopping or w.tainted or w.run_id or w.ui
+                        or fresh['state']!='idle' or fresh['generation']!=w.generation): continue
+                cleanup=(await self.interrupt(fresh))['cleanup']
+                self.event(w,'evicted',{'reason':'capacity','cleanup':cleanup})
+                if cleanup!='verified':
+                    self.store.agent_update(eaid,state='orphaned',cleanup=cleanup)
+                    self.store.bump(a['scope']); self.notify()
+            finally:
+                lock.release()
+
     async def _boot_worker(self, a):
         """Own the generation and ledger transitions; worker owns process pipes."""
         aid=a['id']
-        if sum(not w.closed for w in self.workers.values()) >= self.config['max_resident_agents']:
-            raise AgentError('capacity_exceeded','Resident Pi limit reached; close an idle agent first')
+        await self.ensure_capacity()
         spec=json.loads(a['launch'])
         if spec.get('access')=='write': self.assert_writer_exclusive(aid,a['cwd'])
         directory,session,argv=worker.session_argv(self.home,a,spec)
@@ -332,7 +378,7 @@ class Runtime:
 
     def require_worker(self,a):
         w=self.workers.get(a['id'])
-        if not w or w.closed or w.tainted: raise AgentError('worker_unavailable','No connected Pi worker; use respawn after checking orphan state')
+        if not w or w.closed or w.tainted: raise AgentError('worker_unavailable','No connected Pi worker; use pi_send_input to wake a cleanly stopped agent, or respawn after checking orphan state')
         return w
 
     async def deliver_input(self,w,kind,message,**params):
@@ -581,7 +627,16 @@ class Runtime:
                 return {'agent_id':aid,'state':'closed' if cleanup=='verified' else 'orphaned','cleanup':cleanup,'session_retained':True}
             if op=='respawn':
                 w=self.workers.get(aid)
-                if w and not w.closed: raise AgentError('worker_alive','Close the current worker before respawn')
+                if w and not w.closed:
+                    if w.tainted:
+                        raise AgentError('worker_alive','The current worker is stopping after unowned activity; let cleanup settle, then respawn')
+                    if p.get('message'):
+                        raise AgentError('worker_alive','Agent worker is still alive; use pi_send_input (steer/send/follow_up, or interrupt=true to replace the worker), or close it before respawning with a new message')
+                    if w.proc.returncode is not None or w.stopping:
+                        # Exit accounting has not retired this worker yet; booting now
+                        # would race the old generation's completion path.
+                        raise AgentError('worker_alive','The previous worker is still settling its exit; retry respawn once accounting completes')
+                    return {'agent_id':aid,'name':a['name'],'generation':w.generation,'run_id':w.run_id,'state':a['state'],'scope':sid,'already_running':True}
                 if a['state']=='orphaned' or a['cleanup']=='unknown': raise AgentError('orphaned_worker','Close/reap the orphan before respawn; old pipes cannot be reattached')
                 async with self.admission:
                     w=await self._boot_worker(a)
@@ -592,8 +647,8 @@ class Runtime:
                     await self.start_run(w,rid)
                 self.store.bump(sid)
                 return {'agent_id':aid,'generation':w.generation,'run_id':rid,'state':'running' if rid else 'idle','scope':sid}
-            w=self.require_worker(a)
             if op=='answer':
+                w=self.require_worker(a)
                 ui_id=text(p.get('ui_request_id'),'ui_request_id',256)
                 item=w.ui.get(ui_id)
                 if not item: raise AgentError('input_not_found','No such pending Pi UI request')
@@ -616,6 +671,7 @@ class Runtime:
                 msg=delegated_text(text(p.get('message')),'Delegated instruction (not a slash command):\n')
                 mode=p.get('mode','steer')
                 if mode not in {'send','steer','follow_up'}: raise AgentError('invalid_argument','Invalid message mode')
+                w=self.workers.get(aid)
                 if p.get('interrupt',False):
                     await self.interrupt(a)
                     a=self.store.agent(sid,aid)
@@ -624,8 +680,21 @@ class Runtime:
                     async with self.admission:
                         w=await self._boot_worker(a)
                     mode='send'
+                else:
+                    usable=bool(w) and not w.closed and not w.tainted
+                    wakeable=(not usable and not (w and w.tainted) and mode in {'send','follow_up'}
+                              and a['state'] in {'dormant','closed'} and a['cleanup']=='verified')
+                    if wakeable:
+                        # Ensure-loaded: a cleanly stopped agent is parked, and its
+                        # next run boots the same persisted session (Codex resume).
+                        async with self.admission:
+                            w=await self._boot_worker(a)
+                        a=self.store.agent(sid,aid)
+                        self.event(w,'auto_wake',{'reason':'send'})
+                    elif not usable:
+                        w=self.require_worker(a)
                 if mode=='steer':
-                    if not w.run_id: raise AgentError('agent_idle','Agent is idle; use mode=send. Steering never implicitly respawns.')
+                    if not w.run_id: raise AgentError('agent_idle','Agent is idle; use mode=send, which wakes a dormant or closed agent. Steering never implicitly respawns.')
                     if len(self.store.all("SELECT id FROM receipts WHERE agent_id=? AND state IN ('sending','queued')",(aid,)))>=20:
                         raise AgentError('queue_full','Too many unconsumed steering messages')
                     receipt=await self.deliver_input(w,'steer',msg)

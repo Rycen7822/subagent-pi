@@ -336,6 +336,63 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                     if task and not task.done():task.cancel()
                 await asyncio.gather(*(t for t in (replacement,competing) if t),return_exceptions=True)
 
+    async def test_capacity_evicts_the_least_recently_active_idle_agent(self):
+        self.rt.config['max_resident_agents']=2
+        first=await self.spawn('simple'); await self.wait(first['run_id'])
+        second=await self.spawn('simple'); await self.wait(second['run_id'])
+        self.rt.workers[first['agent_id']].last_activity-=10
+        third=await self.spawn('simple')
+        self.assertFalse((await self.wait(third['run_id']))['timed_out'])
+        parked=self.rt.store.agent(self.scope,first['agent_id'])
+        self.assertEqual((parked['state'],parked['cleanup']),('dormant','verified'))
+        self.assertEqual(self.rt.store.agent(self.scope,second['agent_id'])['state'],'idle')
+        event=json.loads(self.events(first['agent_id'],'evicted')[0]['payload'])
+        self.assertEqual((event['reason'],event['cleanup']),('capacity','verified'))
+        self.assertEqual(len([w for w in self.rt.workers.values() if not w.closed]),2)
+
+    async def test_capacity_never_evicts_a_pending_question(self):
+        self.rt.config['max_resident_agents']=2
+        asking=await self.spawn('UI_CONFIRM')
+        self.assertEqual((await self.wait(asking['run_id']))['runs'][0]['state'],'needs_input')
+        idle=await self.spawn('simple'); await self.wait(idle['run_id'])
+        self.rt.workers[asking['agent_id']].last_activity-=10
+        third=await self.spawn('simple')
+        await self.wait(third['run_id'])
+        self.assertEqual(self.rt.store.agent(self.scope,asking['agent_id'])['state'],'needs_input')
+        self.assertEqual(self.rt.store.agent(self.scope,idle['agent_id'])['state'],'dormant')
+        self.assertEqual(len(self.events(asking['agent_id'],'evicted')),0)
+
+    async def test_capacity_without_a_parkable_candidate_still_refuses(self):
+        self.rt.config['max_resident_agents']=1
+        asking=await self.spawn('UI_CONFIRM')
+        self.assertEqual((await self.wait(asking['run_id']))['runs'][0]['state'],'needs_input')
+        with self.assertRaises(AgentError) as cm: await self.spawn('simple')
+        self.assertEqual(cm.exception.code,'capacity_exceeded')
+        await self.mutation('answer',asking['agent_id'],ui_request_id='ui-1',answer=False)
+        self.assertFalse((await self.wait(asking['run_id']))['timed_out'])
+
+    async def test_eviction_with_unverified_cleanup_orphans_and_tries_the_next(self):
+        self.rt.config['max_resident_agents']=2
+        first=await self.spawn('simple'); await self.wait(first['run_id'])
+        second=await self.spawn('simple'); await self.wait(second['run_id'])
+        self.rt.workers[first['agent_id']].last_activity-=10
+        original=worker.terminate
+        async def unknown(directory,current):
+            cleanup=await original(directory,current)
+            return 'unknown' if current.agent['id']==first['agent_id'] else cleanup
+        with m.patch('subagent_pi.runtime.terminate',unknown):
+            third=await self.spawn('simple')
+        await self.wait(third['run_id'])
+        event=json.loads(self.events(first['agent_id'],'evicted')[0]['payload'])
+        self.assertEqual((event['reason'],event['cleanup']),('capacity','unknown'))
+        # worker_exited re-judges cleanup from the real process group afterwards,
+        # so the agent must at least not be left parked as a clean dormant agent.
+        parked=self.rt.store.agent(self.scope,first['agent_id'])
+        self.assertIn(parked['state'],{'orphaned','crashed'})
+        self.assertNotEqual((parked['state'],parked['cleanup']),('dormant','verified'))
+        self.assertEqual(self.rt.store.agent(self.scope,second['agent_id'])['state'],'idle')
+        self.assertEqual(len([w for w in self.rt.workers.values() if not w.closed]),2)
+
     async def test_reader_failure_after_interrupt_keeps_the_terminal_state(self):
         spawned=await self.spawn('delay=120|running')
         w=self.rt.workers[spawned['agent_id']]
@@ -668,6 +725,40 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         revived=await self.mutation('respawn',s['agent_id'],message='after stop')
         await self.wait(revived['run_id'])
         self.assertIn('after stop',(await self.result(revived['run_id']))['text'])
+    async def test_send_auto_wakes_a_dormant_agent(self):
+        s=await self.spawn('simple'); await self.wait(s['run_id'])
+        stopped=await self.mutation('interrupt',s['agent_id'])
+        self.assertEqual(stopped['cleanup'],'verified')
+        sent=await self.mutation('send',s['agent_id'],mode='send',message='after park')
+        await self.wait(sent['run_id'])
+        self.assertEqual((await self.result(sent['run_id']))['text'],'Completed: after park')
+        self.assertEqual(self.rt.store.agent(self.scope,s['agent_id'])['generation'],2)
+        self.assertEqual(len(self.events(s['agent_id'],'auto_wake')),1)
+    async def test_send_auto_wakes_a_closed_agent(self):
+        s=await self.spawn('simple'); await self.wait(s['run_id'])
+        await self.mutation('close',s['agent_id'])
+        sent=await self.mutation('send',s['agent_id'],mode='send',message='after close')
+        await self.wait(sent['run_id'])
+        self.assertIn('after close',(await self.result(sent['run_id']))['text'])
+    async def test_send_never_auto_wakes_an_unverified_stop(self):
+        s=await self.spawn('simple'); await self.wait(s['run_id'])
+        original=worker.terminate
+        async def unknown(directory,current):
+            await original(directory,current)
+            return 'unknown'
+        with m.patch('subagent_pi.runtime.terminate',unknown):
+            stopped=await self.mutation('interrupt',s['agent_id'])
+        self.assertEqual(stopped['cleanup'],'unknown')
+        with self.assertRaises(AgentError) as cm:
+            await self.mutation('send',s['agent_id'],mode='send',message='must not boot')
+        self.assertEqual(cm.exception.code,'worker_unavailable')
+        self.assertEqual(self.rt.store.agent(self.scope,s['agent_id'])['generation'],1)
+    async def test_steer_still_requires_a_live_worker_and_never_wakes(self):
+        s=await self.spawn('simple'); await self.wait(s['run_id'])
+        await self.mutation('interrupt',s['agent_id'])
+        with self.assertRaises(AgentError) as cm:
+            await self.mutation('send',s['agent_id'],mode='steer',message='too late')
+        self.assertEqual(cm.exception.code,'worker_unavailable')
     async def test_prompt_handled_without_a_run_is_reported_as_a_failed_run(self):
         # A handled input still gets a failed managed completion; the next task
         # can run without an empty success or a missing completion boundary.
@@ -703,9 +794,19 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((row['state'],row['cleanup']),('dormant','verified'))
         self.assertEqual(self.rt.store.run(self.scope,rid)['state'],'interrupted')
         self.assertEqual([e['type'] for e in self.rt.store.all('SELECT type FROM events WHERE agent_id=?',(aid,))].count('run_terminal'),1)
-    async def test_respawn_live_refused(self):
-        s=await self.spawn()
-        with self.assertRaises(AgentError) as cm: await self.mutation('respawn',s['agent_id'])
+    async def test_respawn_live_noop_returns_current_state(self):
+        # Codex-style resume: an alive worker is left alone and its effective
+        # state is returned; only a new message (which would replace a live
+        # writer) is still refused.
+        s=await self.spawn(); await self.wait(s['run_id'])
+        before=self.rt.store.agent(self.scope,s['agent_id'])
+        noop=await self.mutation('respawn',s['agent_id'])
+        self.assertTrue(noop['already_running'])
+        self.assertEqual(noop['generation'],before['generation'])
+        self.assertEqual(noop['state'],'idle'); self.assertIsNone(noop['run_id'])
+        self.assertEqual(len(self.rt.store.all('SELECT id FROM runs WHERE agent_id=?',(s['agent_id'],))),1)
+        with self.assertRaises(AgentError) as cm:
+            await self.mutation('respawn',s['agent_id'],message='replace')
         self.assertEqual(cm.exception.code,'worker_alive')
     async def test_crash_not_completed(self):
         s=await self.spawn('CRASH'); r=await self.wait(s['run_id'])

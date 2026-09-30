@@ -2,7 +2,7 @@
 from .common import AgentError, DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS
 S={'type':'string'}
 ID={'type':'string','minLength':1,'maxLength':128}
-SCOPE={'scope':{**ID,'description':'Optional after pi_context binds this MCP connection; pass explicitly to address another scope.'}}
+SCOPE={'scope':{**ID,'description':'Optional after pi_context binds this MCP connection or pi_spawn_agent opens it from cwd; pass explicitly to address another scope.'}}
 REQ={'request_id':{**ID,'description':'Stable key for this mutation; reuse only for identical retries.'}}
 AGENT={**SCOPE,'agent_id':ID}
 
@@ -12,14 +12,14 @@ def tool(name,op,description,properties,required,read=False):
     return {'name':name,'description':description,'inputSchema':obj(properties,required),
             'annotations':{'readOnlyHint':read,'destructiveHint':not read,'idempotentHint':read or 'request_id' in properties,'openWorldHint':not read},'_op':op}
 TOOLS=[
- tool('pi_context','scope_open','Open a Pi delegation scope in an explicit workspace, or resume a known scope. Reuse it for subsequent calls.',
+ tool('pi_context','scope_open','Open a Pi delegation scope in an explicit workspace, or resume a known scope. Reuse it for subsequent calls. Optional: pi_spawn_agent with a cwd opens this scope implicitly.',
       {'cwd':{**S,'description':'Absolute current workspace directory, never the daemon directory.'},'scope':ID,'label':S,
        'inheritance':{'type':'boolean','description':'Explicitly enable or disable Codex skill/MCP inheritance for this scope.'},
        'codex_home':{**S,'description':'Explicit trusted Codex home directory; rebinds this scope as a management action.'}},['cwd']),
- tool('pi_spawn_agent','spawn','Start an independent Pi session and asynchronous task. Parent Codex conversation and sandbox are not inherited. Returns named agent/run IDs; no native Codex /agents integration.',
+ tool('pi_spawn_agent','spawn','Start an independent Pi session and asynchronous task. Parent Codex conversation and sandbox are not inherited. Returns named agent/run IDs; no native Codex /agents integration. scope is optional: with cwd and no bound scope the connection opens or resumes that workspace scope first. Settled idle agents are parked automatically when the resident limit is reached.',
       {**SCOPE,**REQ,'cwd':{**S,'description':'Absolute existing child working directory; defaults to the Codex scope cwd but may be elsewhere. Instructions always come from the scope cwd SUBAGENT-PI.md.'},'task':{**S,'description':'Self-contained delegation: goal, relevant findings and file paths, authorized actions/edit boundaries, constraints, acceptance checks and expected report. Distinguish confirmed facts from hypotheses; do not assume Pi saw the parent conversation.'},'name':{**ID,'description':'Short role/task label, unique within this scope (e.g. git-stats-fix). Returned as name; use agent_id/run_id for operations. Omit to use agent_id as the name.'},'profile':S,'model':S,'thinking':{**ID,'description':'Pi thinking level for the selected model. Omit to inherit Pi settings. Unsupported values return that model’s available levels.'},'access':{'type':'string','enum':['read','write'],'default':'write','description':'Managed tool policy, not an OS sandbox. Ambient Pi extensions retain their own capabilities.'},'idle_timeout_seconds':{'type':'integer','minimum':1,'maximum':604800,'description':'Model inactivity limit, default 1800 seconds. Text/thinking/tool-call deltas reset it; active tools and parent questions pause it. No total task deadline.'}},
       ['request_id','task']),
- tool('pi_send_input','send','Submit input to an existing Pi session. Queued is not consumed. interrupt=true terminates and verifies the owned process before starting a replacement with this message; it does not roll back effects.',
+ tool('pi_send_input','send','Submit input to an existing Pi session. Queued is not consumed. send/follow_up wakes a cleanly stopped (dormant or closed, verified) agent from its persisted session and boots it; steer still needs an active run on a live worker. interrupt=true terminates and verifies the owned process before starting a replacement with this message; it does not roll back effects.',
       {**AGENT,**REQ,'message':{**S,'description':'New work or a correction, with any changed facts, permissions and acceptance criteria. The child retains its own Pi history, but cannot see new parent conversation.'},'mode':{'type':'string','enum':['send','steer','follow_up'],'default':'steer','description':'send: new run on an idle agent. steer: same-run continuation after the current SDK call finishes, not a mid-call interruption. follow_up: separate run after the active task and all its continuations.'},'interrupt':{'type':'boolean','default':False}},
       ['agent_id','request_id','message']),
  tool('pi_wait_agent','wait','Event-driven wait, default 10 minutes, maximum 1 hour. Returns immediately on any completion (default any mode), failure, stop or question; all mode waits for all normal completions but still returns early for problems/questions. No polling or fixed sleep. Includes bounded results and exact hashes; never acknowledges. A successful bound-parent delivery consumes the event wakeup, settling any earlier queued notice before output. Cancelling the wait does not stop agents.',
@@ -32,9 +32,9 @@ TOOLS=[
       {**SCOPE,'run_id':ID,'offset':{'type':'integer','minimum':0},'max_bytes':{'type':'integer','minimum':256,'maximum':16384}},['run_id'],True),
  tool('pi_ack_result','ack','Acknowledge an exact run result only after it has been incorporated or explicitly dismissed. Recalls its queued notification when supported; notification_recall reports pending/failed cleanup. Does not delete session or result files.',
       {**SCOPE,**REQ,'run_id':ID,'result_sha256':S},['request_id','run_id','result_sha256']),
- tool('pi_close_agent','close','Stop work and terminate the owned process group. Preserve durable session and results. Also reaps a verified orphan.',
+ tool('pi_close_agent','close','Stop work and terminate the owned process group. Preserve durable session and results. Also reaps a verified orphan. Capacity is managed automatically: settled idle agents are parked when the resident limit is reached.',
       {**AGENT,**REQ},['agent_id','request_id']),
- tool('pi_respawn_agent','respawn','Restore the same logical agent from its persisted Pi session only after the previous writer is gone. Never auto-replay interrupted shell commands.',
+ tool('pi_respawn_agent','respawn','Ensure the same logical agent is running from its persisted Pi session. An alive worker is returned unchanged (already_running) unless a new message would replace it; a cleanly stopped agent can instead be woken with pi_send_input. Never auto-replay interrupted shell commands.',
       {**AGENT,**REQ,'message':S},['agent_id','request_id']),
  tool('pi_answer_agent','answer','Answer a pending Pi extension input request explicitly. Confirmations require a boolean; select/input/editor use text.',
       {**AGENT,**REQ,'ui_request_id':S,'answer':{'anyOf':[{'type':'string'},{'type':'boolean'}]}},['agent_id','request_id','ui_request_id','answer']),
@@ -78,5 +78,5 @@ def validate_op(op,p):
     if op in BY_OP:
         validate(p,BY_OP[op]['inputSchema'])
         if op!='scope_open' and not p.get('scope'):
-            raise AgentError('invalid_argument','scope is required; call pi_context first or pass scope explicitly')
+            raise AgentError('invalid_argument','scope is required; call pi_context first, or pass scope explicitly, or pass cwd to pi_spawn_agent')
     elif op not in {'ping','doctor','scope_list','shutdown'}: raise AgentError('unknown_operation','Unknown operation')

@@ -66,7 +66,7 @@ async def serve_mcp(home):
                 initialized=True
                 result={'protocolVersion':version,'capabilities':{'tools':{'listChanged':False}},
                         'serverInfo':{'name':'subagent-pi','version':__version__},
-                        'instructions':'Use pi_context with the actual workspace cwd, this connection then reuses its scope and spawn cwd. Tasks run outside the Codex native subagent runtime. Bound Codex parents receive queued attention on completion, failure, stop or questions. Check parent_notifications in pi_context; unbound callers must use wait. Keep mutation request_id stable for retries.'}
+                        'instructions':'Use pi_context with the actual workspace cwd to bind this connection; pi_spawn_agent with a cwd opens that scope implicitly when none is bound. Tasks run outside the Codex native subagent runtime. Bound Codex parents receive queued attention on completion, failure, stop or questions. Check parent_notifications in pi_context; unbound callers must use wait. Keep mutation request_id stable for retries.'}
             elif method=='ping': result={}
             elif not initialized: await error(rid,-32002,'Initialize first'); return
             elif method=='tools/list': result={'tools':[{k:v for k,v in t.items() if k!='_op'} for t in TOOLS]}
@@ -85,6 +85,17 @@ async def serve_mcp(home):
                     if existing: args['scope']=existing
                 elif spec['_op']!='scope_open' and not args.get('scope') and caller in active_scopes:
                     args['scope']=active_scopes[caller]
+                if spec['_op']=='spawn' and not args.get('scope') and args.get('cwd'):
+                    # Single-step spawn: bind the workspace exactly as an explicit
+                    # pi_context call would, then run the spawn with that scope.
+                    existing=os.environ.get('PI_AGENTS_SCOPE') or bound_scopes.get((caller,args['cwd']))
+                    lazy={'cwd':args['cwd'],**({'scope':existing} if existing else {})}
+                    from .inheritance import scope_source_snapshot  # trusted values never pass through the model
+                    source=scope_source_snapshot(home,{k:v for k,v in os.environ.items() if k!='CODEX_THREAD_ID'})
+                    source['parent']=parent
+                    opened=await request(home,'scope_open',lazy,timeout=call_timeout('scope_open',lazy,home),source=source)
+                    active_scopes[caller]=opened['scope']; bound_scopes[(caller,args['cwd'])]=opened['scope']
+                    args['scope']=opened['scope']
                 validate_op(spec['_op'],args)
                 timeout=call_timeout(spec['_op'],args,home)
                 source={'env':{},'parent':parent} if parent else None

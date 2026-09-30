@@ -282,6 +282,31 @@ class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         a=await self.tool('pi_context',{'cwd':str(self.workspace)})
         b=await self.tool('pi_context',{'cwd':str(self.workspace)})
         self.assertEqual(a['scope'],b['scope'])
+    async def test_spawn_with_cwd_opens_the_workspace_scope_implicitly(self):
+        # Single-step start: pi_context is optional when the spawn carries the
+        # workspace cwd; the implicit binding is connection-local like pi_context.
+        await self.initialize()
+        first=await self.tool('pi_spawn_agent',{'cwd':str(self.workspace),'task':'implicit scope','access':'read','request_id':'implicit-1'})
+        done=await self.tool('pi_wait_agent',{'run_ids':[first['run_id']],'timeout_seconds':4})
+        self.assertEqual(done['runs'][0]['result']['text'],'Completed: implicit scope')
+        listed=await self.tool('pi_list_agents',{})
+        self.assertEqual(listed['scope'],first['scope'])
+        second=await self.tool('pi_spawn_agent',{'task':'reused scope','access':'read','request_id':'implicit-2'})
+        self.assertEqual(second['scope'],first['scope'])
+        await self.tool('pi_close_agent',{'agent_id':first['agent_id'],'request_id':'implicit-close-1'})
+        await self.tool('pi_close_agent',{'agent_id':second['agent_id'],'request_id':'implicit-close-2'})
+    async def test_spawn_without_cwd_or_binding_still_asks_for_a_workspace(self):
+        await self.initialize()
+        response=await self.rpc('tools/call',{'name':'pi_spawn_agent','arguments':{'task':'nowhere','access':'read','request_id':'implicit-3'}})
+        self.assertTrue(response['result']['isError'])
+        self.assertIn('cwd',self.unpack(response)['error']['message'])
+    async def test_explicit_scope_spawn_does_not_open_another_scope(self):
+        await self.initialize()
+        sid=await self.open_scope()
+        before={s['id'] for s in (await request(self.home,'scope_list',{}))['scopes']}
+        run=await self.tool('pi_spawn_agent',{'scope':sid,'cwd':str(self.workspace),'task':'explicit','access':'read','request_id':'explicit-1'})
+        after={s['id'] for s in (await request(self.home,'scope_list',{}))['scopes']}
+        self.assertEqual(run['scope'],sid); self.assertEqual(before,after)
     async def test_bound_scope_defaults_and_explicit_resume_are_connection_local(self):
         await self.initialize()
         first=await self.tool('pi_context',{'cwd':str(self.workspace)})

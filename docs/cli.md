@@ -22,7 +22,7 @@ subagent-pi scope list
 subagent-pi codex [-- CODEX_ARGS...]
 ```
 
-常规命令带 `--scope ID`，或设置 PI_AGENTS_SCOPE。只有 CLI spawn 允许省略 scope 自动创建；MCP spawn 必须使用 pi_context 的 scope。
+常规命令带 `--scope ID`，或设置 PI_AGENTS_SCOPE。CLI spawn 与带 cwd 的 MCP spawn（无绑定时）会自动打开该 workspace 的 scope，等价于先开 scope；其他操作仍需显式传入或先绑定。
 
 ## Spawn / input
 
@@ -66,7 +66,7 @@ subagent-pi answer AGENT_ID UI_REQUEST_ID --scope ID --answer TEXT_OR_TRUE_FALSE
   [--request-id KEY]
 ```
 
-interrupt 停止并核验子进程，保留 session；再次使用需 respawn。interrupt+message 显式替换为新进程。resume 为 respawn 别名；live idle agent 使用 send。close 保留 session；daemon stop --force 会影响所有 scope 的 resident agents，而非当前 scope。
+interrupt 停止并核验子进程，保留 session；再次使用可直接用 send 自动唤醒，或显式 respawn。interrupt+message 显式替换为新进程。resume 为 respawn 别名，对存活 agent 幂等返回现状。close 保留 session；daemon stop --force 会影响所有 scope 的 resident agents，而非当前 scope。
 
 ## Runtime / docs
 

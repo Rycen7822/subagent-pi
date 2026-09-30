@@ -17,7 +17,7 @@ max_wait_seconds = 3600
 event_max_count_per_agent = 20000
 ```
 
-`pi_command` 是 argv 数组，不经 shell。指向官方 Pi 可执行文件（可为符号链接）；插件据此定位 SDK，再启动自己的 Node 入口。任意 shell 启动器或原版 Pi RPC 服务不等价于 SDK transport，会在握手时拒绝。不要在这里写管道或命令拼接字符串。安装 `--pi` 仅在 config.toml 不存在时写入路径，不覆盖已有配置。
+`pi_command` 是 argv 数组，不经 shell。指向官方 Pi 可执行文件（可为符号链接）；插件据此定位 SDK，再启动自己的 Node 入口。任意 shell 启动器或原版 Pi RPC 服务不等价于 SDK transport，会在握手时拒绝。不要在这里写管道或命令拼接字符串。安装 `--pi` 仅在 config.toml 不存在时写入路径，不覆盖已有配置。`max_resident_agents` 既是驻留上限也是自动 park 的触发线：达到上限时最久未活动的已结算 idle agent 会被停止并保留会话（无需手动 close），无可 park 候选才报 capacity_exceeded；`max_agents_per_scope` 仍是每 scope 历史 agent 上限。
 
 ## Codex 继承（受管子代理）
 
@@ -87,6 +87,6 @@ wait 的 timeout_seconds 以秒计，只限制调用等待，不停止任务。�
 
 单条 Pi JSONL 帧最大 8 MiB，超出视为协议/资源错误并停止该 worker。每个 agent 保留最近约 20,000 条规范化事件；每次启动的首条事件及之后每 256 条批量裁剪，避免短进程反复重启时绕过上限。每条事件内容有界。最终结果最多保存 1 MiB 文本快照，发生截断会返回 result_truncated=true；原始 Pi session 仍由 Pi 保留。stderr 最多保留 512 KiB；不是无限增长日志。
 
-已退出 Worker 在有界读流及退出清账后从内存移除，不保留历史结果副本；agent/request 锁只在持有或等待期间保留，回收不依赖定时扫描。活跃/空闲子进程仍占 resident 配额，任务结束后应按需 close。scope 的环境绑定保留供后续恢复使用，因此大量不同 scope 的环境快照仍会占用 daemon 内存；重启会释放这些快照，涉及秘密值的 scope 需重新绑定。
+已退出 Worker 在有界读流及退出清账后从内存移除，不保留历史结果副本；agent/request 锁只在持有或等待期间保留，回收不依赖定时扫描。活跃/空闲子进程仍占 resident 配额；配额满时自动 park 最久未活动的已结算 idle agent，因此通常无需为腾位而 close，close 仅用于显式停止或回收 orphan。scope 的环境绑定保留供后续恢复使用，因此大量不同 scope 的环境快照仍会占用 daemon 内存；重启会释放这些快照，涉及秘密值的 scope 需重新绑定。
 
 磁盘上的结果、session、请求账本默认不自动 GC，防止清掉未处理证据。长期使用应人工归档已收尾的整个 scope 数据；本版不提供自动清理命令。磁盘耗尽是一个操作失败，不是安全完成。
