@@ -3,6 +3,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { readSync, closeSync, writeSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 import { McpConnection, CancelledError, MAX_RESULT_TEXT, MAX_SCHEMA_BYTES,
   type ServerCfg, type ToolMeta, type HeaderPlanEntry } from "./mcp/connection";
 import { StdioConnection } from "./mcp/stdio";
@@ -118,7 +119,7 @@ export default async function (pi: ExtensionAPI) {
   }
   pi.on("session_shutdown", () => closeAll());
 
-  function describeResult(result: unknown): string {
+  function describeResult(result: unknown, configuredBudget?: number): string {
     const r = result as { content?: { type: string; text?: string }[]; structuredContent?: unknown };
     const parts: string[] = [];
     let unsupported = 0;
@@ -127,11 +128,21 @@ export default async function (pi: ExtensionAPI) {
       else unsupported += 1;
     }
     let text = parts.join("\n");
-    if (r?.structuredContent !== undefined) {
-      text += (text ? "\n" : "") + "structuredContent: " + JSON.stringify(r.structuredContent).slice(0, MAX_RESULT_TEXT);
+    let duplicatesStructured = false;
+    if (parts.length === 1 && r?.structuredContent !== undefined) {
+      try { duplicatesStructured = isDeepStrictEqual(JSON.parse(parts[0]), r.structuredContent); }
+      catch { /* Plain text is independent content. */ }
+    }
+    if (r?.structuredContent !== undefined && !duplicatesStructured) {
+      text += (text ? "\n" : "") + "structuredContent: " + JSON.stringify(r.structuredContent);
     }
     if (unsupported > 0) text += `\n[${unsupported} content item(s) of unsupported non-text type omitted; nothing was written to disk]`;
-    if (text.length > MAX_RESULT_TEXT) text = text.slice(0, MAX_RESULT_TEXT) + "\n[output truncated]";
+    const budget = configuredBudget && configuredBudget > 0 ? Math.min(configuredBudget, MAX_RESULT_TEXT) : MAX_RESULT_TEXT;
+    if (Buffer.byteLength(text, "utf8") > budget) {
+      // Streaming decode omits an incomplete final codepoint; retain a leading BOM.
+      text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(Buffer.from(text, "utf8").subarray(0, budget), { stream: true });
+      text += configuredBudget ? "\n[output truncated to the configured output_token_limit budget]" : "\n[output truncated]";
+    }
     return text;
   }
 
@@ -227,14 +238,7 @@ export default async function (pi: ExtensionAPI) {
     if (signal?.aborted) throw new CancelledError(false);
     try {
       const result = await conn.callTool(toolName, params.args ?? {}, cfg.tool_timeout_sec, signal, headerPlan) as { isError?: boolean } | undefined;
-      let text = describeResult(result);
-      // output_token_limit: enforced here at the serialization boundary with a
-      // conservative 4 bytes/token budget; it can only TIGHTEN the default cap.
-      const budget = cfg.tool_output_limits?.[toolName];
-      if (budget && budget > 0) {
-        const bytes = Buffer.from(text, "utf8");
-        if (bytes.length > budget) text = bytes.subarray(0, budget).toString("utf8") + "\n[output truncated to the configured output_token_limit budget]";
-      }
+      const text = describeResult(result, cfg.tool_output_limits?.[toolName]);
       if (result?.isError) throw new Error(`MCP tool reported failure: ${text.slice(0, 1000)}`);  // Pi sets isError on throw
       return { content: [{ type: "text", text }], details: { server: serverName, tool: toolName } };
     } catch (err) {

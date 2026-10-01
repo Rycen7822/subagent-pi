@@ -61,6 +61,8 @@ subagent-pi ack RUN_ID --scope ID --sha256 HASH [--request-id KEY]
 
 inspect 默认不返回 assistant message，detail=full 加入规范化文本、当前或最近任务的时间/用量/结果路径以及通知详情。诊断字段超过字节预算时被省略并标记 diagnostics_truncated=true；仍可增大 max_bytes，最大 16 KiB。不等于输出全部原始 session。事件 cursor 和 result byte offset 是两种不同游标，不可互用。
 
+从 0.5.0 起，管理操作 `scope_list` 省略已停用的 revision 字段；旧账本保留历史列，读取不依赖其值。
+
 ## Lifecycle
 
 ```text

@@ -3,13 +3,14 @@
 ## 离线自动测试
 
 ```bash
+python3 -m pip install -r tests/requirements.txt
 python3 scripts/validate_package.py
 python3 -m unittest discover -s tests -v
 npm run setup
 npm run typecheck
 ```
 
-默认使用 fake 子进程验证 MCP/CLI → daemon → guard 的协议、任务身份、回执、持久化、进程清理、故障和恢复。Node 队列测试由 Python 套件调用，覆盖串行归属、异常退出、handled 输入和旧回调不能混入新任务。没有模型请求。
+默认使用 fake 子进程验证 MCP/CLI → daemon → guard 的协议、任务身份、回执、持久化、进程清理、故障和恢复。Runtime 测试共享独立 fixture；schema 契约使用仅用于测试的 jsonschema 校验器，并通过真实 MCP/CLI 边界验证参数。Node 队列测试由 Python 套件调用，覆盖串行归属、异常退出、handled 输入和旧回调不能混入新任务。没有模型请求。
 
 资源回归使用隔离进程和真实 socket/stdio，覆盖 RPC/UI/IPC 背压与有界关闭、MCP 半帧取消、结果交付确认、Worker/锁回收和幂等记录保留。退出与替换并发用例验证旧任务完成清账、旧队列取消、迟到回调隔离和统一容量准入；后代保留管道时也要及时结算。Node 测试覆盖任务输入队列与输出通道的容量、进度合并、关键帧顺序和输出超时；真实 SDK 测试暂停自有 daemon 读取，验证大量工具进度后仍能提问、收取结果和执行后继任务，输入或关键输出过载则崩溃并取消队列。父通知与事件裁剪的积压测试检查有界扫描和跨短进程代际的保留上限。
 

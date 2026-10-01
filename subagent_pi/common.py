@@ -15,6 +15,10 @@ import uuid
 MAX_FRAME = 8 * 1024 * 1024
 DEFAULT_WAIT_SECONDS = 600
 MAX_WAIT_SECONDS = 3_600
+TEXT_MAX_BYTES = 65_536
+LABEL_MAX_CHARS = 128
+# The final lookahead requires absolute end in both Python and JSON Schema regexes.
+IDENTIFIER_PATTERN = r'^[A-Za-z0-9_.:-]+(?![\s\S])'
 # Agent states in which a worker may still hold processes or work behind it; the
 # workspace exclusion and crash reconciliation both use exactly this set.
 RESIDENT_AGENT_STATES = ('starting', 'running', 'needs_input', 'idle', 'stopping', 'orphaned')
@@ -53,16 +57,22 @@ def now() -> float:
 def new_id(prefix: str) -> str:
     return prefix + uuid.uuid4().hex[:20]
 
-def text(value, field="message", maximum=65536) -> str:
+def text(value, field="message", maximum=TEXT_MAX_BYTES) -> str:
     if not isinstance(value, str) or not value.strip() or "\x00" in value:
         raise AgentError("invalid_argument", f"{field} must be nonempty text without NUL")
     if len(value.encode("utf-8")) > maximum:
         raise AgentError("invalid_argument", f"{field} exceeds {maximum} UTF-8 bytes")
     return value
 
+def label(value, field='name') -> str:
+    value = text(value, field, LABEL_MAX_CHARS * 4)
+    if len(value) > LABEL_MAX_CHARS:
+        raise AgentError('invalid_argument', f'{field} exceeds {LABEL_MAX_CHARS} characters')
+    return value
+
 def identifier(value, field="id") -> str:
-    value = text(value, field, 128)
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+    value = text(value, field, LABEL_MAX_CHARS)
+    if not re.fullmatch(IDENTIFIER_PATTERN, value):
         raise AgentError("invalid_argument", f"Invalid {field}")
     return value
 

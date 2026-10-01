@@ -35,7 +35,9 @@ Python 3.11+ 与 Node 标准库，加载用户已安装的 Pi SDK，无额外模
 
 scopes、agents、runs、requests、receipts、events 是独立表。执行终态不等于 ack。agent generation 用于过滤旧实例事件。操作 request_id 在 scope 内唯一，参数不同不能重用。
 
-账本 schema 版本由 `store.py` 的 `MIGRATIONS` 注册表按序号递进升级（当前 5）；比当前版本更新的数据库直接拒绝启动，不猜测、不降级。scopes.base_env 只保存非密级的基础环境键（PATH/HOME 等），使 worker 在 daemon 重启后仍能启动；其余绑定值只存在于内存。
+账本 schema 版本由 `store.py` 的 `MIGRATIONS` 注册表按序号递进升级（当前 6）；比当前版本更新的数据库直接拒绝启动，不猜测、不降级。scopes.base_env 只保存非密级的基础环境键（PATH/HOME 等），使 worker 在 daemon 重启后仍能启动；其余绑定值只存在于内存。
+
+正常完成、明确拒绝和合作式打断共用空闲结算，重置任务状态及驻留计时；排队启动被明确拒绝时继续检查后继任务，结果不确定时停止推进。最近任务、投递回执和通知使用 Store 的有界索引查询。历史 scopes.revision 列保留但不再写入或用于观察状态。
 
 最终结果文件先原子写+fsync，再提交 terminal 数据库记录。后台事件是有界规范化投影，不反复保存 streaming partial 的不断增长全文。原始 Pi session 由 Pi 自己管理，不自行修改其消息树。
 

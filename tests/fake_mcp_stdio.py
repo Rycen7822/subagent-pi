@@ -157,8 +157,10 @@ def handle_call(req, name, args):
         if 'text' not in args or not isinstance(args.get('text'), str):
             reply(req, {"content": [{"type": "text", "text": "invalid arguments: text is required"}], "isError": True})
             return
-        reply(req, {"content": [{"type": "text", "text": text * count}],
-                    "structuredContent": {"echoed": text, "count": count}})
+        structured = {"echoed": text, "count": count}
+        rendered = json.dumps(structured) if MODE == 'duplicate_result' else text * count
+        reply(req, {"content": [{"type": "text", "text": rendered}],
+                    **({} if MODE == 'text_only_result' else {"structuredContent": structured})})
     elif name == 'delete_file':
         reply(req, {"content": [{"type": "text", "text": f"counted delete attempt for {args.get('path')}"}]})
     else:

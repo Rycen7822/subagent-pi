@@ -7,14 +7,14 @@ from pathlib import Path
 import time
 
 from . import parent
-from .common import TERMINAL, DEFAULT_WAIT_SECONDS, AgentError, crop, dumps, identifier, integer, text
+from .common import TERMINAL, DEFAULT_WAIT_SECONDS, AgentError, crop, dumps, identifier, integer, label
 
 def model_settings(a):
     spec=json.loads(a['launch'])
     return {k:spec[k] for k in ('resolved_model','thinking','available_thinking') if k in spec}
 
 def agent_status(store,a):
-    row=store.one("SELECT state FROM runs WHERE id=?",(a['current_run'],)) if a['current_run'] else store.one("SELECT state FROM runs WHERE agent_id=? AND state!='queued' ORDER BY created DESC LIMIT 1",(a['id'],))
+    row=store.one("SELECT state FROM runs WHERE id=?",(a['current_run'],)) if a['current_run'] else store.latest_run(a['id'])
     return row['state'] if row else 'idle'
 
 def listed_agent(store,a,w=None):
@@ -91,7 +91,7 @@ class ReadViews:
         return {'runs':[brief_run(r) for r in rows], 'total':count,'omitted':max(0,count-len(rows))}
 
     def inspect(self,p):
-        a=self.store.resolve_agent(p['scope'],text(p.get('agent_id'),'agent_id',128))
+        a=self.store.resolve_agent(p['scope'],label(p.get('agent_id'), 'agent_id'))
         limit=integer(p.get('limit',20),'limit',1,100)
         budget=integer(p.get('max_bytes',4096),'max_bytes',1024,16384)
         after=integer(p.get('after',0),'after',0,2**63-1)
@@ -100,10 +100,9 @@ class ReadViews:
         sql='SELECT * FROM events WHERE agent_id=? AND seq>?'
         if detail=='tools': sql+=" AND type!='message'"
         rows=self.store.all(sql+' ORDER BY seq LIMIT ?',(a['id'],after,limit+1))
-        receipts=self.store.all('SELECT id,run_id,state,updated FROM receipts WHERE agent_id=? ORDER BY created DESC LIMIT 5',(a['id'],))
+        receipts=self.store.recent_receipts(a['id'])
         result={'agent':brief_agent(a,self.worker_for(a['id'])),'events':[],'next_cursor':after,'has_more':False,'receipts':receipts}
-        run=self.store.run(p['scope'],a['current_run']) if a['current_run'] else self.store.one(
-            "SELECT * FROM runs WHERE agent_id=? AND state!='queued' ORDER BY created DESC LIMIT 1",(a['id'],))
+        run=self.store.run(p['scope'],a['current_run']) if a['current_run'] else self.store.latest_run(a['id'])
         if run:
             result['run']={k:run[k] for k in ('id','state')}
             if detail=='full':

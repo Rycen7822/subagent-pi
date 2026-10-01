@@ -156,6 +156,102 @@ def _enabled_tools(server: dict) -> list[str] | None:
         raise AgentError('invalid_argument', 'enabled_tools must be a list of tool names')
     return sorted(set(enabled))
 
+def _common_config(server, name, diagnostics):
+    entry = {}
+    policy, pdiag = _tool_policy(server, name)
+    entry.update(policy, allowed_tools=_enabled_tools(server))
+    diagnostics.extend(pdiag)
+    if server.get('startup_timeout_sec') is not None:
+        # sec wins over ms when both are present (current Codex semantics)
+        if server.get('startup_timeout_ms') is not None:
+            diagnostics.append(Diagnostic('mcp', name,
+                                          'startup_timeout_ms ignored: startup_timeout_sec takes precedence (Codex semantics)'))
+        entry['startup_timeout_sec'] = _num_field(server, 'startup_timeout_sec', 10, diagnostics)
+    else:
+        entry['startup_timeout_sec'] = _num_field(server, 'startup_timeout_ms', 10000,
+            diagnostics, maximum=3600000, integral=True) / 1000
+    entry['tool_timeout_sec'] = _num_field(server, 'tool_timeout_sec', 60, diagnostics)
+    return entry
+
+
+def _http_config(server, protocol_mode):
+    entry = {}
+    entry['protocol_mode'] = protocol_mode if protocol_mode in ('auto', 'legacy_2025_06_18', 'modern_2026_07_28') else 'auto'
+    entry['transport'] = 'http'
+    url = server['url']
+    if not isinstance(url, str) or not url.startswith(('http://', 'https://')):
+        raise AgentError('invalid_argument', 'url must be http(s)')
+    entry['url'] = url
+    if 'auth' in server and server['auth'] != 'bearer':
+        raise AgentError('invalid_argument', f"auth={server['auth']!r} (oauth/chatgpt) is not supported in managed children")
+    headers = server.get('http_headers') or {}
+    env_headers = server.get('env_http_headers') or {}
+    if not isinstance(headers, dict) or not isinstance(env_headers, dict) or \
+       any(not isinstance(k, str) or not isinstance(v, str) for k, v in {**headers, **env_headers}.items()):
+        raise AgentError('invalid_argument', 'http_headers/env_http_headers must map strings to strings')
+    entry['static_headers'] = dict(headers)
+    entry['env_header_names'] = dict(env_headers)
+    entry['bearer_token_env_var'] = server.get('bearer_token_env_var') if isinstance(server.get('bearer_token_env_var'), str) else None
+    return entry
+
+
+def _stdio_config(server, codex_home, protocol_mode, name, diagnostics):
+    entry = {}
+    entry['transport'] = 'stdio'
+    command = server.get('command')
+    if not isinstance(command, str) or not command.strip():
+        raise AgentError('invalid_argument', 'missing command')
+    args = server.get('args', [])
+    if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
+        raise AgentError('invalid_argument', 'args must be a list of strings')
+    env_static = server.get('env') or {}
+    env_refs = server.get('env_vars', [])
+    if not isinstance(env_refs, list):
+        raise AgentError('invalid_argument', 'env_vars must be a list of names or local references')
+    if not isinstance(env_static, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env_static.items()):
+        raise AgentError('invalid_argument', 'env must map strings to strings')
+    refs: list[str] = []
+    for ref in env_refs:
+        if isinstance(ref, str):
+            refs.append(ref)
+        elif isinstance(ref, dict) and isinstance(ref.get('name'), str) and ref.get('source', 'local') in (None, 'local'):
+            refs.append(ref['name'])
+        elif isinstance(ref, dict) and ref.get('source') == 'remote':
+            raise AgentError('invalid_argument', f"env_vars source=remote ({ref.get('name')}) requires remote executor")
+        else:
+            raise AgentError('invalid_argument', 'env_vars entries must be names')
+    # CODEX_MCP_PROTOCOL_VERSION is a Codex CLIENT-side protocol
+    # selection marker: consume it here to pick the stdio era and never
+    # forward it to the server process (current Codex removes the marker
+    # from the env before spawning the MCP server).
+    marker = env_static.get('CODEX_MCP_PROTOCOL_VERSION')
+    env_static = {k: v for k, v in env_static.items() if k != 'CODEX_MCP_PROTOCOL_VERSION'}
+    if marker is not None and marker != '2026-07-28':
+        raise AgentError('invalid_argument',
+                         f'unsupported CODEX_MCP_PROTOCOL_VERSION {marker!r} (only 2026-07-28 is supported)')
+    if marker == '2026-07-28' and protocol_mode == 'legacy_2025_06_18':
+        diagnostics.append(Diagnostic('mcp', name,
+                                      'global protocol_mode legacy_2025_06_18 keeps this stdio server on the 2025-06-18 handshake; the Codex modern opt-in marker is stripped and not forwarded'))
+    entry['protocol_mode'] = ('legacy_2025_06_18'
+                              if marker != '2026-07-28' or protocol_mode == 'legacy_2025_06_18'
+                              else 'modern_2026_07_28')
+    cwd = server.get('cwd')
+    if cwd is not None:
+        if not isinstance(cwd, str) or not cwd.strip():
+            raise AgentError('invalid_argument', 'cwd must be a path string')
+        cwd_path = Path(cwd).expanduser()
+        if not cwd_path.is_absolute():
+            # Codex does not document relative-cwd resolution; anchor to the config source.
+            cwd_path = (codex_home / cwd_path).resolve()
+            diagnostics.append(Diagnostic('mcp', name, f'relative cwd anchored to codex home: {cwd_path}'))
+        cwd = str(cwd_path)
+    entry.update(command=command, args=args, static_env=dict(env_static),
+                 env_var_names=sorted(set(refs)), cwd=cwd)
+    if _is_self_server(entry, codex_home):  # recursion guard by execution definition, rename-evasive
+        raise AgentError('invalid_argument', 'subagent-pi management server (recursion guard)')
+    return entry
+
+
 def parse_mcp_servers(codex_home: Path, raw: dict, protocol_mode: str = 'auto') -> tuple[list[dict], list[Diagnostic]]:
     """Convert [mcp_servers.*] TOML into normalized in-memory server configs (no
     environment access here). Every declared server keeps a disposition
@@ -211,87 +307,11 @@ def parse_mcp_servers(codex_home: Path, raw: dict, protocol_mode: str = 'auto') 
             if MCP_FIELD_COMPAT[f][0] == 'accepted_no_effect':
                 diagnostics.append(Diagnostic('mcp', name, f'{f}: {MCP_FIELD_COMPAT[f][1]}'))
         try:
-            policy, pdiag = _tool_policy(server, name)
-            entry.update(policy, allowed_tools=_enabled_tools(server))
-            diagnostics.extend(pdiag)
-            if server.get('startup_timeout_sec') is not None:
-                # sec wins over ms when both are present (current Codex semantics)
-                if server.get('startup_timeout_ms') is not None:
-                    diagnostics.append(Diagnostic('mcp', name,
-                                                  'startup_timeout_ms ignored: startup_timeout_sec takes precedence (Codex semantics)'))
-                entry['startup_timeout_sec'] = _num_field(server, 'startup_timeout_sec', 10, diagnostics)
-            else:
-                entry['startup_timeout_sec'] = _num_field(server, 'startup_timeout_ms', 10000,
-                    diagnostics, maximum=3600000, integral=True) / 1000
-            entry['tool_timeout_sec'] = _num_field(server, 'tool_timeout_sec', 60, diagnostics)
+            entry.update(_common_config(server, name, diagnostics))
             if is_http:
-                entry['protocol_mode'] = protocol_mode if protocol_mode in ('auto', 'legacy_2025_06_18', 'modern_2026_07_28') else 'auto'
-                entry['transport'] = 'http'
-                url = server['url']
-                if not isinstance(url, str) or not url.startswith(('http://', 'https://')):
-                    raise AgentError('invalid_argument', 'url must be http(s)')
-                entry['url'] = url
-                if 'auth' in server and server['auth'] != 'bearer':
-                    raise AgentError('invalid_argument', f"auth={server['auth']!r} (oauth/chatgpt) is not supported in managed children")
-                headers = server.get('http_headers') or {}
-                env_headers = server.get('env_http_headers') or {}
-                if not isinstance(headers, dict) or not isinstance(env_headers, dict) or \
-                   any(not isinstance(k, str) or not isinstance(v, str) for k, v in {**headers, **env_headers}.items()):
-                    raise AgentError('invalid_argument', 'http_headers/env_http_headers must map strings to strings')
-                entry['static_headers'] = dict(headers)
-                entry['env_header_names'] = dict(env_headers)
-                entry['bearer_token_env_var'] = server.get('bearer_token_env_var') if isinstance(server.get('bearer_token_env_var'), str) else None
+                entry.update(_http_config(server, protocol_mode))
             else:
-                entry['transport'] = 'stdio'
-                command = server.get('command')
-                if not isinstance(command, str) or not command.strip():
-                    raise AgentError('invalid_argument', 'missing command')
-                args = server.get('args', [])
-                if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
-                    raise AgentError('invalid_argument', 'args must be a list of strings')
-                env_static = server.get('env') or {}
-                env_refs = server.get('env_vars') or []
-                if not isinstance(env_static, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env_static.items()):
-                    raise AgentError('invalid_argument', 'env must map strings to strings')
-                refs: list[str] = []
-                for ref in env_refs:
-                    if isinstance(ref, str):
-                        refs.append(ref)
-                    elif isinstance(ref, dict) and isinstance(ref.get('name'), str) and ref.get('source', 'local') in (None, 'local'):
-                        refs.append(ref['name'])
-                    elif isinstance(ref, dict) and ref.get('source') == 'remote':
-                        raise AgentError('invalid_argument', f"env_vars source=remote ({ref.get('name')}) requires remote executor")
-                    else:
-                        raise AgentError('invalid_argument', 'env_vars entries must be names')
-                # CODEX_MCP_PROTOCOL_VERSION is a Codex CLIENT-side protocol
-                # selection marker: consume it here to pick the stdio era and never
-                # forward it to the server process (current Codex removes the marker
-                # from the env before spawning the MCP server).
-                marker = env_static.get('CODEX_MCP_PROTOCOL_VERSION')
-                env_static = {k: v for k, v in env_static.items() if k != 'CODEX_MCP_PROTOCOL_VERSION'}
-                if marker is not None and marker != '2026-07-28':
-                    raise AgentError('invalid_argument',
-                                     f'unsupported CODEX_MCP_PROTOCOL_VERSION {marker!r} (only 2026-07-28 is supported)')
-                if marker == '2026-07-28' and protocol_mode == 'legacy_2025_06_18':
-                    diagnostics.append(Diagnostic('mcp', name,
-                                                  'global protocol_mode legacy_2025_06_18 keeps this stdio server on the 2025-06-18 handshake; the Codex modern opt-in marker is stripped and not forwarded'))
-                entry['protocol_mode'] = ('legacy_2025_06_18'
-                                          if marker != '2026-07-28' or protocol_mode == 'legacy_2025_06_18'
-                                          else 'modern_2026_07_28')
-                cwd = server.get('cwd')
-                if cwd is not None:
-                    if not isinstance(cwd, str) or not cwd.strip():
-                        raise AgentError('invalid_argument', 'cwd must be a path string')
-                    cwd_path = Path(cwd).expanduser()
-                    if not cwd_path.is_absolute():
-                        # Codex does not document relative-cwd resolution; anchor to the config source.
-                        cwd_path = (codex_home / cwd_path).resolve()
-                        diagnostics.append(Diagnostic('mcp', name, f'relative cwd anchored to codex home: {cwd_path}'))
-                    cwd = str(cwd_path)
-                entry.update(command=command, args=args, static_env=dict(env_static),
-                             env_var_names=sorted(set(refs)), cwd=cwd)
-                if _is_self_server(entry, codex_home):  # recursion guard by execution definition, rename-evasive
-                    raise AgentError('invalid_argument', 'subagent-pi management server (recursion guard)')
+                entry.update(_stdio_config(server, codex_home, protocol_mode, name, diagnostics))
             servers.append(entry)
         except AgentError as exc:
             _failed(name, transport, required, exc.message)

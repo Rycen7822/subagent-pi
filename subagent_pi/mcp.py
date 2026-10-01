@@ -13,6 +13,17 @@ from .parent import capture
 VERSIONS=('2025-06-18','2025-03-26','2024-11-05')
 OUTPUT_TIMEOUT=45
 
+def success_result(value):
+    return {'content':[{'type':'text','text':dumps(value)}],
+            'structuredContent':value, 'isError':False}
+
+
+def scope_source(home, parent):
+    from .inheritance import scope_source_snapshot
+    source = scope_source_snapshot(home, {k:v for k,v in os.environ.items() if k != 'CODEX_THREAD_ID'})
+    return {**source, 'parent':parent}
+
+
 class OutputClosed(Exception):
     """The stdio connection cannot safely carry another JSON frame."""
 
@@ -90,9 +101,7 @@ async def serve_mcp(home):
                     # pi_context call would, then run the spawn with that scope.
                     existing=os.environ.get('PI_AGENTS_SCOPE') or bound_scopes.get((caller,args['cwd']))
                     lazy={'cwd':args['cwd'],**({'scope':existing} if existing else {})}
-                    from .inheritance import scope_source_snapshot  # trusted values never pass through the model
-                    source=scope_source_snapshot(home,{k:v for k,v in os.environ.items() if k!='CODEX_THREAD_ID'})
-                    source['parent']=parent
+                    source=scope_source(home,parent)
                     opened=await request(home,'scope_open',lazy,timeout=call_timeout('scope_open',lazy,home),source=source)
                     active_scopes[caller]=opened['scope']; bound_scopes[(caller,args['cwd'])]=opened['scope']
                     args['scope']=opened['scope']
@@ -100,18 +109,16 @@ async def serve_mcp(home):
                 timeout=call_timeout(spec['_op'],args,home)
                 source={'env':{},'parent':parent} if parent else None
                 if spec['_op']=='scope_open':
-                    from .inheritance import scope_source_snapshot  # trusted values never pass through the model
-                    source=scope_source_snapshot(home,{k:v for k,v in os.environ.items() if k!='CODEX_THREAD_ID'})
-                    source['parent']=parent
+                    source=scope_source(home,parent)
                 async def write_result(value):
-                    await output({'jsonrpc':'2.0','id':rid,'result':{'content':[{'type':'text','text':dumps(value)}],'structuredContent':value,'isError':False}})
+                    await output({'jsonrpc':'2.0','id':rid,'result':success_result(value)})
                 if spec['_op']=='wait':
                     await request(home,'wait',args,timeout=timeout,source=source,on_result=write_result)
                     return
                 value=await request(home,spec['_op'],args,timeout=timeout,source=source)
                 if spec['_op']=='scope_open':
                     active_scopes[caller]=value['scope']; bound_scopes[(caller,args['cwd'])]=value['scope']
-                result={'content':[{'type':'text','text':dumps(value)}],'structuredContent':value,'isError':False}
+                result=success_result(value)
             else: await error(rid,-32601,'Method not found'); return
             await output({'jsonrpc':'2.0','id':rid,'result':result})
         except AgentError as e:

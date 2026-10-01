@@ -75,14 +75,16 @@ All proxy operations serialize through one in-memory chain and Pi's sequential t
 
 | Fields | Handling |
 |---|---|
-| `command`, `args`, `cwd`, `env`, `env_vars` | stdio; local environment references only. Relative cwd anchors to Codex home with a diagnostic. Arguments and values are not shell-expanded. |
+| `command`, `args`, `cwd`, `env`, `env_vars` | stdio; local environment references only. `env_vars` must be a list of variable names or local reference objects. Relative cwd anchors to Codex home with a diagnostic. Arguments and values are not shell-expanded. |
 | `url`, `http_headers`, `env_http_headers`, `bearer_token_env_var`, `auth="bearer"` | Streamable HTTP with static or bound credentials. |
 | `startup_timeout_sec`, `startup_timeout_ms`, `tool_timeout_sec` | Seconds accept fractions; milliseconds require integers. Explicit seconds take precedence. Defaults: startup 10 s, tool 60 s. |
 | `enabled`, `required`, `enabled_tools`, `disabled_tools`, approval fields | Applied to availability, readiness, visibility and confirmation. |
-| `tools.<name>.output_token_limit` | Tightens result output to a conservative four bytes per token, capped at 256 KiB. Invalid values deny the tool. |
+| `tools.<name>.output_token_limit` | Tightens the UTF-8 result body budget to a conservative four bytes per token, capped at the default 256 KiB. Invalid values deny the tool. |
 | `supports_parallel_tool_calls`, legacy `name` | Recorded as no-effect hints. Calls remain serialized. |
 | `environment_id` | Absent or `local` accepted; remote rejected. |
 | `http_headers_helper`, `experimental_environment`, `omit_tools_from`, `scopes`, `oauth`, `oauth_resource` | Unsupported; no header-helper execution, remote executor or credential store. |
+
+When a single text item contains JSON equal to `structuredContent`, the bridge renders it once. Differing text and structured data are both retained. One shared byte budget applies after rendering, without splitting UTF-8 characters; a truncation notice is appended outside the body budget.
 
 Unknown per-tool fields deny that tool. OAuth/ChatGPT-session authentication, sampling/elicitation and Codex sandbox semantics are not inherited. Recursion checks reject this plugin's management executable, installer wrapper and module forms; arbitrary renamed binaries or same-user code are outside that guard.
 

@@ -146,6 +146,34 @@ class BridgeHostCase(unittest.TestCase):
 class BridgeHostTests(BridgeHostCase):
     prefix = 'bridge-host-'
 
+    def test_equivalent_json_result_is_rendered_once(self):
+        srv = self.h.start_stdio(mode='duplicate_result')
+        out = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
+            {'action':'call','server':'local','tool':'echo','args':{'text':'unique-marker'},'confirm':True},
+        ])['results'][0]
+        self.assertEqual(out['kind'], 'result')
+        self.assertEqual(out['text'].count('unique-marker'), 1)
+        self.assertNotIn('structuredContent:', out['text'])
+
+    def test_unicode_output_uses_one_safe_byte_budget(self):
+        for budget, body, expected in [(4, '你好', '你'), (5, '🦊🦊', '🦊'), (4, '\ufeff你好', '\ufeff')]:
+            with self.subTest(budget=budget, body=body):
+                srv = self.h.start_stdio(mode='text_only_result')
+                cfg = stdio_cfg(server_env=srv['env'], tool_output_limits={'echo':budget})
+                row = self.h.run_host([cfg], [{'action':'call','server':'local','tool':'echo',
+                    'args':{'text':body},'confirm':True}])['results'][0]
+                self.assertEqual(row['kind'], 'result')
+                self.assertEqual(row['text'].split('\n[output truncated', 1)[0], expected)
+                self.assertNotIn('\ufffd', row['text'])
+        srv = self.h.start_stdio(mode='text_only_result')
+        row = self.h.run_host([stdio_cfg(server_env=srv['env'])], [
+            {'action':'call','server':'local','tool':'echo','args':{'text':'你'*100000},'confirm':True},
+        ])['results'][0]
+        body, notice = row['text'].split('\n[output truncated', 1)
+        self.assertLessEqual(len(body.encode('utf-8')), 256*1024)
+        self.assertTrue(notice)
+        self.assertNotIn('\ufffd', body)
+
     # ---- happy paths ----
     def test_stdio_list_describe_call(self):
         srv = self.h.start_stdio()

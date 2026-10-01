@@ -42,6 +42,10 @@ class Store:
         CREATE INDEX IF NOT EXISTS runs_agent_state ON runs(agent_id,state,created);
         CREATE INDEX IF NOT EXISTS events_agent_seq ON events(agent_id,seq);
         CREATE INDEX IF NOT EXISTS receipts_run ON receipts(run_id,state);
+        CREATE INDEX IF NOT EXISTS receipts_agent_recent ON receipts(agent_id,created DESC);
+        CREATE INDEX IF NOT EXISTS receipts_agent_pending ON receipts(agent_id) WHERE state IN ('sending','queued');
+        CREATE INDEX IF NOT EXISTS runs_agent_recent ON runs(agent_id,created DESC) WHERE state!='queued';
+        CREATE INDEX IF NOT EXISTS parent_notifications_scope_recent ON parent_notifications(scope,created DESC);
         ''')
         row = self.one("SELECT value FROM meta WHERE key='schema'")
         current = int(row['value']) if row else None
@@ -70,7 +74,6 @@ class Store:
     def all(self, sql, args=()):
         return [dict(r) for r in self.db.execute(sql, args)]
     def execute(self, sql, args=()): return self.db.execute(sql, args)
-    def bump(self, scope): self.execute("UPDATE scopes SET revision=revision+1 WHERE id=?", (scope,))
     def scope(self, sid):
         row = self.one("SELECT * FROM scopes WHERE id=?", (sid,))
         if not row: raise AgentError("scope_not_found", "Unknown scope; use pi_context to open or resume one")
@@ -91,6 +94,18 @@ class Store:
         row = self.one("SELECT * FROM runs WHERE id=? AND scope=?", (rid,sid))
         if not row: raise AgentError("run_not_found", "Run not found in this scope")
         return row
+    def pending_receipt_count(self, aid):
+        return self.one("SELECT COUNT(*) n FROM receipts WHERE agent_id=? AND state IN ('sending','queued')", (aid,))['n']
+
+    def recent_receipts(self, aid):
+        return self.all('SELECT id,run_id,state,updated FROM receipts WHERE agent_id=? ORDER BY created DESC LIMIT 5', (aid,))
+
+    def latest_run(self, aid):
+        return self.one("SELECT * FROM runs WHERE agent_id=? AND state!='queued' ORDER BY created DESC LIMIT 1", (aid,))
+
+    def recent_notifications(self, sid):
+        return self.all('SELECT run_id,kind,state,queued_id,error FROM parent_notifications WHERE scope=? ORDER BY created DESC LIMIT 6', (sid,))
+
     def agent_update(self, aid, **fields):
         fields['updated'] = now()
         self.execute('UPDATE agents SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?', (*fields.values(),aid))
@@ -108,7 +123,6 @@ class Store:
             self.execute("UPDATE runs SET state=?,ended=?,result_path=?,result_sha=?,error=?,usage=? WHERE id=?", (state,now(),str(path),sha,error,dumps(usage or {}),rid))
             self.execute("UPDATE receipts SET state='not_consumed',updated=? WHERE run_id=? AND state IN ('queued','sending')", (now(),rid))
             self.attention(rid,'terminal')
-            self.bump(row['scope'])
             self.execute("COMMIT")
         except BaseException:
             self.execute("ROLLBACK"); raise

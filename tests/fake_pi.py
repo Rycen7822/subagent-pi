@@ -266,7 +266,8 @@ async def main():
             if not a.no_managed_protocol: state['subagentProtocol']=1
             response(r,data=state)
         elif kind=='prompt':
-            if current and not current.done(): response(r,False,error='Already streaming')
+            if r.get('message')=='REJECT_START': response(r,False,error='Explicit test prompt rejection')
+            elif current and not current.done(): response(r,False,error='Already streaming')
             elif a.handle_prompt and MARK_OUTCOME in r.get('message',''):
                 response(r)
                 emit({'type':'managed_task_end','runId':r['runId'],'error':'Pi handled the input without producing an assistant result'})

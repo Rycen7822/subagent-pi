@@ -192,6 +192,15 @@ class McpParsingCase(unittest.TestCase):
     def parse(self,config): return parse_mcp_servers(self.home,tomllib.loads(config))
 
 class McpParsing(McpParsingCase):
+    def test_env_vars_requires_an_outer_list(self):
+        for value in ('"API_KEY"', '{}', 'false'):
+            with self.subTest(value=value):
+                servers, diagnostics = self.parse('[mcp_servers.a]\ncommand="cat"\nrequired=true\nenv_vars='+value)
+                self.assertEqual(servers[0]['disposition'], 'failed')
+                self.assertTrue(servers[0]['required'])
+                self.assertIn('env_vars must be a list', servers[0]['reasons'][0])
+                self.assertTrue(diagnostics)
+
     def test_stdio_modern_opt_in_selects_modern_and_strips_marker(self):
         config='''
 [mcp_servers.a]
@@ -467,6 +476,16 @@ class RuntimeInheritance(unittest.IsolatedAsyncioTestCase):
     async def spawn(self,**extra):
         return await self.rt.dispatch('spawn',{'scope':self.scope,'request_id':self.key(),
             'cwd':str(self.workspace),'task':'simple','access':'read',**extra})
+    async def test_required_malformed_env_vars_blocks_before_subprocess_start(self):
+        (self.codex/'config.toml').write_text(
+            '[mcp_servers.broken]\ncommand = "cat"\nrequired = true\nenv_vars = "API_KEY"\n')
+        with mock.patch('subagent_pi.runtime.asyncio.create_subprocess_exec') as start:
+            with self.assertRaises(AgentError) as caught:
+                await self.spawn()
+        self.assertEqual(caught.exception.code, 'inheritance_required_server_failed')
+        start.assert_not_called()
+        self.assertFalse(self.rt.workers)
+        self.assertEqual(self.run_rows(), [('failed',)])
     async def test_required_server_failure_blocks_spawn_without_prompt(self):
         # F11: a broken REQUIRED server aborts the boot; no prompt is ever sent
         # and the worker does not linger.

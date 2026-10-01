@@ -4,6 +4,8 @@
 
 scope 是父任务集合；agent_id 是长期身份；run_id 是一项委托任务；generation 是一次受管子进程；request_id 是控制操作的幂等身份。MCP 与 CLI 使用同一份账本。 创建时用 name 标注角色或任务（如 git-stats-fix），同一 scope 内唯一；省略时使用 agent_id。创建、任务摘要、等待、问题、结果和通知均携带该名称；后续操作可使用 ID 或 scope 内唯一名称；名称与另一 ID 冲突时拒绝歧义目标。
 
+名称和 agent 目标最多 128 个字符，允许 Unicode；scope、run、request 等技术 ID 最多 128 个 ASCII 字符，只允许字母、数字、`_ . : -`。任务与消息正文最多 65536 个 UTF-8 字节；schema 的 `x-maxBytes` 标注这一服务端约束，普通 JSON Schema 校验器不会自行执行该扩展。
+
 agent 状态包括 starting、running、needs_input、idle、stopping、dormant、closed、orphaned、crashed。run 状态包括 queued、starting、running、needs_input、completed、failed、interrupted、crashed、cancelled、timed_out。completed 表示执行正常结束，不证明答案正确或可以发布。
 
 ## 完成边界
@@ -88,4 +90,4 @@ queued 只是 Codex 入队回执。结果被精确 hash ack、同一父会话准
 
 此机制要求 Codex 支持 queue，撤回另需 app-server 的 `thread/queue/delete`（均已用本地模拟模型验证）。使用绑定时的本地 CODEX_HOME；远程会话不在本机消息存储中时不能据此承诺唤醒。未修改 Pi/Codex 宿主，也不模拟键盘或重启用户会话。
 
-等待接口不再接受 timeout_ms / --timeout-ms。IPC 协议升级为 v2；升级后需在旧任务清理完成时正常重启插件 daemon/MCP 连接，混用旧客户端或旧 daemon 会明确返回 version_mismatch，不自动停止用户进程。
+等待接口不再接受 timeout_ms / --timeout-ms。当前 IPC 协议为 v3；协议升级后需在旧任务清理完成时正常重启插件 daemon/MCP 连接，混用旧客户端或旧 daemon 会明确返回 version_mismatch，不自动停止用户进程。

@@ -8,21 +8,60 @@ import sys
 import time
 import unittest
 from unittest import mock
-import test_runtime as base
+from runtime_harness import RuntimeHarness
 from test_transport import McpHarness, ROOT
 from subagent_pi.common import AgentError
 from subagent_pi.schema import BY_NAME, validate
+from schema_oracle import validate_contract
+from jsonschema.exceptions import ValidationError
 
-class V2RuntimeTests(unittest.IsolatedAsyncioTestCase):
-    asyncSetUp=base.RuntimeTests.asyncSetUp
-    asyncTearDown=base.RuntimeTests.asyncTearDown
-    key=base.RuntimeTests.key
-    spawn=base.RuntimeTests.spawn
-    mutation=base.RuntimeTests.mutation
-    wait=base.RuntimeTests.wait
-    result=base.RuntimeTests.result
-    until=base.RuntimeTests.until
-    events=base.RuntimeTests.events
+class V2RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
+    async def test_retired_revision_and_indexed_read_paths(self):
+        self.rt.store.execute('UPDATE scopes SET revision=11 WHERE id=?', (self.scope,))
+        statements = []
+        self.rt.store.db.set_trace_callback(statements.append)
+        a = await self.spawn()
+        await self.wait(a['run_id'])
+        page = await self.result(a['run_id'])
+        await self.rt.dispatch('ack', {'scope':self.scope, 'request_id':self.key(),
+            'run_id':a['run_id'], 'result_sha256':page['result_sha256']})
+        self.rt.store.db.set_trace_callback(None)
+        self.assertEqual(self.rt.store.scope(self.scope)['revision'], 11)
+        self.assertFalse(any('SET revision=' in sql for sql in statements))
+        self.assertNotIn('revision', (await self.rt.dispatch('scope_list', {}))['scopes'][0])
+        queries = [
+            ("SELECT id FROM receipts WHERE agent_id=? AND state IN ('sending','queued')", a['agent_id']),
+            ('SELECT id FROM receipts WHERE agent_id=? ORDER BY created DESC LIMIT 5', a['agent_id']),
+            ("SELECT state FROM runs WHERE agent_id=? AND state!='queued' ORDER BY created DESC LIMIT 1", a['agent_id']),
+            ('SELECT run_id FROM parent_notifications WHERE scope=? ORDER BY created DESC LIMIT 6', self.scope),
+        ]
+        for query, target in queries:
+            with self.subTest(query=query):
+                plan = self.rt.store.all('EXPLAIN QUERY PLAN '+query, (target,))
+                self.assertTrue(all('SEARCH ' in row['detail'] for row in plan), plan)
+                self.assertFalse(any('TEMP B-TREE' in row['detail'] for row in plan), plan)
+
+    async def test_rejected_idle_start_restores_expiry(self):
+        with self.assertRaises(AgentError) as caught:
+            await self.spawn('REJECT_START')
+        aid = caught.exception.details['agent_id']
+        rid = caught.exception.details['run_id']
+        w = self.rt.workers[aid]
+        self.assertEqual((await self.result(rid))['run']['state'], 'failed')
+        self.assertIsNotNone(w.idle_since)
+        w.idle_since = time.monotonic() - 1801
+        await self.rt.park_expired()
+        self.assertEqual(self.rt.store.agent(self.scope, aid)['state'], 'dormant')
+
+    async def test_rejected_queued_start_advances_successor(self):
+        first = await self.spawn('delay=0.5|first')
+        rejected = await self.mutation('send', first['agent_id'], mode='follow_up', message='REJECT_START')
+        successor = await self.mutation('send', first['agent_id'], mode='follow_up', message='successor')
+        done = await self.wait(successor['run_id'])
+        self.assertFalse(done['timed_out'])
+        self.assertEqual((await self.result(rejected['run_id']))['run']['state'], 'failed')
+        self.assertEqual((await self.result(successor['run_id']))['text'], 'Completed: successor')
+        self.assertIsNotNone(self.rt.workers[first['agent_id']].idle_since)
 
     async def test_soft_interrupt_retains_worker_cancels_queue_and_reuses_session(self):
         a=await self.spawn('delay=1|first',name='worker')
@@ -69,12 +108,12 @@ class V2RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((sent['delivery'],sent['run_id']),('stored',None))
         self.assertEqual(self.rt.store.one('SELECT COUNT(*) n FROM runs')['n'],1)
         path=self.rt.store.agent(self.scope,a['agent_id'])['session_file']
-        self.assertIn('remember this',base.Path(path).read_text())
+        self.assertIn('remember this',Path(path).read_text())
         w=self.rt.workers[a['agent_id']]; w.idle_since=time.monotonic()-1801
         await self.rt.park_expired()
         b=await self.mutation('followup',a['agent_id'],message='next')
         await self.wait(b['run_id'])
-        self.assertIn('remember this',base.Path(path).read_text())
+        self.assertIn('remember this',Path(path).read_text())
 
     async def test_idle_timer_ignores_telemetry_and_preserves_unacked_result(self):
         a=await self.spawn(); await self.wait(a['run_id'])
@@ -130,7 +169,7 @@ class V2RuntimeTests(unittest.IsolatedAsyncioTestCase):
 class V2TransportTests(McpHarness,unittest.IsolatedAsyncioTestCase):
     async def test_cli_v2_operations_share_mcp_ledger_and_projections(self):
         await self.initialize()
-        target='审查 agent'
+        target='审'*128
         a=await self.tool('pi_spawn_agent',{'cwd':str(self.workspace),'task':'first','access':'read',
             'name':target,'request_id':'spawn'})
         await self.tool('pi_wait_agent',{'run_ids':[a['run_id']],'timeout_seconds':8})
@@ -143,15 +182,34 @@ class V2TransportTests(McpHarness,unittest.IsolatedAsyncioTestCase):
             out,err=await asyncio.wait_for(proc.communicate(),10)
             self.assertEqual(proc.returncode,0,err.decode()); return json.loads(out)
         stored=await cli('send-message','--message','idle text','--request-id','msg')
-        validate(stored,BY_NAME['pi_send_message']['outputSchema']); self.assertIsNone(stored['run_id'])
+        validate_contract(stored,BY_NAME['pi_send_message']['outputSchema']); self.assertIsNone(stored['run_id'])
         inspected=await self.tool('pi_inspect_agent',{'agent_id':target})
         self.assertEqual(inspected['agent']['id'],a['agent_id'])
         await self.tool('pi_send_message',{'agent_id':target,'message':'MCP Unicode target','request_id':'mcp-msg'})
         next_run=await cli('followup-task','--message','delay=1|next','--request-id','next')
         stopped=await cli('interrupt','--request-id','stop')
-        validate(stopped,BY_NAME['pi_interrupt_agent']['outputSchema']); self.assertTrue(stopped['runtime_retained'])
+        validate_contract(stopped,BY_NAME['pi_interrupt_agent']['outputSchema']); self.assertTrue(stopped['runtime_retained'])
         result=await self.tool('pi_agent_result',{'run_id':next_run['run_id']})
         self.assertEqual(result['run']['state'],'interrupted')
+
+    async def test_identifier_and_text_guards_match_tool_contract(self):
+        await self.initialize()
+        await self.tool('pi_context', {'cwd':str(self.workspace)})
+        schema = BY_NAME['pi_spawn_agent']['inputSchema']
+        for key in ['检查-1', 'trailing\n']:
+            args = {'cwd':str(self.workspace), 'task':'first', 'access':'read', 'request_id':key}
+            with self.assertRaises(ValidationError):
+                validate_contract(args, schema)
+            response = await self.rpc('tools/call', {'name':'pi_spawn_agent','arguments':args})
+            self.assertTrue(response['result']['isError'])
+        args = {'cwd':str(self.workspace), 'task':'你'*22000, 'access':'read', 'request_id':'bytes'}
+        # Standard JSON Schema has no byte-length keyword; the advertised
+        # x-maxBytes resource guard is enforced by both adapters and Runtime.
+        self.assertEqual(schema['properties']['task']['x-maxBytes'], 65536)
+        response = await self.rpc('tools/call', {'name':'pi_spawn_agent','arguments':args})
+        self.assertTrue(response['result']['isError'])
+        listed = await self.rpc('tools/call', {'name':'pi_list_agents','arguments':{}})
+        self.assertEqual(self.unpack(listed)['total'], 0)
 
     async def test_discovery_and_structured_output_contracts(self):
         await self.initialize()
@@ -165,14 +223,14 @@ class V2TransportTests(McpHarness,unittest.IsolatedAsyncioTestCase):
         for name,args in calls:
             r=await self.rpc('tools/call',{'name':name,'arguments':args}); value=self.unpack(r)
             self.assertFalse(r['result']['isError'],value); self.assertEqual(value,r['result']['structuredContent'])
-            validate(value,BY_NAME[name]['outputSchema']); run=value
+            validate_contract(value,BY_NAME[name]['outputSchema']); run=value
         for name,args in [('pi_followup_task',{'agent_id':'named','message':'native','request_id':'b'}),
                           ('pi_interrupt_agent',{'agent_id':'named','request_id':'c'}),
                           ('pi_list_agents',{}),
                           ('pi_wait_agent',{'run_ids':[run['run_id']],'timeout_seconds':0})]:
             r=await self.rpc('tools/call',{'name':name,'arguments':args}); value=self.unpack(r)
             self.assertFalse(r['result']['isError'],value); self.assertEqual(value,r['result']['structuredContent'])
-            validate(value,BY_NAME[name]['outputSchema'])
+            validate_contract(value,BY_NAME[name]['outputSchema'])
 
     async def test_compact_read_contract_preserves_paging_ack_and_diagnostics(self):
         await self.initialize()
@@ -181,7 +239,7 @@ class V2TransportTests(McpHarness,unittest.IsolatedAsyncioTestCase):
             value=self.unpack(response)
             self.assertFalse(response['result']['isError'],value)
             self.assertEqual(value,response['result']['structuredContent'])
-            validate(value,BY_NAME[name]['outputSchema'])
+            validate_contract(value,BY_NAME[name]['outputSchema'])
             return value
         args={'cwd':str(self.workspace),'task':'BIG','name':'results','access':'read','request_id':'big'}
         a=await checked('pi_spawn_agent',args)

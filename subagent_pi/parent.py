@@ -64,7 +64,7 @@ def status(store,sid,compact=False):
     if not raw: return {'enabled':False,'reason':'no_parent_identity'}
     parent=json.loads(raw)
     return {'enabled':bool(parent['command']),'thread_id':parent['thread_id'],'transport':'codex_queue',
-            'recent':store.all('SELECT run_id,kind,state,queued_id,error FROM parent_notifications WHERE scope=? ORDER BY created DESC LIMIT 6',(sid,))}
+            'recent':store.recent_notifications(sid)}
 
 
 class ParentNotifications:
