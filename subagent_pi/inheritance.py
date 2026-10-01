@@ -15,7 +15,7 @@ MAX_ENV_VALUE = 16384
 # The snapshot additionally captures CODEX_HOME: it is a source pointer the daemon
 # resolves itself, so it is bound for the scope but never forwarded to a child.
 SNAPSHOT_ENV_KEYS = BASE_ENV_KEYS + ('CODEX_HOME',)
-MANAGEMENT_SKILL_NAMES = {'pi-subagents'}
+MANAGEMENT_SKILL_NAMES = {'subagent-pi'}
 
 
 def resolve_codex_home(inh: dict, source_env: dict | None) -> tuple[Path | None, str]:

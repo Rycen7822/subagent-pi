@@ -1,9 +1,9 @@
 ---
-name: pi-subagents
+name: subagent-pi
 description: Delegate bounded work to persistent Pi agents; message, follow up, interrupt and collect results.
 ---
 
-# Pi Subagents
+# Subagent Pi
 
 Use advertised Pi MCP tools for daily control; CLI for scope management, explicit unloading and recovery. Legacy tools are explicit management calls, not the daily catalog.
 On an unbound connection, pi_spawn_agent with the actual absolute Codex workspace cwd opens/binds a scope. To resume or address another scope, pass its ID explicitly; this does not replace the connection default. Another parent's results remain readable, but new work uses your own scope. Never infer cwd from the server.

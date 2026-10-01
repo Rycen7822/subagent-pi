@@ -134,13 +134,13 @@ class SkillCollection(unittest.TestCase):
         self.assertEqual(selected,[])
         self.assertTrue(any('disabled by codex' in d.reason for d in diag))
     def test_management_skill_excluded_by_name_and_plugin_path(self):
-        make_skill(self.home/'skills','pi-subagents')
-        plugin_skill=ROOT/'skills'/'pi-subagents'
+        make_skill(self.home/'skills','subagent-pi')
+        plugin_skill=ROOT/'skills'/'subagent-pi'
         alias=self.home/'skills'/'renamed-alias'
         if not alias.exists(): alias.symlink_to(plugin_skill)
         selected,diag=collect_skills(self.home,{},None,[])
         self.assertEqual([p for p in selected if 'renamed-alias' in p],[])
-        self.assertTrue(all('pi-subagents' not in p for p in selected))
+        self.assertTrue(all('subagent-pi' not in p for p in selected))
         self.assertTrue(any('recursion guard' in d.reason for d in diag))
     def test_missing_dir_diagnostic_and_chinese_space_paths(self):
         empty=make_codex_home(self.base/'x')

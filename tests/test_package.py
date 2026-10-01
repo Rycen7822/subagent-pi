@@ -116,7 +116,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(crop('🙂字',4),'🙂')
         self.assertEqual(crop('🙂字',3),'')
     def test_skill_stays_small(self):
-        content=(ROOT/'skills/pi-subagents/SKILL.md').read_text()
+        content=(ROOT/'skills/subagent-pi/SKILL.md').read_text()
         self.assertLessEqual(len(content.splitlines()),35)
         self.assertIn('../../docs/',content)
         self.assertNotIn('spawn_agent schema',content)
@@ -140,7 +140,7 @@ class ShipManifest(unittest.TestCase):
         for needed in ['subagent_pi/runtime.py','subagent_pi/worker.py','subagent_pi/views.py',
                        'subagent_pi/binding.py','runtime/pi-sdk.mjs','runtime/task-queue.mjs','bin/subagent-pi','extensions/codex-mcp-bridge.ts',
                        'subagent_pi/mcp_config.py','extensions/mcp/connection.ts','extensions/mcp/stdio.ts','extensions/mcp/http.ts',
-                       'plugin.json','docs/architecture.md','skills/pi-subagents/SKILL.md',
+                       'plugin.json','docs/architecture.md','skills/subagent-pi/SKILL.md',
                        '.github/workflows/ci.yml','scripts/ship_manifest.py']:
             self.assertFalse(m.excluded(ROOT/needed,ROOT),f'{needed} would be missing')
     def test_selection_is_deterministic_and_unique(self):

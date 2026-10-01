@@ -88,7 +88,7 @@ subagent-pi list --scope SCOPE_ID
 ```bash
 codex mcp add subagent-pi -- python3 "$HOME/.local/share/subagent-pi-marketplace/plugins/subagent-pi/bin/subagent-pi" mcp
 mkdir -p "$HOME/.agents/skills"
-ln -s "$HOME/.local/share/subagent-pi-marketplace/plugins/subagent-pi/skills/pi-subagents"       "$HOME/.agents/skills/pi-subagents"
+ln -s "$HOME/.local/share/subagent-pi-marketplace/plugins/subagent-pi/skills/subagent-pi"       "$HOME/.agents/skills/subagent-pi"
 ```
 
 已有同名 skill 时先检查来源。Skill 通过相对路径访问插件 docs，保留整个安装目录；模型实际加载的 skill、MCP 代码和 schema 应来自同一版本。工具是否 deferred 由宿主决定。
