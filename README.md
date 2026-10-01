@@ -2,11 +2,11 @@
 
 **MCP + 极薄 Skill + CLI + 一个持久化运行时。无 hooks。**
 
-让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、任务内有序续跑、排队 follow-up、检查工作轨迹、中断、关闭、恢复原会话、收取结果。
+让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、任务内消息和后续工作、检查工作轨迹、中断、卸载、恢复会话、收取结果。
 
 这是完整源码版 `0.5.0`，针对 **Linux / WSL2，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
 
-受管子进程使用原版 Pi 的公开 SDK（本轮离线验证版本 0.99.1），无需修改 Pi。主代理使用 V2 风格的消息、后续任务和软中断操作；中断通常保留进程，无法确认整个任务退出时核验并终止进程组。空闲进程默认 30 分钟后自动卸载，session 和结果保留。详见 `docs/lifecycle.md`。
+受管子进程使用原版 Pi 的公开 SDK，无需修改 Pi；版本证据和测试边界见 [测试指南](docs/testing.md)。主代理使用 V2 风格的消息、后续任务和软中断操作；中断通常保留进程，无法确认整个任务退出时核验并终止进程组。空闲进程默认 30 分钟后自动卸载，session 和结果保留。详见 [操作语义](docs/lifecycle.md)。
 
 受管子代理加载 Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes 与 settings（SDK 的 settings 更新仅在子进程内存中保存）；`ambient_extensions`/`ambient_skills` 默认 `true`。上下文文件单独处理：保留 Pi 配置目录的全局 `AGENTS.md`，不加载子代理工作目录及其父目录的 `AGENTS.md`；改为读取打开 scope 的 Codex 工作目录下的 `SUBAGENT-PI.md`。新建与 respawn 时重新读取，即使子代理在另一个 cwd 执行也一样。Pi 配置目录沿用打开 scope 的客户端进程里的 `PI_CODING_AGENT_DIR`（未设置即 Pi 默认 `$HOME/.pi/agent`，跨 daemon 重启保持）。在此之上按需继承 Codex 全局 skills（`~/.codex/skills`）与 MCP（`~/.codex/config.toml` 的 `mcp_servers`）；普通 `pi` 不受影响。
 
@@ -37,7 +37,7 @@ cd /absolute/path/to/project
 subagent-pi codex
 ```
 
-该可选启动器为本次工作创建 scope，并通过环境变量交给 MCP；不是 hook，不向提示词注入状态。已有会话仍可直接使用插件，由 `pi_context` 指定 cwd（恢复时指定 scope）；同一 MCP 连接后续省略 scope，spawn 省略 cwd 时沿用作用域目录。
+该可选启动器为本次工作创建 scope，并通过环境变量交给 MCP；也支持 `subagent-pi codex -C /absolute/path/to/project`。普通 Codex 会话可直接首次调用 `pi_spawn_agent(cwd=实际工作区绝对路径, ...)`，打开并绑定 scope；后续可省略 scope。显式 scope 用于恢复或选择另一份账本，不替换连接默认值。子代理 cwd 可不同于 scope 目录；worktree 绑定、升级和缓存刷新见 [入门指南](docs/getting-started.md)。
 
 ## 已实现
 
@@ -53,7 +53,7 @@ subagent-pi codex
 | 防重复执行 | scope + request_id + 参数摘要，持久保存已完成回执 |
 | 结果交接 | 读取不等于确认；按 run ID + SHA-256 显式确认 |
 | MCP / CLI 互通 | 同一个 daemon、同一个 SQLite 账本 |
-| 父代理自动唤醒 | 完成、失败、停止、问题 → Codex 持久消息队列；pi_context/list 返回投递状态 |
+| 父代理自动唤醒 | 完成、失败、停止、问题 → Codex 持久消息队列；list 返回启用/失败摘要，inspect(detail=full) 提供详情 |
 | 子代理询问父代理 | 模型 `ask_parent` 或扩展 UI 请求 → wait 返回问题 → `pi_answer_agent` 显式回答 |
 | 推理等级 | spawn `thinking` 按所选 Pi 模型校验；省略则继承 Pi 设置 |
 | 文档按需读取 | `subagent-pi guide TOPIC --section SECTION` |
@@ -64,27 +64,30 @@ subagent-pi codex
 
 > 使用 Subagent Pi，在当前项目创建一个只读子代理检查缓存失效逻辑。继续你的其他工作，必要时读取增量轨迹；完成后读取结果再确认收尾。
 
+日常 MCP 发现 10 个工具；context、close、respawn、legacy send 保留为显式管理调用和 CLI 操作。`pi_send_message` 活动时使用原生 steering，空闲时只写入 history；`pi_followup_task` 活动时加入同一 run，空闲时开始新 run。
+
 CLI 对等示例：
 
 ```bash
-# 此命令自行创建一个新 scope，并返回 scope / agent_id / run_id。
-subagent-pi spawn --access read --task '检查缓存失效逻辑，只报告问题，不修改文件'
+# 未给 scope 时按 cwd 打开 scope；保存返回的 scope / agent_id / run_id。
+subagent-pi spawn --cwd /absolute/path/to/project --access read --name cache-review \
+  --task '检查缓存失效逻辑，只报告问题，不修改文件' --request-id cache-review-1
 
 # 使用上一条返回的真实 ID：
 subagent-pi inspect AGENT_ID --scope SCOPE_ID
-subagent-pi steer AGENT_ID --scope SCOPE_ID --message '优先检查索引刷新路径'
+# 活动任务中接入消息；若已空闲，此操作只保存消息。
+subagent-pi send-message AGENT_ID --scope SCOPE_ID --message '优先检查索引刷新路径' --request-id cache-priority-1
 subagent-pi wait RUN_ID --scope SCOPE_ID --timeout-seconds 3600
 subagent-pi result RUN_ID --scope SCOPE_ID
-subagent-pi ack RUN_ID --scope SCOPE_ID --sha256 RESULT_SHA256
-subagent-pi close AGENT_ID --scope SCOPE_ID
+subagent-pi ack RUN_ID --scope SCOPE_ID --sha256 RESULT_SHA256 --request-id cache-ack-1
 ```
 
-`AGENT_ID` 等是示意占位符，不是可直接使用的 ID。脚本调用可用 `subagent-pi call OP --json -` 从 stdin 传 JSON，避免 shell 引号问题。
+`AGENT_ID` 等是示意占位符，需替换为实际值；较大结果按 next_offset 分页。继续工作用 `followup-task`；取消当前任务用 `interrupt`；明确卸载用 `close`，闲置进程也会自动卸载。脚本调用可用 `subagent-pi call OP --json -` 从 stdin 传 JSON。重试复用相同 request_id 和参数。
 
 ## 重要边界
 
 - **Pi worker 不继承 Codex 的沙箱或逐工具批准机制。** 它使用当前 OS 用户和 Pi 自身权限。受管子代理默认加载 Pi 自身 extensions/skills（可用 profile 的 `ambient_extensions`/`ambient_skills` 显式关闭）；`access=read` 只把本插件控制的 builtin 限制为 read/grep/find/ls（由 `extensions/managed-surface.ts` 按 Pi 报告的来源应用、并回读验证后才算生效；扩展注册的同名工具不受影响）并收窄继承 MCP 的暴露面，Pi 自己的扩展、其工具与代码不受约束，因此这不是 OS 安全隔离。
-- 不安装 hooks。pi_context 从 Codex 的调用元数据绑定父会话；任务结束或提问时，通过官方 codex queue 入队提醒。仍在运行且空闲的父会话会自动续跑，跨进程通常约 10 秒检查一次；忙碌时排队，不强制打断。没有父会话身份的客户端仍使用 wait。
+- 不安装 hooks。打开 scope（含 spawn 隐式打开）时从 Codex 调用元数据绑定父会话；任务结束或提问时，通过官方 codex queue 入队提醒。仍在运行且空闲的父会话会自动续跑，跨进程通常约 10 秒检查一次；忙碌时排队，不强制打断。没有父会话身份的客户端仍使用 wait。
 - MCP 进程退出不终止 Pi。**daemon 崩溃后不能重新接回旧 stdin/stdout**；先确认并关闭遗留进程，再显式恢复。
 - interrupt 等待整个受管任务退出；不合作的 SDK hook 可触发硬清理。close 和自动卸载核验受管进程组；主动脱离该组的后代不受绝对保证。清理状态 unknown 时拒绝自动恢复。
 - 同一或嵌套 cwd 只允许一个受管理 writer；不能阻止 Codex 主 agent、编辑器或其他进程同时改文件。
@@ -99,7 +102,7 @@ python3 scripts/validate_package.py
 python3 -m unittest discover -s tests -v
 ```
 
-默认测试使用确定性受管子进程和本地 MCP 服务。设置 `SUBAGENT_PI_LIVE_PI=1` 可运行原版 Pi 0.87 SDK 的隔离进程测试，使用离线 mock provider。命令和验证边界见 [测试指南](docs/testing.md)；离线通过不等于真实模型或 Codex 安装联调通过。
+默认测试使用确定性受管子进程和本地 MCP 服务。设置 `SUBAGENT_PI_LIVE_PI=1` 可运行已安装 Pi SDK 的隔离进程测试，使用离线 mock provider。命令、版本和验证边界见 [测试指南](docs/testing.md)；离线通过不等于真实模型或 Codex 安装联调通过。
 
 本机可进行一次**明确会调用模型、可能消耗额度**的实测：
 

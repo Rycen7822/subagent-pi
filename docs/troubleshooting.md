@@ -38,7 +38,7 @@ doctor 不调用模型，只检查本地程序路径、配置和运行时信息�
 
 ## 启动失败或没有响应
 
-检查 `$PI_AGENTS_HOME/daemon.log` 及 `agents/AGENT_ID/stderr.log`。JSONL stdout 只容纳协议；扩展往 stdout 写其他内容会被记录为 protocol_warning。超过 8 MiB 的一条事件会导致停止，而不是无限占用内存。
+检查状态目录的 daemon.log 及 agents/AGENT_ID/stderr.log。受管 SDK 把普通 stdout 写入（含 console）重定向到 stderr，JSONL stdout 留给协议；直接写原始文件描述符绕过此通道仍可能产生 protocol_warning。超过 8 MiB 的一条事件会导致停止。
 
 初始启动等待与正常控制 RPC 分开配置。出现 rpc_timeout 时，不能推断任务没有执行；查询账本并使用相同 request_id。磁盘很忙或首次启动 Pi 很慢时适度增加 startup_timeout_seconds。
 
@@ -47,6 +47,10 @@ Pi 的项目 trust、环境初始化或扩展装载行为可能影响 RPC 启动
 ## Codex 看不到工具
 
 插件安装后开始新会话；确认没有同时通过全局 MCP 又注册同一个服务。使用 `/mcp` 检查连接，并实际尝试带 cwd 的 pi_spawn_agent。deferred/tool-search 能否发现属于 Codex 版本和 provider 行为，不是本插件保证。
+
+0.5.0 日常发现列表包含 10 个工具，包括 pi_send_message、pi_followup_task、pi_interrupt_agent；pi_context、pi_send_input、pi_close_agent、pi_respawn_agent 留在显式管理面。仅找不到这些管理工具不等于服务故障。如果 skill 仍要求先 pi_context、使用 pi_send_input，或常规停止用 pi_close_agent，检查是否载入旧版本。
+
+`subagent-pi --version`、`subagent-pi schemas` 只反映 PATH 对应 CLI。源码更新、git push 和重新复制 marketplace 文件不会刷新当前会话；需按 [升级步骤](getting-started.md#升级与移除) 同步安装代码、Codex 缓存、skill/docs，再开启新会话。不单独覆盖缓存中的 SKILL.md，以免新指引配旧 schema。
 
 安装后的 MCP 配置是绝对路径。如果移动或删除安装源目录，Codex 缓存中的配置可能仍指向旧位置，需要重新安装。CLI 被移除不一定影响已经使用绝对 Python 路径的 MCP，但不能依赖残留环境。
 
@@ -58,7 +62,7 @@ Pi 的项目 trust、环境初始化或扩展装载行为可能影响 RPC 启动
 
 ## writer conflict
 
-同一/嵌套 cwd 的另一个受管理 writer 仍驻留。只读审查选 access=read；写任务可 send 给原 agent、关闭已闲置 writer 后新建，或由用户准备互不重叠的工作目录。不能仅改 name 绕过限制。
+同一/嵌套 cwd 的另一个受管理 writer 可能仍在活动，或清理状态未核验。已结算、无待答问题的冲突 writer 可在新 writer 准入时自动卸载；仍报冲突时先查看其状态。继续同一 agent 的工作可用 followup-task；并发写入使用独立 worktree，并显式保留原 workspace scope，见 [lifecycle.md](lifecycle.md#scope-与-worktree)。只读审查选 access=read；仅改 name 不能改变目录冲突，父代理也应避免编辑子代理负责的文件。
 
 ## Permission denied / sandbox
 

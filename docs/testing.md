@@ -44,9 +44,9 @@ GitHub CI 的 Python lane 跑默认离线套件；integration 固定 Pi 0.87.0�
 
 ## 需要单独授权的验证
 
-真实模型请求可能计费，需要显式同意。离线 MCP 和 SDK 证明不等于已经安装到 Codex。安装后还需新建 Codex 会话检查工具发现、spawn/steer/result/ack、interrupt/respawn，以及实际使用的扩展组合。
+真实模型请求可能计费，需要显式同意。离线 MCP 和 SDK 证明不等于已经安装到 Codex。安装后还需新建 Codex 会话确认代码、schema、skill/docs 版本一致，验证日常 spawn/message/followup/wait/result/ack/interrupt，以及实际使用的扩展组合；close/respawn 和 legacy steer/follow-up 另按管理路径验证。
 
-尚未证明全部第三方扩展兼容，也未把 Pi 0.85/0.86 或更新版本列为本 SDK transport 的验证目标。扩展自己创建的其他 SDK session、独立模型调用及脱离进程组的后代不受任务队列保证。
+版本证据以 workflow 和具体测试日志为准，不推导未测试 Pi 版本或第三方扩展组合的兼容性。扩展自己创建的其他 SDK session、独立模型调用及脱离进程组的后代不受任务队列保证。
 
 父代理唤醒集成：`SUBAGENT_PI_LIVE_CODEX=1 PYTHONPATH=tests python3 -m unittest test_parent_live`。真实 Codex 与 Pi SDK 使用隔离 HOME 和本地 mock 模型，验证父会话完成后由问题/完成通知重新开启同一会话；不使用真实认证或模型端点。
 

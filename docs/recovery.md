@@ -10,13 +10,28 @@ subagent-pi list --scope SCOPE_ID
 subagent-pi inspect AGENT_ID --scope SCOPE_ID --detail full
 ```
 
+新的 MCP 连接显式传入原 scope ID；读取结果不要求恢复 Pi 进程。直接以相同 cwd 重新 spawn 不会自动找回旧 scope，显式 scope 也不会设置该连接的默认值。CLI scope open 与 MCP 连接默认值的区别见 [lifecycle.md](lifecycle.md#scope-与-worktree)。
+
+daemon 重启后需要重新捕获环境引用时，由所属客户端使用管理 pi_context 重开原 scope，或执行 `subagent-pi scope open --cwd ORIGINAL_WORKSPACE --scope SCOPE_ID`。仅在 spawn 中传旧 scope 不会重采集环境。CLI 重开后仍需向 MCP 显式传 scope；来源/凭据边界见 [inheritance.md](inheritance.md)。
+
+## 空闲卸载后的继续工作
+
+已核验卸载的 agent（dormant/closed 且 cleanup=verified）保留 session 和结果。可直接给它后续任务，无需先 respawn：
+
+```bash
+subagent-pi followup-task AGENT_ID --scope SCOPE_ID \
+  --message '继续检查索引刷新路径；先核实已完成的工作。' --request-id continue-index-1
+```
+
+pi_followup_task / followup-task 在空闲时唤醒并启动新 run，活动时加入当前 run；pi_send_message / send-message 在空闲时只写入 history，不启动模型。正常软中断后通常仍是 idle；若已卸载则按上述路径恢复。未 ACK 的旧结果继续保留；读取并处理后按其精确 hash 确认。模型/推理深度沿用该 agent 已解析的选择。
+
 ## 幂等和不确定结果
 
-所有 mutation 使用稳定 request_id；数据库记录操作和参数摘要。同一 key、相同参数重试返回历史回执；相同 key 改参数报 idempotency_conflict。历史回执标 replayed，不代表里面的旧 state 是当前实时状态。
+带 request_id 的任务控制操作使用稳定 key；数据库记录操作和参数摘要。管理 scope_open / pi_context 没有 request_id，不使用这套重试账本。同一 key、相同参数重试返回历史回执；相同 key 改参数报 idempotency_conflict。历史回执标 replayed，不代表里面的旧 state 是当前实时状态。
 
 若 daemon 在操作执行中崩溃，只有 pending 没有 durable reply，返回 request_uncertain。不自动重放。先查询 scope/agent/result，以及 Pi session 和代码差异，再决定采用新请求。
 
-CLI 未指定 --request-id 会自行生成并返回 ID；需要可靠跨进程重试的脚本应从一开始显式传入 ID。MCP 则要求模型显式提供。没有实现或宣称“跨进程任意副作用 exactly once”。
+带 --request-id 的 CLI 操作未指定该参数时会自行生成并返回 ID；需要可靠跨进程重试的脚本应从一开始显式传入 ID。MCP 则要求模型显式提供。没有实现或宣称“跨进程任意副作用 exactly once”。
 
 ## Daemon 崩溃
 
@@ -43,7 +58,7 @@ subagent-pi respawn AGENT_ID --scope SCOPE_ID --message '先检查之前的修�
 
 恢复保留逻辑 agent_id、已解析启动配置和 Pi session，generation 增加。不会无损续接正在执行的 shell、修复任何损坏的 Pi session、恢复服务端 KV cache，或自动重新提交已中断任务。
 
-没有形成持久化 session 的首次启动失败，可能不可恢复。显式新建 agent 即可，不伪造旧上下文。恢复后的新 message 是一项新 run，有自己的总时限；没有额外 token/费用硬预算框架。
+没有形成持久化 session 的首次启动失败，可能不可恢复。需要新工作时显式新建 agent，不伪造旧上下文。respawn 附带的新 message 创建新 run；任务没有总时限，模型静默仍受 idle_timeout_seconds 约束，工具执行和等待回答期间暂停检测。没有额外 token/费用硬预算框架。
 
 ## 未处理结果
 

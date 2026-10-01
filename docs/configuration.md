@@ -4,7 +4,7 @@
 
 默认路径：`~/.local/state/subagent-pi/config.toml`。`PI_AGENTS_HOME` 改变整个账本、配置、session、日志的根；`XDG_STATE_HOME` 影响默认位置。复制 `examples/config.toml` 可以查看全部选项。
 
-修改配置后要 drain 并重启 daemon；已创建 agent 的 launch snapshot 不跟随配置变化，避免恢复时悄悄改变工具或模型。新配置应用于新 agent。
+配置在 daemon 启动时读取；修改后先收尾并关闭驻留 agent，再重启 daemon。新 agent 按新的 profile 创建；已有 agent 的 model/thinking、工具和启动 argv 保持原 launch snapshot。每次新 boot 的 profile.env 来自当前 daemon 配置，继承技能/MCP 文件按原 scope 来源重读；驻留进程保留启动快照。
 
 ```toml
 pi_command = ["/home/you/.local/bin/pi"]
@@ -50,7 +50,7 @@ tools = ["read", "bash", "edit", "write", "grep", "find", "ls"]
 
 默认不硬编码任何模型。首先使用 spawn 显式 model，其次 profile model，最后由 Pi 自行选择；启动完成后保存 Pi 报告的 provider/model ID，后续恢复继续使用。`thinking` 同样支持 spawn / CLI `--thinking` 覆盖 profile；未指定时由 Pi 的模型默认/全局设置决定。插件用实际 session.getAvailableThinkingLevels() 校验显式等级，不支持则在提交任务前报错并列出可用项；不会静默钳制。spawn/inspect 返回 thinking 与 available_thinking；list 仅返回身份和状态，恢复固定已选等级。它不会固定 API 服务端模型权重，也不会锁定可执行文件的全部依赖字节。
 
-受管子代理加载 Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes 与 settings，然后继承 Codex 的 skills 与 MCP。上下文文件采用固定规则：Pi 全局 `AGENTS.md`（包括 Pi 的同目录 override/CLAUDE 优先级）仍加载；子代理 cwd 的项目 AGENTS/CLAUDE 不加载；项目指令来自 `pi_context` 绑定目录的 `SUBAGENT-PI.md`，每次新建/respawn 重新读取。Pi 用来定位自己配置目录的 `PI_CODING_AGENT_DIR` 会随 scope 绑定：CLI/MCP 客户端进程里的取值经 scope 快照传到子进程，daemon 重启后仍按记录恢复；未设置时保持 Pi 默认（`$HOME/.pi/agent`），profile 的 `[profiles.x.env] PI_CODING_AGENT_DIR` 仍然优先。`ambient_extensions` / `ambient_skills` 默认 `true`，是**显式退出开关**（设为 `false` 会重新加上 `--no-extensions` / `--no-skills`）。
+受管子代理加载 Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes 与 settings，然后继承 Codex 的 skills 与 MCP。上下文文件采用固定规则：Pi 全局 `AGENTS.md`（包括 Pi 的同目录 override/CLAUDE 优先级）仍加载；子代理 cwd 的项目 AGENTS/CLAUDE 不加载；项目指令来自 scope 目录的 `SUBAGENT-PI.md`，每次新建、唤醒和 respawn 重新读取。scope 可由首次带 cwd 的 spawn 隐式打开、CLI 打开，或显式管理 pi_context 绑定；与子代理 cwd 的关系见 [lifecycle.md](lifecycle.md#scope-与-worktree)。Pi 用来定位自己配置目录的 `PI_CODING_AGENT_DIR` 会随 scope 绑定：CLI/MCP 客户端进程里的取值经 scope 快照传到子进程，daemon 重启后仍按记录恢复；未设置时保持 Pi 默认（`$HOME/.pi/agent`），profile 的 `[profiles.x.env] PI_CODING_AGENT_DIR` 仍然优先。`ambient_extensions` / `ambient_skills` 默认 `true`，是**显式退出开关**（设为 `false` 会重新加上 `--no-extensions` / `--no-skills`）。
 
 `tools` 决定子代理的 **builtin** 工具面，由随插件发布的 `extensions/managed-surface.ts` 在 session_start 按 Pi 报告的来源（`sourceInfo.path = "<builtin:NAME>"`）精确激活/停用：profile 列出的 builtin 生效，未列出的 builtin（包括本插件还不认识的）停用。刻意不使用 `--tools` **也不用** `--exclude-tools`：两者都按**工具名**过滤同一份注册表，会连带剔除 Pi 扩展注册的同名工具（例如扩展用自己的 `bash` 覆盖 builtin）。只有真正限制 builtin 的 profile 才会加载该扩展；扩展文件缺失时该 profile 直接拒绝启动，而不是放出无约束的子代理。扩展/自定义工具保持 Pi 自身判定；插件仅在受管子进程增加 ask_parent，用于向父代理提出阻塞问题。
 
@@ -82,9 +82,9 @@ startup_timeout_seconds 控制初始 Pi handshake；rpc_timeout_seconds 覆盖�
 
 wait 的 timeout_seconds 以秒计，只限制调用等待，不停止任务。标准 Codex 安装在本插件清单中设置 3630 秒工具超时；其他 MCP 客户端或手工安装需要自行保证外层超时足够长。插件不改全局配置或批准策略。
 
-客户端对 IPC 调用的等待按 daemon 自身预算推导：wait 是 max(45s, timeout_seconds+10s)，其他普通操作为 45s；启动/回收类操作（spawn、respawn、close、interrupt）覆盖 daemon 的启动预算（由 startup_timeout_seconds 推导，默认约 90s），因为一次健康但缓慢的启动不应被报成失败。spawn 的 idle_timeout_seconds 是**模型静默**时限，不影响该调用本身的等待；旧 spawn.timeout_seconds / --timeout-seconds 已移除，wait 的同名参数不变。旧配置 default_run_timeout_seconds 作为默认静默阈值读取（新键优先），不再施加总时长限制。IPC v3 拒绝混用旧 daemon/客户端；正常结束旧任务后再更新连接。历史 deadline 列仅保留旧记录，不参与调度。
+客户端对 IPC 调用的等待按 daemon 自身预算推导：wait 是 max(45s, timeout_seconds+10s)，其他普通操作为 45s；可能启动/回收进程的操作（spawn、respawn、close、interrupt、soft_interrupt、send、message、followup）覆盖 daemon 的启动预算（由 startup_timeout_seconds 与 rpc_timeout_seconds 推导，默认约 90s），因为一次健康但缓慢的启动不应被报成失败。spawn 的 idle_timeout_seconds 是**模型静默**时限，不影响该调用本身的等待；旧 spawn.timeout_seconds / --timeout-seconds 已移除，wait 的同名参数不变。旧配置 default_run_timeout_seconds 作为默认静默阈值读取（新键优先），不再施加总时长限制。IPC v3 拒绝混用旧 daemon/客户端；正常结束旧任务后再更新连接。历史 deadline 列仅保留旧记录，不参与调度。
 
-模型 HTTP 请求时限、代理、认证和模型流解析交由 Pi。调整 Pi 自身的 httpIdleTimeoutMs 时，不要把它与本插件的 wait 或总运行时限混淆。没有输出不自动代表死进程，插件不以“多久没有 token”作为杀进程条件。
+模型 HTTP 请求时限、代理、认证和模型流解析交由 Pi；Pi 的 httpIdleTimeoutMs 与本插件的 wait/静默检测是不同约束。工具执行或父代理问答期间没有 token 仍可正常运行；其余连续无模型进展受 idle_timeout_seconds 约束。任务没有总运行时限。
 
 ## 资源与保留
 
