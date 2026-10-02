@@ -83,19 +83,27 @@ class ParentNotifications:
         bound=json.loads(raw)
         if any(parent.get(k)!=bound[k] for k in ('thread_id','codex_home')): return None
         token=object()
-        self.waits[token]=(params['scope'],frozenset(ids))
+        self.waits[token]=(params['scope'],frozenset(ids),False)
         params['run_ids']=ids  # Freeze the same selection for waiting and delivery.
-        for rid in ids:
-            self.store.execute("UPDATE parent_notifications SET state='recalling',error=NULL WHERE scope=? AND run_id=? AND state='recall_failed' AND queued_id IS NOT NULL",
-                               (params['scope'],rid))
+        if params.get('mode','any')=='any': self.cover_wait(token)
         self.schedule()
         return token
+
+    def cover_wait(self, token):
+        """Only first-event waits, or an already prepared response, take attention."""
+        sid,ids,covering=self.waits[token]
+        if covering: return
+        self.waits[token]=(sid,ids,True)
+        for rid in ids:
+            self.store.execute("UPDATE parent_notifications SET state='recalling',error=NULL WHERE scope=? AND run_id=? AND state='recall_failed' AND queued_id IS NOT NULL",
+                               (sid,rid))
 
     async def settle_wait(self, token, response):
         """A wait cannot deliver an event while its earlier wakeup can still arrive."""
         reservation=self.waits.get(token)
         if not reservation: return
-        sid,ids=reservation
+        self.cover_wait(token)
+        sid,ids,_=reservation
         events=[(r['id'],'terminal',None) for r in response['runs'] if r['id'] in ids and r.get('result')]
         events.extend((q['run_id'],'question',q['id']) for q in response['questions'] if q['run_id'] in ids)
         until=asyncio.get_running_loop().time()+WAIT_HANDOFF_SECONDS
@@ -115,7 +123,7 @@ class ParentNotifications:
     def release_wait(self, token, response=None):
         reservation=self.waits.pop(token,None)
         if reservation and response is not None:
-            sid,ids=reservation
+            sid,ids,_=reservation
             # Only events actually included in the response are observed.
             for run in response['runs']:
                 if run['id'] in ids and run.get('result'):
@@ -168,7 +176,7 @@ class ParentNotifications:
                      'state':notice['run_state'],'ack':notice['ack']}
                 worker=self.worker_for(run['agent_id'])
                 relevant=not notice['handled'] and ((not run['ack']) if notice['kind']=='terminal' else bool(worker and worker.run_id==run['id'] and notice['ui_id'] in worker.ui))
-                waiting=any(sid==notice['scope'] and notice['run_id'] in ids for sid,ids in self.waits.values())
+                waiting=any(covering and sid==notice['scope'] and notice['run_id'] in ids for sid,ids,covering in self.waits.values())
                 recalling=notice['state'] in ('queued','recalling')
                 if notice['state']=='queued' and relevant and not waiting: continue
                 if not recalling:
@@ -209,7 +217,7 @@ class ParentNotifications:
         run=self.store.run(notice['scope'],notice['run_id'])
         worker=self.worker_for(run['agent_id'])
         relevant=not current['handled'] and ((not run['ack']) if notice['kind']=='terminal' else bool(worker and worker.run_id==run['id'] and notice['ui_id'] in worker.ui))
-        waiting=any(sid==notice['scope'] and run['id'] in ids for sid,ids in self.waits.values())
+        waiting=any(covering and sid==notice['scope'] and run['id'] in ids for sid,ids,covering in self.waits.values())
         if not relevant or waiting:
             self.store.execute('UPDATE parent_notifications SET state=? WHERE id=?',('pending' if relevant else 'superseded',notice['id']))
             return

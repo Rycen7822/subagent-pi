@@ -306,10 +306,11 @@ TOOLS = [
     tool(
         "pi_wait_agent",
         "wait",
-        "Wait for completion, failure, stop or questions. all waits for every normal completion, but returns early for problems/questions. Returns bounded previews and hashes without acknowledgement. Settles earlier parent notifications before output. Cancelling the wait does not stop agents.",
+        "Wait for selected runs. Default any returns on the first completion, failure, stop or question. Optional all waits for every run to reach a terminal state; questions still return early. Returns all ready bounded previews and hashes without acknowledgement. Settles earlier parent notifications before output. Cancelling the wait does not stop agents.",
         {
             **SCOPE,
-            "run_ids": {"type": "array", "items": ID, "maxItems": 100},
+            "run_ids": {"type": "array", "items": ID, "maxItems": 100,
+                        "description": "Selected run IDs; omit for up to 100 currently unacknowledged runs in the bound scope."},
             "mode": {"type": "string", "enum": ["any", "all"], "default": "any"},
             "timeout_seconds": {
                 "type": "integer",

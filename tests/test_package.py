@@ -59,6 +59,7 @@ class ClientTimeoutBudget(unittest.TestCase):
         from subagent_pi.common import AgentError
         props=BY_NAME['pi_wait_agent']['inputSchema']['properties']
         self.assertNotIn('timeout_ms',props)
+        self.assertEqual(props['mode'],{'type':'string','enum':['any','all'],'default':'any'})
         self.assertEqual((props['timeout_seconds']['default'],props['timeout_seconds']['maximum']),(600,3600))
         for seconds in (0,1,600,3600):
             validate_op('wait',{'scope':'scope','timeout_seconds':seconds})
@@ -66,6 +67,8 @@ class ClientTimeoutBudget(unittest.TestCase):
             with self.subTest(args=args),self.assertRaises(AgentError): validate_op('wait',{'scope':'scope',**args})
         self.assertEqual(parser().parse_args(['wait','--timeout-seconds','3600']).timeout_seconds,3600)
         self.assertIsNone(parser().parse_args(['wait']).timeout_seconds)
+        self.assertEqual(parser().parse_args(['wait','--mode','all']).mode,'all')
+        validate_op('wait',{'scope':'scope','mode':'all','timeout_seconds':0})
 
 class PackageTests(unittest.TestCase):
     def test_manifest_structure_and_no_hooks(self):

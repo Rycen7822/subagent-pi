@@ -46,7 +46,7 @@ subagent-pi codex
 | 当前项目异步启动 | `pi_spawn_agent` / `subagent-pi spawn`，记录明确的绝对 cwd |
 | 消息 / 后续任务 | `pi_send_message` / `pi_followup_task`，支持 ID 或 scope 内唯一名称；活动输入使用原生 steering |
 | 空闲消息 | 写入 Pi history，不启动模型；后续任务自动唤醒已卸载 session |
-| 等待一个或多个任务 | `pi_wait_agent`，携带小结果与 hash；失败、停止、问题在 all 模式也立即返回 |
+| 等待一个或多个任务 | `pi_wait_agent`，默认 any 逐批接收，显式 all 等选中任务全部终态；携带就绪结果与 hash |
 | 检查工作轨迹 | `pi_inspect_agent`，有界输出、增量 cursor、控制回执 |
 | 中断 / 卸载 | `pi_interrupt_agent` 取消任务并尽量保留进程；CLI close 显式清理进程组 |
 | 恢复 / respawn | 保留 agent ID，增加 generation，重新加载已持久化 Pi session |

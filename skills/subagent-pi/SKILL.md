@@ -20,7 +20,9 @@ pi_followup_task: active input joins the same run; idle starts a new run. Both l
 Accepted/queued is not consumed. Inspect receipts only for diagnosis, uncertainty or requested progress; reuse cursors.
 pi_interrupt_agent cancels the managed task and queued work, normally retaining runtime; blocked preflight/hooks may force verified hard cleanup. It never rolls back effects. CLI close explicitly unloads; unknown cleanup blocks automatic recovery.
 Idle residents unload after 30 minutes by default; durable sessions/results remain. Read-only observation does not renew the timer. Optional model/thinking selection is SDK-validated and pinned across reload; extensions retain their capabilities.
-Keep one pi_wait_agent active per scope for remaining run IDs; remove integrated terminal runs before waiting again and handle returned questions/problems. Do not poll inspect/list. all waits for all normal completions but returns early for problems/questions; canceling wait does not stop Pi.
+Keep one pi_wait_agent active per scope, covering all remaining parallel run IDs. Default mode=any returns on the first completion/problem/question; handle every ready result, then wait on the remainder.
+Choose mode=all when the selected run snapshot must finish together: failed/stopped runs still wait for the others; questions or timeout return early. New runs need a later wait.
+Do not poll inspect/list during normal execution; use them for diagnosis, recovery or requested progress. Canceling wait does not stop Pi; timeout_seconds is an upper bound.
 Tasks have no total deadline; idle_timeout_seconds limits model silence, paused during tools/questions.
 Read and integrate results, then ACK the exact run/hash. Page larger text via pi_agent_result; reading never ACKs. Check actual diffs for code tasks.
 Answer pending questions with pi_answer_agent. Child ask_parent pauses for an explicit decision; tell the child to use it for unresolved authority/material choices.

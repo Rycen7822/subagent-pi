@@ -136,7 +136,7 @@ def msg(role,body,**extra):
 def response(r,success=True,data=None,error=None):
     emit({'type':'response','id':r.get('id'),'command':r['type'],'success':success,**({'data':data} if data is not None else {}),**({'error':error} if error else {})})
 
-TASK_OPTS={'delay','settle','resume','retry','compact','dupsettled','model','parallel','after_tool'}
+TASK_OPTS={'delay','settle','resume','retry','compact','dupsettled','model','parallel','after_tool','gate'}
 
 def parse_task(task):
     """Parse test-only key=value| prefixes: turn/post-run delay, continuation and
@@ -161,6 +161,8 @@ async def run(raw_task, rid):
     resume=int(opts.get('resume',0)); retry=int(opts.get('retry',0)); compact=bool(opts.get('compact'))
     emit({'type':'agent_start'})
     msg('user',task)
+    if opts.get('gate'):
+        while not Path(opts['gate']).exists(): await asyncio.sleep(.01)
     if task=='CRASH': os._exit(9)
     if task=='SPAWN_CHILD':
         proc=subprocess.Popen(['sleep','120'])

@@ -59,7 +59,7 @@ subagent-pi result RUN_ID --scope ID [--offset N] [--max-bytes N]
 subagent-pi ack RUN_ID --scope ID --sha256 HASH [--request-id KEY]
 ```
 
-wait 默认 any、最多等 600 秒；all 等所有正常完成，但失败/停止/问题提前返回。timeout_seconds 最大 3600，0 只检查，取消等待不停止任务。对同一 scope 内尚需处理的 run_ids 保持一次 wait，不混合不同 scope 的 run；处理终态后从后续等待集合移除，问题需明确回答。
+wait 默认 any、最多等 600 秒；并行协调时对同一 scope 的剩余 run 保持一次 wait，任一完成/失败/停止/问题就处理返回的就绪结果，再等待剩余任务。显式 `--mode all` 等选中任务全部进入终态，即使已有任务失败或停止也继续等其他任务；问题和超时仍返回。all 在响应准备好前不抑制部分完成通知，但通知入队不保证打断阻塞中的调用。MCP 的 pi_wait_agent 使用相同的 mode 和语义。timeout_seconds 最大 3600，0 只检查，取消等待不停止任务。“全部”是本次 run 快照，不包含之后新建的任务或其他 scope；问题需明确回答，读取结果不会 ACK。
 
 inspect 默认有界事件；detail=full 加入规范化文本、当前/最近任务的时间、用量、结果路径和通知详情。诊断超出预算会被省略并标记 diagnostics_truncated；max_bytes 最大 16 KiB。事件 cursor 与结果 byte offset 是两种游标。
 

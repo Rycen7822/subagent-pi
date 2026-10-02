@@ -167,7 +167,7 @@ class ReadViews:
                 done=[r for r in rows if r['state'] in TERMINAL]
                 attention=[r for r in rows if r['state']=='needs_input']
                 failures=[r for r in done if r['state']!='completed']
-                ready=not ids or bool(attention) or bool(failures) or (bool(done) if mode=='any' else len(done)==len(ids))
+                ready=not ids or bool(attention) or (bool(done) if mode=='any' else len(done)==len(ids))
                 if ready or time.monotonic()>=until:
                     # Share a fixed text budget across the page, never 100 full results.
                     budget=8192; runs=[]; questions=[]

@@ -75,6 +75,43 @@ else:
     async def open_parent(self):
         return (await self.parent_tool('pi_context',{'cwd':str(self.workspace)}))['scope']
 
+    async def test_all_barrier_keeps_partial_completion_attention_until_handoff(self):
+        # Exercise Pi and Codex queue subprocesses while controlling reservation
+        # order directly; both MCP and CLI use the same Runtime barrier.
+        rt=Runtime(self.home); token=None; waiting=None
+        gates=[self.root/'release-first',self.root/'release-second']
+        try:
+            source=self.trusted_source()
+            sid=(await rt.dispatch('scope_open',{'cwd':str(self.workspace)},source))['scope']
+            runs=[await rt.dispatch('spawn',{'scope':sid,'task':f'gate={gate}|run-{i}',
+                'access':'read','request_id':f'barrier-{i}'},source) for i,gate in enumerate(gates)]
+            params={'scope':sid,'run_ids':[r['run_id'] for r in runs],'mode':'all','timeout_seconds':4}
+            token=rt.parent_notifications.reserve_wait(params,source)
+            waiting=asyncio.create_task(rt.dispatch('wait',params,source))
+            gates[0].touch()
+            async with asyncio.timeout(2):
+                while not self.queued(): await asyncio.sleep(.01)
+            self.assertFalse(waiting.done(),'all must retain its explicit barrier semantics')
+            self.assertEqual(rt.store.run(sid,runs[1]['run_id'])['state'],'running')
+            first_notice=self.queued()[0]
+            self.assertIn(runs[0]['run_id'],first_notice['message'])
+            gates[1].touch()
+            response=await waiting
+            await rt.parent_notifications.settle_wait(token,response)
+            rt.parent_notifications.release_wait(token,response); token=None
+            self.assertIn({'threadId':self.parent,'queuedSubmissionId':first_notice['id']},self.recalls())
+            self.assertEqual([r['state'] for r in response['runs']],['completed','completed'])
+            self.assertTrue(all(not rt.store.run(sid,r['run_id'])['ack'] for r in runs))
+            notices=rt.store.all('SELECT state,handled FROM parent_notifications WHERE scope=?',(sid,))
+            self.assertEqual(len(notices),2)
+            self.assertTrue(all(r['handled'] and r['state'] not in ('pending','sending','queued','recalling') for r in notices))
+        finally:
+            for gate in gates: gate.touch()
+            if waiting and not waiting.done(): waiting.cancel()
+            if waiting: await asyncio.gather(waiting,return_exceptions=True)
+            if token: rt.parent_notifications.release_wait(token)
+            await rt.shutdown()
+
     async def test_two_parents_share_adapter_without_scope_or_notification_cross_talk(self):
         first=await self.open_parent(); other=str(uuid.uuid4())
         second=(await self.parent_tool('pi_context',{'cwd':str(self.workspace)},other))['scope']
@@ -531,7 +568,7 @@ class ParentScheduleBounds(unittest.TestCase):
                 self.assertLessEqual(sum(seen),64)
                 rt.store.execute("UPDATE parent_notifications SET state='pending' WHERE id='notice_000'")
                 rt.parent_notifications.deliveries.clear()
-                rt.parent_notifications.waits[object()]=(sid,frozenset(ids[:100]))
+                rt.parent_notifications.waits[object()]=(sid,frozenset(ids[:100]),True)
                 with mock.patch.object(rt.parent_notifications,'spawn_task',side_effect=capture_delivery):
                     rt.parent_notifications.schedule()
                 selected=rt.store.one("SELECT run_id FROM parent_notifications WHERE state='sending'")
@@ -553,7 +590,7 @@ class ParentDeliveryProcessTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(winner=winner):
                 store=Store(); run['ack']=int(winner=='ack'); store.handled=int(winner=='wait_receipt')
                 notifications=parent.ParentNotifications(store,None,lambda _aid: None)
-                if winner=='wait_reservation': notifications.waits[object()]=('s',frozenset({'r'}))
+                if winner=='wait_reservation': notifications.waits[object()]=('s',frozenset({'r'}),True)
                 with mock.patch.object(parent,'enqueue',new_callable=mock.AsyncMock) as enqueue:
                     await notifications.deliver(notice,{'state':'completed','ack':0},{})
                     enqueue.assert_not_awaited()
