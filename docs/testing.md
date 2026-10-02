@@ -24,7 +24,7 @@ npm run typecheck
 SUBAGENT_PI_LIVE_PI=1 python3 -m unittest discover -s tests -v
 ```
 
-使用原版 Pi 的 SDK（本轮本机为 0.99.1；CI 固定版本见 workflow），隔离 HOME、PI_CODING_AGENT_DIR、workspace 和 daemon。`SUBAGENT_PI_LIVE_PI_BIN` 可选择另一份官方 Pi 安装。无需宿主补丁，不改安装缓存。
+兼容范围为官方 Pi ≥0.99.1；0.99.1 是当前最低验证基线，旧版不再维护。使用原版 Pi 的 SDK，隔离 HOME、PI_CODING_AGENT_DIR、workspace 和 daemon。`SUBAGENT_PI_LIVE_PI_BIN` 可选择另一份官方 Pi 安装。无需宿主补丁，不改安装缓存。
 
 真实 MCP → daemon → SDK 子进程使用离线 mock provider，fetch 被替换为抛错函数。覆盖正常任务、before-settle/native continuation、多条及嵌套扩展输入、串行预处理与 FIFO、强制 system prompt、handled 输入、有序 steer、中断预处理、替换进程、迟到计时器隔离与显式 UI 确认；另验证启动期本地命令完成、无归属消息拒绝和扩展 stdout 不破坏协议事件。provider context、结果/hash 和进程清理是行为证据。父通知测试另覆盖 MCP 元数据归属、共享连接隔离、终态/问题投递及不确定提交不重试。
 
@@ -40,7 +40,7 @@ sha256sum -c FILES.sha256
 
 重复打包必须得到相同 manifest/ZIP。包包含 SDK transport 和队列，不含 `.work`、node_modules 或宿主补丁。开发声明从当前 Pi 安装 stage，重复 setup 不得破坏符号链接目标。
 
-GitHub CI 的 Python lane 跑默认离线套件；integration 固定 Pi 0.87.0、Node 22.19.0，执行类型检查、完整 live 离线套件和打包检查。
+GitHub CI 的 Python lane 跑默认离线套件；integration 固定最低支持版本 Pi 0.99.1、Node 22.19.0，执行类型检查、完整 live 离线套件和打包检查。
 
 ## 需要单独授权的验证
 

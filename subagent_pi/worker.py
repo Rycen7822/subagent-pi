@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import sys
@@ -272,6 +273,10 @@ def managed_command(argv):
         try: package = json.loads(manifest.read_text())
         except (OSError, ValueError): continue
         if package.get('name') != '@earendil-works/pi-coding-agent': continue
+        version = package.get('version')
+        match = re.fullmatch(r'([0-9]+)\.([0-9]+)\.([0-9]+)(?:\+[0-9A-Za-z.-]+)?', version) if isinstance(version, str) else None
+        if not match or tuple(map(int, match.groups())) < (0, 99, 1):
+            raise AgentError('unsupported_pi_version', f'Pi >=0.99.1 is required; found SDK version {version!r}')
         sdk = directory/'dist/index.js'
         node = shutil.which('node')
         if not sdk.is_file() or not node:

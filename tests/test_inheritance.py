@@ -982,7 +982,7 @@ class RealPiSkillBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.tool_path(probe,'bash'),str(probe_ext))
         self.assertIn('bash',self.active_tools(probe))                    # ... and the managed child keeps it
         for name in ('edit','write'):                                     # real built-ins stay restricted
-            self.assertEqual(self.tool_path(probe,name),f'<builtin:{name}>')
+            self.assertEqual(self.tool_path(probe,name),f'builtin:{name}')
             self.assertNotIn(name,self.active_tools(probe))
         evidence=parse_surface(stderr)
         self.assertEqual(evidence['ok'],'true')
@@ -996,7 +996,7 @@ class RealPiSkillBoundary(unittest.IsolatedAsyncioTestCase):
         stderr=self.stderr_of(aid)
         probe=json.loads(stderr.split('PROBE_TOOLS ',1)[1].splitlines()[0])
         for name in ('bash','edit','write','powershell'):
-            self.assertEqual(self.tool_path(probe,name),f'<builtin:{name}>')  # registered by Pi ...
+            self.assertEqual(self.tool_path(probe,name),f'builtin:{name}')  # registered by Pi ...
             self.assertNotIn(name,self.active_tools(probe))                   # ... but not usable
         for name in ('read','grep','find','ls'): self.assertIn(name,self.active_tools(probe))
         self.assertIn('codex_mcp',self.active_tools(probe))                   # Pi's own extension tool kept

@@ -18,7 +18,7 @@ max_wait_seconds = 3600
 event_max_count_per_agent = 20000
 ```
 
-`pi_command` 是 argv 数组，不经 shell。指向官方 Pi 可执行文件（可为符号链接）；插件据此定位 SDK，再启动自己的 Node 入口。任意 shell 启动器或原版 Pi RPC 服务不等价于 SDK transport，会在握手时拒绝。不要在这里写管道或命令拼接字符串。安装 `--pi` 仅在 config.toml 不存在时写入路径，不覆盖已有配置。`max_resident_agents` 既是驻留上限也是自动 park 的触发线：达到上限时最久未活动的已结算 idle agent 会被停止并保留会话（无需手动 close），无可 park 候选才报 capacity_exceeded；`max_agents_per_scope` 仍是每 scope 历史 agent 上限。
+`pi_command` 是 argv 数组，不经 shell。指向官方 Pi ≥0.99.1 的可执行文件（可为符号链接）；插件据此定位 SDK，拒绝旧版或无法确认版本的 SDK，再启动自己的 Node 入口。任意 shell 启动器或原版 Pi RPC 服务不等价于 SDK transport，会在握手时拒绝。不要在这里写管道或命令拼接字符串。安装 `--pi` 仅在 config.toml 不存在时写入路径，不覆盖已有配置。`max_resident_agents` 既是驻留上限也是自动 park 的触发线：达到上限时最久未活动的已结算 idle agent 会被停止并保留会话（无需手动 close），无可 park 候选才报 capacity_exceeded；`max_agents_per_scope` 仍是每 scope 历史 agent 上限。
 
 resident_idle_timeout_seconds 是已结算 resident 的卸载阈值，默认 30 分钟，区别于 default_idle_timeout_seconds 的模型静默检测。无任务、无待答问题且持有者/generation 一致才卸载；读取与遥测不会续期，空闲消息会续期。
 

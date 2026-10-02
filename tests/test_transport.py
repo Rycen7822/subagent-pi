@@ -357,6 +357,26 @@ class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         r=await self.rpc('tools/call',{'name':'pi_spawn_agent','arguments':{'task':'missing fields'}})
         self.assertTrue(r['result']['isError'])
         self.assertIn('invalid_argument',r['result']['content'][0]['text'])
+    async def test_mcp_spawn_rejects_unsupported_pi_before_launch(self):
+        old_pi=self.root/'old-pi'
+        (old_pi/'dist/bundle').mkdir(parents=True)
+        (old_pi/'package.json').write_text(json.dumps({'name':'@earendil-works/pi-coding-agent','version':'0.99.0'}))
+        (old_pi/'dist/index.js').write_text('throw new Error("old SDK must not run");')
+        marker=self.root/'old-pi-ran'
+        cli=old_pi/'dist/bundle/cli'
+        cli.write_text('#!/usr/bin/env python3\nfrom pathlib import Path\nPath('+repr(str(marker))+').touch()\n')
+        cli.chmod(0o755)
+        (self.home/'config.toml').write_text('pi_command = '+json.dumps([str(cli)])+'\n[inheritance]\nenabled = false\n')
+        await self.initialize()
+        response=await self.rpc('tools/call',{'name':'pi_spawn_agent','arguments':{
+            'cwd':str(self.workspace),'task':'must not start','access':'read','request_id':'old-pi'}})
+        self.assertTrue(response['result']['isError'])
+        error=self.unpack(response)['error']
+        self.assertEqual(error['code'],'unsupported_pi_version')
+        self.assertIn('0.99.1',error['message'])
+        self.assertIn('0.99.0',error['message'])
+        self.assertFalse(marker.exists())
+
     async def test_mcp_protocol_errors_and_ping(self):
         await self.initialize()
         self.mcp.stdin.write(b'not json\n'); await self.mcp.stdin.drain()
@@ -478,7 +498,7 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
     made; Pi, its agent dir and HOME are all isolated under the test root.
     SUBAGENT_PI_LIVE_PI_BIN selects an isolated Pi install (default: PATH).
 
-    Uses the plugin-owned SDK child against an unmodified Pi 0.87 installation.
+    Uses the plugin-owned SDK child against an unmodified Pi >=0.99.1 installation.
     """
     BIN=os.environ.get('SUBAGENT_PI_LIVE_PI_BIN','pi')
     BEFORE_SETTLE='PI_MOCK_BEFORE_SETTLE'

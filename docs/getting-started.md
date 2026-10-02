@@ -2,7 +2,7 @@
 
 ## 环境
 
-本版针对 Linux / WSL2，依赖 Python 3.11+、Node.js 22.19+、已安装并配置好模型/认证的 Pi，以及支持本地插件或 MCP 的 Codex CLI。WSL 状态目录使用 Linux 本地文件系统；文件锁和 SQLite WAL 不适合网络文件系统。
+本版针对 Linux / WSL2，依赖 Python 3.11+、Node.js 22.19+、已安装并配置好模型/认证的 Pi ≥0.99.1，以及支持本地插件或 MCP 的 Codex CLI。WSL 状态目录使用 Linux 本地文件系统；文件锁和 SQLite WAL 不适合网络文件系统。
 
 先确认：
 

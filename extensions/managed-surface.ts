@@ -8,7 +8,7 @@
  * filtered BY NAME): either flag would also remove a tool an extension
  * registered under a built-in's name. The profile's built-in surface is applied
  * here instead, where Pi reports the real source of every tool:
- * `sourceInfo.path === "<builtin:NAME>"` for Pi's own tools, the extension file
+ * `sourceInfo.path === "builtin:NAME"` for Pi's own tools, the extension file
  * for everything else. Only real built-ins follow the profile; every
  * extension/custom tool — including one that shadows a built-in name — keeps
  * exactly the state Pi gave it.
@@ -30,7 +30,7 @@
 import type { ExtensionAPI, ToolInfo } from "@earendil-works/pi-coding-agent";
 
 /** Pi's marker for a tool it implements itself (dist/core/tools). */
-const BUILTIN_SOURCE_PREFIX = "<builtin:";
+const BUILTIN_SOURCE_PREFIX = "builtin:";
 
 function sourcePath(tool: ToolInfo): string | undefined {
   const path = (tool.sourceInfo as { path?: unknown } | undefined)?.path;
@@ -41,7 +41,7 @@ function sourcePath(tool: ToolInfo): string | undefined {
  * built-in name, and such a tool is Pi's own business, not the profile's. */
 function isBuiltin(tool: ToolInfo): boolean {
   const path = sourcePath(tool);
-  return path !== undefined && path.startsWith(BUILTIN_SOURCE_PREFIX);
+  return path === `${BUILTIN_SOURCE_PREFIX}${tool.name}`;
 }
 
 export default async function (pi: ExtensionAPI) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * One-time development setup for TypeScript type checking (never needed at
- * runtime): locates the globally installed Pi distribution and stages its
+ * runtime): locates the installed Pi distribution and stages its
  * type declarations under node_modules/pi-host so `npm run typecheck` can
  * resolve `@earendil-works/pi-coding-agent`, `typebox` and Node's types.
  * Nothing here is packaged, cached at runtime, or downloaded by the product.
@@ -9,6 +9,7 @@
 import { execSync } from 'node:child_process';
 import { existsSync, realpathSync, lstatSync, mkdirSync, cpSync, rmSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { createRequire } from 'node:module';
 
 const which = (cmd) => {
   try { return execSync(`command -v ${cmd}`, { shell: '/bin/bash' }).toString().trim(); }
@@ -22,6 +23,15 @@ for (const parent of [real, ...Array(8).fill().map((_, i) => real.split('/').sli
   if (existsSync(join(parent, 'dist', 'index.d.ts'))) { piDir = parent; break; }
 }
 if (!piDir) throw new Error('could not locate the Pi distribution (dist/index.d.ts) from ' + real);
+const require = createRequire(join(piDir, 'package.json'));
+const dependencyDir = (name) => {
+  const root = require.resolve.paths(name).map((base) => join(base, name))
+    .find((path) => existsSync(join(path, 'package.json')));
+  if (!root) throw new Error(`could not locate ${name} from the Pi distribution`);
+  return root;
+};
+const typeboxDir = dependencyDir('typebox');
+const nodeTypesDir = dependencyDir('@types/node');
 const isLink = (path) => {
   try { return lstatSync(path).isSymbolicLink(); } catch { return false; }
 };
@@ -37,7 +47,7 @@ const stageDir = (src, dest) => {
 if (isLink('node_modules/pi-host')) unlinkSync('node_modules/pi-host');
 else rmSync('node_modules/pi-host', { recursive: true, force: true });
 stageDir(join(piDir, 'dist'), join('node_modules', 'pi-host', 'dist'));
-stageDir(join(piDir, 'node_modules', 'typebox'), join('node_modules', 'pi-host', 'node_modules', 'typebox'));
-stageDir(join(piDir, 'node_modules', '@types', 'node'), join('node_modules', 'pi-host', 'node_modules', '@types', 'node'));
-stageDir(join(piDir, 'node_modules', '@types', 'node'), join('node_modules', '@types', 'node'));
+stageDir(typeboxDir, join('node_modules', 'pi-host', 'node_modules', 'typebox'));
+stageDir(nodeTypesDir, join('node_modules', 'pi-host', 'node_modules', '@types', 'node'));
+stageDir(nodeTypesDir, join('node_modules', '@types', 'node'));
 console.log('staged Pi types from', piDir);

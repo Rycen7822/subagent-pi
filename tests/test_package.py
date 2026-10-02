@@ -195,8 +195,10 @@ class DevSetupStaging(unittest.TestCase):
         cli=self.pi/'dist/cli.js'; cli.write_text('#!/usr/bin/env node\n'); cli.chmod(0o755)
         (self.pi/'node_modules/typebox').mkdir(parents=True)
         (self.pi/'node_modules/typebox/index.d.ts').write_text('export type T = 1;\n')
+        (self.pi/'node_modules/typebox/package.json').write_text('{"name":"typebox"}')
         (self.pi/'node_modules/@types/node').mkdir(parents=True)
         (self.pi/'node_modules/@types/node/index.d.ts').write_text('declare const nodeMarker: 1;\n')
+        (self.pi/'node_modules/@types/node/package.json').write_text('{"name":"@types/node"}')
         self.bin=self.root/'bin'; self.bin.mkdir()
         (self.bin/'pi').symlink_to(cli)          # the executable symlink must resolve into the dist tree
         self.cwd=self.root/'project'; (self.cwd/'node_modules/@types').mkdir(parents=True)
@@ -216,6 +218,17 @@ class DevSetupStaging(unittest.TestCase):
         self.assertIn('refreshed',(self.cwd/'node_modules/pi-host/dist/index.d.ts').read_text())
         self.assertTrue((self.cwd/'node_modules/pi-host/node_modules/typebox/index.d.ts').is_file())
         self.assertIn('staged Pi types from',second.stdout)
+    def test_hoisted_dependencies_are_resolved_from_pi(self):
+        shared=self.pi.parent
+        (shared/'@types').mkdir()
+        shutil.move(str(self.pi/'node_modules/typebox'),str(shared/'typebox'))
+        shutil.move(str(self.pi/'node_modules/@types/node'),str(shared/'@types/node'))
+        done=self.setup_script()
+        self.assertEqual(done.returncode,0,done.stderr)
+        self.assertEqual((self.cwd/'node_modules/pi-host/node_modules/typebox/index.d.ts').read_text(),
+                         'export type T = 1;\n')
+        self.assertEqual((self.cwd/'node_modules/@types/node/index.d.ts').read_text(),
+                         'declare const nodeMarker: 1;\n')
     def test_symlinked_targets_are_unlinked_not_deleted(self):
         outside=self.root/'outside'; (outside/'keep').mkdir(parents=True)
         (outside/'keep/data.txt').write_text('must survive\n')
@@ -239,7 +252,7 @@ class SdkTransport(unittest.TestCase):
         from subagent_pi.worker import managed_command
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); (root/'dist/bundle').mkdir(parents=True)
-            manifest=root/'package.json'; manifest.write_text('{"name":"@earendil-works/pi-coding-agent"}')
+            manifest=root/'package.json'; manifest.write_text('{"name":"@earendil-works/pi-coding-agent","version":"0.99.1"}')
             cli=root/'dist/bundle/cli.js'; cli.write_text('unchanged cli')
             sdk=root/'dist/index.js'; sdk.write_text('unchanged sdk')
             before={p:p.read_bytes() for p in (manifest,cli,sdk)}
@@ -247,3 +260,22 @@ class SdkTransport(unittest.TestCase):
                 argv=managed_command([str(cli),'--mode','rpc'])
             self.assertEqual(argv[1:],[str(ROOT/'runtime/pi-sdk.mjs'),str(sdk),'--mode','rpc'])
             self.assertEqual({p:p.read_bytes() for p in before},before)
+
+    def test_stock_pi_command_rejects_old_or_unknown_sdk_versions(self):
+        from subagent_pi.worker import managed_command
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); (root/'dist/bundle').mkdir(parents=True)
+            manifest=root/'package.json'
+            cli=root/'dist/bundle/cli.js'; cli.write_text('unchanged cli')
+            sdk=root/'dist/index.js'; sdk.write_text('unchanged sdk')
+            for version in ('0.87.0', '0.99.0', None, 'unknown'):
+                with self.subTest(version=version):
+                    manifest.write_text(json.dumps({'name':'@earendil-works/pi-coding-agent','version':version}))
+                    with self.assertRaises(AgentError) as error:
+                        managed_command([str(cli),'--mode','rpc'])
+                    self.assertEqual(error.exception.code,'unsupported_pi_version')
+                    self.assertIn('0.99.1',error.exception.message)
+            for version in ('0.99.1', '0.100.0', '1.0.0'):
+                with self.subTest(version=version), patch('shutil.which',return_value='/usr/bin/node'):
+                    manifest.write_text(json.dumps({'name':'@earendil-works/pi-coding-agent','version':version}))
+                    self.assertEqual(managed_command([str(cli),'--mode','rpc'])[2],str(sdk))
