@@ -48,7 +48,7 @@ Pi 的项目 trust、环境初始化或扩展装载行为可能影响 RPC 启动
 
 插件安装后开始新会话；确认没有同时通过全局 MCP 又注册同一个服务。使用 `/mcp` 检查连接，并实际尝试带 cwd 的 pi_spawn_agent。deferred/tool-search 能否发现属于 Codex 版本和 provider 行为，不是本插件保证。
 
-0.6.0 日常发现列表包含 9 个工具，包括 pi_send_message、pi_followup_task、pi_interrupt_agent；pi_context、pi_send_input、pi_close_agent、pi_respawn_agent 留在显式管理面。仅找不到这些管理工具不等于服务故障。如果 skill 仍要求先 pi_context、使用 pi_send_input，要求 pi_ack_result，或常规停止用 pi_close_agent，检查是否载入旧版本。
+0.6.1 日常发现列表包含 9 个工具，包括 pi_send_message、pi_followup_task、pi_interrupt_agent；pi_context、pi_send_input、pi_close_agent、pi_respawn_agent 留在显式管理面。仅找不到这些管理工具不等于服务故障。如果 skill 仍要求先 pi_context、使用 pi_send_input，要求 pi_ack_result，或常规停止用 pi_close_agent，检查是否载入旧版本。
 
 `subagent-pi --version`、`subagent-pi schemas` 只反映 PATH 对应 CLI。源码更新、git push 和重新复制 marketplace 文件不会刷新当前会话；需按 [升级步骤](getting-started.md#升级与移除) 同步安装代码、Codex 缓存、skill/docs，再开启新会话。不单独覆盖缓存中的 SKILL.md，以免新指引配旧 schema。
 
@@ -56,7 +56,7 @@ Pi 的项目 trust、环境初始化或扩展装载行为可能影响 RPC 启动
 
 ## wait 经常立即返回
 
-省略选择时，已完成但未成功交付的 run 会立即就绪；用原父会话的 wait / result 成功读取后，默认等待会排除它们。list / inspect 或其他父会话读取不会消费关注。显式 run_ids 故意允许重读；继续协调时改传剩余 run_ids，或省略选择。若输出失败或通知交接失败，先查看 parent_notifications 再重试读取。
+省略选择时，已完成但未成功交付的 run 会立即就绪；用原父会话的 wait / result 成功读取后，默认等待会排除它们。list / inspect 或其他父会话读取不会消费关注。显式 run_ids 故意允许重读；继续协调时改传剩余 run_ids，或省略选择。若输出失败或通知交接失败，先查看 parent_notifications；需要查看正文时用 CLI result --peek，只读且保留未决关注。自定义 CODEX_HOME 时检查新安装的原生清单是否透传该变量；更新清单不会重绑定旧 scope。
 
 只有进度而没有终态时，wait 不应提前返回。需要输入的 Pi 请求会返回 needs_input，使用 pi_answer_agent 明确回答，不自动批准。
 

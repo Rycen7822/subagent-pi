@@ -47,7 +47,9 @@ def parser():
             q.add_argument('--after',type=int,default=0); q.add_argument('--limit',type=int,default=20); q.add_argument('--max-bytes',type=int,default=4096); q.add_argument('--detail',choices=['tools','full'],default='tools')
         if name=='result':
             q.add_argument('run_id',nargs='?'); q.add_argument('--agent',dest='agent_id',help='Agent name/ID instead of run ID')
-        if name=='result': q.add_argument('--offset',type=int,default=0); q.add_argument('--max-bytes',type=int,default=4096)
+        if name=='result':
+            q.add_argument('--offset',type=int,default=0); q.add_argument('--max-bytes',type=int,default=4096)
+            q.add_argument('--peek',action='store_true',help='Read without consuming notification attention or settling a failed handoff')
         if name=='answer':
             q.add_argument('ui_request_id'); q.add_argument('--answer',required=True,help='Text, or JSON true/false for confirmation')
     d=sub.add_parser('doctor',help='Diagnostics; add --inheritance for source/skill/server names only')
@@ -148,6 +150,7 @@ async def execute(args):
         os.execvpe(exe,[exe,*rest],env)
     data=vars(args).copy()
     for k in ('command','home'): data.pop(k,None)
+    peek=data.pop('peek',False)
     if 'cwd' in data: data['cwd']=str(Path(data['cwd']).expanduser().resolve())
     if not data.get('scope'):
         if cmd=='spawn':
@@ -162,7 +165,7 @@ async def execute(args):
     if cmd=='wait' and not data['run_ids']: data.pop('run_ids')
     data={k:v for k,v in data.items() if v is not None}
     op={'steer':'send','follow-up':'send','send-message':'message','followup-task':'followup','interrupt':'soft_interrupt','resume':'respawn'}.get(cmd,cmd)
-    if op in DELIVERY_OPS:
+    if op in DELIVERY_OPS and not peek:
         from .parent import capture
         async def write_result(value): print(dumps(value),flush=True)
         source={'env':{},'parent':capture(os.environ,os.environ.get('CODEX_THREAD_ID'))}

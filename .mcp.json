@@ -2,7 +2,8 @@
   "mcpServers": {
     "subagent-pi": {
       "command": "subagent-pi",
-      "args": ["mcp"]
+      "args": ["mcp"],
+      "env_vars": ["XDG_RUNTIME_DIR", "CODEX_HOME"]
     }
   }
 }

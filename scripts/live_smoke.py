@@ -8,25 +8,27 @@ import tempfile
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
 from subagent_pi.client import request
 from subagent_pi.common import state_home
+from subagent_pi.cli import source_snapshot
 
 async def run(args):
-    home=state_home()
+    home=state_home(); source=source_snapshot(home)
     with tempfile.TemporaryDirectory(prefix='subagent-pi-live-') as temp:
         root=Path(temp); (root/'marker.txt').write_text('subagent-pi-live-ok\n')
-        scope=(await request(home,'scope_open',{'cwd':temp,'label':'Real Pi opt-in smoke'}))['scope']
+        scope=(await request(home,'scope_open',{'cwd':temp,'label':'Real Pi opt-in smoke'},source=source))['scope']
         a=None
         try:
             a=await request(home,'spawn',{'scope':scope,'cwd':temp,'access':'read','task':'Read marker.txt and reply with its exact contents. Do not access other files.',
                             'request_id':'smoke-spawn',**({'model':args.model} if args.model else {})})
             print('Spawned:',a)
-            terminal=await request(home,'wait',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':120},timeout=130)
-            print('Wait:',terminal)
+            async def wait_output(value): print('Wait:',value,flush=True)
+            terminal=await request(home,'wait',{'scope':scope,'run_ids':[a['run_id']],'timeout_seconds':120},timeout=130,source=source,on_result=wait_output)
             if terminal['timed_out']: raise RuntimeError('Smoke wait timed out; inspect the preserved run')
-            result=await request(home,'result',{'scope':scope,'run_id':a['run_id']})
-            print('Result:',result)
+            async def result_output(value): print('Result:',value,flush=True)
+            result=await request(home,'result',{'scope':scope,'run_id':a['run_id']},source=source,on_result=result_output)
             assert result['run']['state']=='completed'
             assert 'subagent-pi-live-ok' in result['text']
-            await request(home,'ack',{'scope':scope,'run_id':a['run_id'],'result_sha256':result['result_sha256'],'request_id':'smoke-ack'})
+            listing=await request(home,'list',{'scope':scope})
+            assert a['run_id'] not in {r['id'] for r in listing['outstanding']['runs']}, 'Successful output did not consume result attention'
         finally:
             if a:
                 print('Close:',await request(home,'close',{'scope':scope,'agent_id':a['agent_id'],'request_id':'smoke-close'}))

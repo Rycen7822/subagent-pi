@@ -92,7 +92,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(legacy['args'],[str(plugin/'bin/subagent-pi'),'mcp'])
             from subagent_pi.common import MAX_WAIT_SECONDS
             self.assertGreater(legacy['tool_timeout_sec'],call_timeout('wait',{'timeout_seconds':MAX_WAIT_SECONDS}))
-            self.assertEqual(legacy['env_vars'],['XDG_RUNTIME_DIR'])
+            self.assertEqual(legacy['env_vars'],['XDG_RUNTIME_DIR','CODEX_HOME'])
             self.assertFalse((plugin/'plugin.json').exists())  # Native Codex manifest owns the timeout.
             self.assertTrue((plugin/'.codex-plugin/plugin.json').exists())
             self.assertEqual(server['env']['PI_AGENTS_HOME'],str(home))

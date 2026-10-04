@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -13,7 +14,7 @@ from subagent_pi import parent
 from subagent_pi.client import request
 from subagent_pi.common import AgentError, dumps, group_members
 from subagent_pi.runtime import Runtime
-from test_transport import McpHarness
+from test_transport import McpHarness, ROOT
 
 
 class ParentNotifications(McpHarness, unittest.IsolatedAsyncioTestCase):
@@ -43,6 +44,7 @@ else:
             assert request['method']=='thread/queue/delete'
             params=request['params']
             with (home/'recalls.jsonl').open('a') as f: f.write(json.dumps(params)+'\\n')
+            while (home/'hold-recall').exists(): time.sleep(.01)
             if (home/'recall-reject').exists():
                 print(json.dumps({'id':request['id'],'error':{'code':-32601,'message':'unsupported'}}),flush=True); continue
             result={'deleted':not (home/'already-consumed').exists()}
@@ -53,6 +55,24 @@ else:
                       'PATH':str(bindir)+os.pathsep+os.environ['PATH']}
         self.parent=str(uuid.uuid4())
         await self.initialize()
+
+    async def test_smoke_delivers_with_bound_parent_identity(self):
+        (self.home/'config.toml').write_text(
+            'pi_command = '+json.dumps([sys.executable,str(ROOT/'tests/fake_pi.py'),
+                                      '--reply-file','marker.txt'])+
+            '\n[inheritance]\nenabled = false\n')
+        env={**os.environ,**self.mcp_env,'CODEX_THREAD_ID':self.parent,
+             'PI_AGENTS_HOME':str(self.home),'TMPDIR':str(self.root)}
+        env.pop('PI_AGENTS_SCOPE',None)
+        proc=await asyncio.create_subprocess_exec(sys.executable,str(ROOT/'scripts/live_smoke.py'),
+            '--allow-model-call',env=env,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+        out,err=await asyncio.wait_for(proc.communicate(),20)
+        self.assertEqual(proc.returncode,0,err.decode()+out.decode())
+        self.assertIn('Real Pi smoke passed',out.decode())
+        with sqlite3.connect(self.home/'registry.sqlite') as db:
+            self.assertEqual(db.execute('SELECT state,handled FROM parent_notifications').fetchall(),
+                             [('observed',1)])
+            self.assertEqual(json.loads(db.execute('SELECT parent FROM scopes').fetchone()[0])['thread_id'],self.parent)
 
     async def parent_tool(self,name,args,thread=None,error=False):
         response=await self.rpc('tools/call',{'name':name,'arguments':args,'_meta':{'threadId':thread or self.parent}})
@@ -169,11 +189,15 @@ else:
         rows=await self.settled_notifications(sid,1)
         self.assertEqual(rows[0]['state'],'unknown'); self.assertEqual(len(self.queued()),1)
 
-    async def restart_daemon(self):
+    async def stop_daemon(self):
         await request(self.home,'shutdown',{'force':True})
         from subagent_pi.common import socket_path
         until=asyncio.get_running_loop().time()+5
         while socket_path(self.home).exists() and asyncio.get_running_loop().time()<until: await asyncio.sleep(.02)
+        self.assertFalse(socket_path(self.home).exists(),'Old daemon did not finish shutdown')
+
+    async def restart_daemon(self):
+        await self.stop_daemon()
         await request(self.home,'ping',{})
 
     async def test_pending_stop_survives_daemon_restart(self):
@@ -203,10 +227,11 @@ else:
         notice=(await self.settled_notifications(sid,1))[0]
         # A delivered wait had requested recall, then the daemon died before
         # recording the host response. Retrying this exact deletion is safe.
+        await self.stop_daemon()
         import sqlite3
         with sqlite3.connect(self.home/'registry.sqlite') as db:
             db.execute("UPDATE parent_notifications SET state='recalling',handled=1")
-        await self.restart_daemon()
+        await request(self.home,'ping',{})
         await self.wait_notice_state(sid,'recalled')
         self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':notice['queued_id']}])
         result=await self.parent_tool('pi_agent_result',{'run_id':run['run_id']})
@@ -216,12 +241,35 @@ else:
         sid=await self.open_parent()
         await self.parent_tool('pi_spawn_agent',{'request_id':'done','task':'done','access':'read'})
         notice=(await self.settled_notifications(sid,1))[0]
+        # Reconcile the persisted row while no old notification callback can run.
+        await self.stop_daemon()
         import sqlite3
         with sqlite3.connect(self.home/'registry.sqlite') as db:
             db.execute('UPDATE parent_notifications SET handled=1')
-        await self.restart_daemon()
+        await request(self.home,'ping',{})
         await self.wait_notice_state(sid,'recalled')
         self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':notice['queued_id']}])
+        self.assertEqual(len(self.queued()),1)
+
+    async def test_inflight_recall_restarts_with_same_id_without_resending(self):
+        sid=await self.open_parent()
+        run=await self.parent_tool('pi_spawn_agent',{'request_id':'done','task':'done','access':'read'})
+        notice=(await self.settled_notifications(sid,1))[0]
+        hold=self.codex_home/'hold-recall'; hold.touch()
+        import sqlite3
+        with sqlite3.connect(self.home/'registry.sqlite') as db:
+            db.execute('UPDATE parent_notifications SET handled=1')
+        # Closing the idle worker schedules the consumed notification's recall.
+        await self.parent_tool('pi_close_agent',{'scope':sid,'agent_id':run['agent_id'],'request_id':'close-before-restart'})
+        async with asyncio.timeout(5):
+            while not self.recalls(): await asyncio.sleep(.01)
+        expected={'threadId':self.parent,'queuedSubmissionId':notice['queued_id']}
+        self.assertEqual(self.recalls(),[expected])
+        await self.stop_daemon()
+        hold.unlink()
+        await request(self.home,'ping',{})
+        await self.wait_notice_state(sid,'recalled')
+        self.assertEqual(self.recalls(),[expected,expected])
         self.assertEqual(len(self.queued()),1)
 
     async def test_restart_during_unconsumed_wait_withdrawal_restores_wakeup(self):
@@ -367,6 +415,41 @@ else:
         self.assertEqual(listing['parent_notifications'],{'enabled':True,'failed':1})
         full=await self.tool('pi_inspect_agent',{'scope':sid,'agent_id':run['agent_id'],'detail':'full','max_bytes':16384})
         self.assertEqual(full['parent_notifications']['recent'][0]['state'],'recall_failed')
+
+    async def check_cli_peek_preserves_notification(self, failure):
+        flag='reject' if failure=='unknown' else 'recall-reject'
+        (self.codex_home/flag).touch()
+        sid=await self.open_parent()
+        run=await self.parent_tool('pi_spawn_agent',{'request_id':'peek','task':'done','access':'read'})
+        await self.settled_notifications(sid,1)
+        normal=await self.parent_tool('pi_agent_result',{'run_id':run['run_id']},error=True)
+        self.assertEqual(normal['error']['code'],'notification_handoff_failed')
+        self.assertIn('--peek',normal['error']['message'])
+        await self.wait_notice_state(sid,failure)
+        before=(len(self.queued()),len(self.recalls()))
+        env={**os.environ,**self.mcp_env,'CODEX_THREAD_ID':self.parent}
+        for selector in ([run['run_id']],['--agent',run['agent_id']]):
+            proc=await asyncio.create_subprocess_exec(sys.executable,str(ROOT/'bin/subagent-pi'),
+                '--home',str(self.home),'result',*selector,'--scope',sid,'--peek',env=env,
+                stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+            out,err=await asyncio.wait_for(proc.communicate(),8)
+            self.assertEqual(proc.returncode,0,err.decode())
+            result=json.loads(out)
+            self.assertEqual(result['run']['id'],run['run_id'])
+            self.assertEqual(result['text'],'Completed: done')
+        import sqlite3
+        with sqlite3.connect(self.home/'registry.sqlite') as db:
+            self.assertEqual(db.execute('SELECT state,handled FROM parent_notifications WHERE run_id=?',
+                                       (run['run_id'],)).fetchone(),(failure,0))
+        self.assertEqual((len(self.queued()),len(self.recalls())),before)
+        listing=await self.tool('pi_list_agents',{'scope':sid})
+        self.assertEqual(listing['outstanding']['total'],1)
+
+    async def test_cli_peek_preserves_unknown_notification(self):
+        await self.check_cli_peek_preserves_notification('unknown')
+
+    async def test_cli_peek_preserves_failed_recall(self):
+        await self.check_cli_peek_preserves_notification('recall_failed')
 
     async def test_consumed_message_is_not_claimed_recalled_or_reenqueued(self):
         (self.codex_home/'already-consumed').touch()

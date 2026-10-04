@@ -26,7 +26,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 默认安装目录：`~/.local/share/subagent-pi-marketplace/plugins/subagent-pi`。本地 marketplace 清单：`~/.local/share/subagent-pi-marketplace/.agents/plugins/marketplace.json`。CLI：`~/.local/bin/subagent-pi`。
 
-源码包保留通用 `plugin.json` / `mcp.json`；安装到 Codex 时选择 `.codex-plugin/plugin.json` / `.mcp.json` 原生清单，并在安装副本移除优先级更高的通用 plugin.json。原生 MCP 配置固定解释器、入口和状态目录，并设置 `tool_timeout_sec=3630`，覆盖一小时 wait；不改 Codex 全局配置或宿主源码。
+源码包保留通用 `plugin.json` / `mcp.json`；安装到 Codex 时选择 `.codex-plugin/plugin.json` / `.mcp.json` 原生清单，并在安装副本移除优先级更高的通用 plugin.json。原生 MCP 配置固定解释器、入口和状态目录，透传 `CODEX_HOME` / `XDG_RUNTIME_DIR`，并设置 `tool_timeout_sec=3630`，覆盖一小时 wait；不改 Codex 全局配置或宿主源码。自定义 Codex 目录必须传到 adapter，否则父 thread ID 可能被绑定到错误目录；CLI 与 MCP 也需使用相同的 runtime 目录。
 
 `--register` 只注册 marketplace。接着在 Codex `/plugins` 中从 Subagent Pi Local 安装 Subagent Pi，或使用当前支持该命令的 CLI：
 
@@ -53,7 +53,7 @@ codex plugin marketplace add "$HOME/.local/share/subagent-pi-marketplace"
 
 这是 `pi_spawn_agent` 的参数示例。连接未绑定且未显式指定 scope 时，adapter 会打开该工作区的 scope 并绑定后续调用；若启动器提供了 `PI_AGENTS_SCOPE`，会使用该已有 scope。保存返回的 scope、agent_id、run_id；同一调用方的连接已绑定后，可省略 scope。此时 spawn 的 cwd 只选择子代理目录，省略则使用 scope 目录。
 
-显式传 scope 会选择那份账本，不替换连接的默认 scope。恢复旧 scope、跨 scope 读取或另一个 MCP 连接，应显式传该 ID；相同 cwd 不会让两个 Codex 会话自动合并。另一父会话可读取旧结果，新委托使用自己的 scope。`pi_context` 仍是显式管理调用，不在 10 个日常工具的发现列表中。
+显式传 scope 会选择那份账本，不替换连接的默认 scope。恢复旧 scope、跨 scope 读取或另一个 MCP 连接，应显式传该 ID；相同 cwd 不会让两个 Codex 会话自动合并。另一父会话可读取旧结果，新委托使用自己的 scope。`pi_context` 仍是显式管理调用，不在 9 个日常工具的发现列表中。
 
 也可通过可选启动器先建立 scope：
 
@@ -112,7 +112,7 @@ codex plugin remove subagent-pi@subagent-pi-local
 codex plugin add subagent-pi@subagent-pi-local
 ```
 
-最后开启新会话。`subagent-pi --version` 和 `subagent-pi schemas` 只证明当前 CLI 的版本；0.6.0 应发现 9 个工具且不含 pi_ack_result；还应检查新会话发现 `pi_send_message`、`pi_followup_task`、`pi_interrupt_agent` 等日常工具，并使用对应的 skill。运行中的连接和已载入 skill 不会因源码、marketplace 文件或 git 提交变化而刷新。
+最后开启新会话。`subagent-pi --version` 和 `subagent-pi schemas` 只证明当前 CLI 的版本；0.6.1 应发现 9 个工具且不含 pi_ack_result；还应检查新会话发现 `pi_send_message`、`pi_followup_task`、`pi_interrupt_agent` 等日常工具，并使用对应的 skill。运行中的连接和已载入 skill 不会因源码、marketplace 文件或 git 提交变化而刷新。
 
 升级保留状态目录，旧安装备份在 `plugins/subagent-pi.previous`。支持的历史账本会自动按迁移注册表升级；比当前程序更新的数据库拒绝打开，不自动降级或删除。0.6.0 使用 IPC v4 / schema 7，移除手工 ACK，并把旧 ACK 和通知交付状态迁移为统一关注状态，保留结果及排队撤回意图。IPC 版本不匹配时需先正常结束旧任务，再更新客户端与 daemon；旧版本不能打开升级后的账本。
 

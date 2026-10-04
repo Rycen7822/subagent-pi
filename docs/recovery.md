@@ -64,4 +64,12 @@ subagent-pi respawn AGENT_ID --scope SCOPE_ID --message '先检查之前的修�
 
 结果先 fsync 写入，再用 SQLite 事务保存 terminal 状态和结果 hash。wait / result 成功输出后自动消费该终态关注；输出失败、取消或无交付回执时继续保留在 outstanding。list / inspect 不消费关注。已经交付的结果文件仍可按 run ID 重新读取。
 
+通知处于 unknown 或 recall_failed 时，普通交付仍要求先结算通知；可直接只读结果，不改变未决状态：
+
+```bash
+subagent-pi result RUN_ID --scope SCOPE_ID --peek
+```
+
+--peek 不消费关注、不撤回或重放通知，也不意味着旧通知已安全处理。需要分页时继续带 --peek，使用返回的 run.id / next_offset。先用 inspect --detail full 查看通知错误，修正绑定或宿主问题后再处理正常交付；不要自动重试未知提交。旧 scope 的父绑定不会因修改安装清单而自动修复。
+
 极端故障中，artifact 已写但事务未提交可能留下孤立文件；它不会被当作正常完成的证据。原始 Pi session 可能包含更多部分信息。不要把恢复时的空结果解释为子代理从未产生副作用。

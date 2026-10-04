@@ -116,7 +116,7 @@ class ParentNotifications:
                 'SELECT state FROM parent_notifications WHERE scope=? AND run_id=? AND kind=? AND ui_id IS ?',
                 (sid,rid,kind,ui_id))]
             if any(r['state'] in ('unknown','recall_failed') for r in rows):
-                raise AgentError('notification_handoff_failed','Result was not delivered: its earlier parent notification could not be settled. Inspect parent_notifications before retrying.')
+                raise AgentError('notification_handoff_failed','Result was not delivered: its earlier parent notification could not be settled. Inspect parent_notifications; CLI result --peek reads the preserved result without consuming attention or retrying the notification.')
             if not any(r['state'] in ('sending','queued','recalling') for r in rows): return
             remaining=until-asyncio.get_running_loop().time()
             if remaining<=0 or not self.deliveries:
