@@ -51,19 +51,19 @@ Pi 不复制父对话；task 写明目标、相关事实/路径、授权边界�
 ## 观察与结果
 
 ```text
-subagent-pi list --scope ID [--limit N]
+subagent-pi list --scope ID [--query TEXT] [--sort updated|created] [--offset N] [--limit N]
 subagent-pi inspect AGENT_ID_OR_NAME --scope ID [--after SEQ] [--limit N]
   [--detail tools|full] [--max-bytes N]
 subagent-pi wait [RUN_IDS...] --scope ID [--mode any|all] [--timeout-seconds N]
-subagent-pi result RUN_ID --scope ID [--offset N] [--max-bytes N]
-subagent-pi ack RUN_ID --scope ID --sha256 HASH [--request-id KEY]
+subagent-pi wait --agents NAME_OR_ID... --scope ID [--mode any|all]
+subagent-pi result [RUN_ID | --agent NAME_OR_ID] --scope ID [--offset N] [--max-bytes N]
 ```
 
-wait 默认 any、最多等 600 秒；并行协调时对同一 scope 的剩余 run 保持一次 wait，任一完成/失败/停止/问题就处理返回的就绪结果，再等待剩余任务。显式 `--mode all` 等选中任务全部进入终态，即使已有任务失败或停止也继续等其他任务；问题和超时仍返回。all 在响应准备好前不抑制部分完成通知，但通知入队不保证打断阻塞中的调用。MCP 的 pi_wait_agent 使用相同的 mode 和语义。timeout_seconds 最大 3600，0 只检查，取消等待不停止任务。“全部”是本次 run 快照，不包含之后新建的任务或其他 scope；问题需明确回答，读取结果不会 ACK。
+wait 默认 any、最多等 600 秒；并行协调时对同一 scope 的剩余 run 保持一次 wait，任一完成/失败/停止/问题就处理返回的就绪结果，再等待剩余任务。显式 `--mode all` 等选中任务全部进入终态，即使已有任务失败或停止也继续等其他任务；问题和超时仍返回。all 在响应准备好前不抑制部分完成通知，但通知入队不保证打断阻塞中的调用。MCP 的 pi_wait_agent 使用相同的 mode 和语义。timeout_seconds 最大 3600，0 只检查，取消等待不停止任务。“全部”是本次 run 快照，不包含之后新建的任务或其他 scope；问题需明确回答。wait / result 成功输出后自动消费终态通知，不需 ACK；list / inspect 保留关注。省略选择时等待活动或未交付 run；--agents 固定当前/最近 run，多任务歧义需明确 run ID。
 
 inspect 默认有界事件；detail=full 加入规范化文本、当前/最近任务的时间、用量、结果路径和通知详情。诊断超出预算会被省略并标记 diagnostics_truncated；max_bytes 最大 16 KiB。事件 cursor 与结果 byte offset 是两种游标。
 
-wait 提供小结果预览；has_more 时从 next_offset 调 result。读取不会 ACK，ACK 必须使用同一结果的 result_sha256；大正文的 hash 对应整个保存结果，先完整读取并处理。未 ACK 任务仍在 outstanding。管理操作 scope_list 从 0.5.0 起省略停用的 revision 字段，旧账本列保留。
+wait 整页结果正文共享 8 KiB 预算，先提供完整小结果；正文完整时直接审核，不需再调 result。has_more 时用返回的 run.id 与 next_offset 调 result。--agent 只可取第一页，后续按 run ID 翻页；大正文的 result_sha256 对应整个结果文件。存在未确定消费或失败的输入时返回有界 input_issues。list 搜索不改变 scope-wide outstanding；按 next_offset 翻页并保持 query/sort 相同，updated 排序会随任务状态变化。0.6.0 移除 ack 命令和 acknowledged 字段；结果交付后仍可重读。
 
 ## 中断、卸载与恢复
 

@@ -1,7 +1,8 @@
 """Bounded read projections: what a client can see about an agent, a run trace and
-a terminal result. Nothing here mutates state or acknowledges work."""
+a terminal result. Delivery consumption belongs to the transport receipt."""
 from __future__ import annotations
 import asyncio
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import time
@@ -17,11 +18,6 @@ def agent_status(store,a):
     row=store.one("SELECT state FROM runs WHERE id=?",(a['current_run'],)) if a['current_run'] else store.latest_run(a['id'])
     return row['state'] if row else 'idle'
 
-def listed_agent(store,a,w=None):
-    result={k:a[k] for k in ('id','name','state')}
-    result['agent_status']=agent_status(store,a)
-    return result
-
 def brief_agent(a, w=None):
     result={k:a[k] for k in ('id','name','scope','cwd','state','generation','current_run','cleanup')}
     result.update(model_settings(a))
@@ -36,6 +32,7 @@ def brief_run(r):
     if r['error']: result['error']=r['error']
     return result
 
+
 def runs_for_ids(store, sid, ids):
     if not ids: return []
     store.scope(sid)
@@ -45,6 +42,32 @@ def runs_for_ids(store, sid, ids):
     by_id={r['id']:r for r in rows}
     if len(by_id)!=len(ids): raise AgentError('run_not_found','Run not found in this scope')
     return [by_id[rid] for rid in ids]
+
+def agent_run_ids(store, sid, targets):
+    ids=[]
+    for target in targets:
+        a=store.resolve_agent(sid,label(target,'agent_id'))
+        active=store.all("SELECT id FROM runs WHERE agent_id=? AND state NOT IN ('completed','failed','interrupted','crashed','cancelled','timed_out') ORDER BY created",(a['id'],))
+        if len(active)>1: raise AgentError('ambiguous_run','Agent has multiple active/queued tasks; use explicit run IDs')
+        r=active[0] if active else store.latest_run(a['id'])
+        if not r: raise AgentError('run_not_found','Agent has no task')
+        ids.append(r['id'])
+    return list(dict.fromkeys(ids))
+
+def input_issues(store, ids):
+    result={rid:{'receipts':[],'total':0,'omitted':0} for rid in ids}
+    if not ids: return result
+    marks=','.join('?' for _ in ids)
+    rows=store.all(f'''WITH issues AS (SELECT id,run_id,state,updated,
+        COUNT(*) OVER (PARTITION BY run_id) total,
+        ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY created DESC,id) position
+        FROM receipts WHERE run_id IN ({marks}) AND state IN ('sending','queued','unknown','not_consumed','failed'))
+        SELECT * FROM issues WHERE position<=5''',ids)
+    for row in rows:
+        item=result[row['run_id']]
+        item['receipts'].append({k:row[k] for k in ('id','state','updated')})
+        item.update(total=row['total'],omitted=max(0,row['total']-5))
+    return result
 
 def result_row(r, limit, offset=0):
     path=Path(r['result_path'])
@@ -63,18 +86,57 @@ def result_row(r, limit, offset=0):
     usage=json.loads(r['usage'])
     return {'run':brief_run(r),'text':content,'result_sha256':r['result_sha'],
             'next_offset':offset+used,'has_more':offset+used<size,'total_bytes':size,
-            'acknowledged':bool(r['ack']),'result_truncated':usage.get('result_truncated',False)}
+            'result_truncated':usage.get('result_truncated',False)}
 
 
 def wait_run_ids(store,p):
     sid=p['scope']
     ids=p.get('run_ids')
+    if 'agent_ids' in p:
+        if ids is not None: raise AgentError('invalid_argument','Choose agent_ids or run_ids, not both')
+        targets=p['agent_ids']
+        if not isinstance(targets,list) or len(targets)>100: raise AgentError('invalid_argument','agent_ids must be a list of at most 100 names/IDs')
+        ids=agent_run_ids(store,sid,targets)
     if ids is None:
-        ids=[r['id'] for r in store.all("SELECT id FROM runs WHERE scope=? AND ack=0 ORDER BY created LIMIT 100",(sid,))]
+        ids=[r['id'] for r in store.all("""SELECT r.id FROM runs r LEFT JOIN parent_notifications n
+            ON n.run_id=r.id AND n.kind='terminal' WHERE r.scope=?
+            AND (r.state NOT IN ('completed','failed','interrupted','crashed','cancelled','timed_out') OR COALESCE(n.handled,0)=0)
+            ORDER BY r.created LIMIT 100""",(sid,))]
     if not isinstance(ids,list) or len(ids)>100: raise AgentError('invalid_argument','run_ids must be a list of at most 100 ids')
     ids=list(dict.fromkeys(identifier(x,'run_id') for x in ids))
     runs_for_ids(store,sid,ids)
     return ids
+
+def run_page(store, worker_for, rows):
+    # Complete small results first; long results share the remaining UTF-8 budget.
+    budget=8192; pages={}; runs=[]; questions=[]
+    done=sorted((r for r in rows if r['state'] in TERMINAL),key=lambda r:Path(r['result_path']).stat().st_size)
+    issues=input_issues(store,[r['id'] for r in done])
+    for row in done:
+        page=result_row(row,budget)
+        pages[row['id']]={k:page[k] for k in ('text','result_sha256','next_offset','has_more','total_bytes','result_truncated')}
+        budget-=len(page['text'].encode())
+    for row in rows:
+        item=brief_run(row)
+        if row['state'] in TERMINAL:
+            item['result']=pages[row['id']]
+            if issues[row['id']]['total']: item['input_issues']=issues[row['id']]
+        if row['state']=='needs_input':
+            w=worker_for(row['agent_id'])
+            if w:
+                questions.extend({**q,'agent_id':row['agent_id'],'run_id':row['id'],'name':item['name']}
+                    for q in list(w.ui.values())[:4])
+        runs.append(item)
+    return {'runs':runs,'questions':questions}
+
+def delivered_events(op, response):
+    if op=='wait': runs=[r for r in response['runs'] if r.get('result')]
+    elif op=='result': runs=[response['run']]
+    else: return []  # Status/diagnostic views do not deliver a terminal result.
+    events=[(r['id'],'terminal',None) for r in runs if r.get('id') and r.get('state') in TERMINAL]
+    if op=='wait': events.extend((q['run_id'],'question',q['id']) for q in response['questions'])
+    return list(dict.fromkeys(events))
+
 
 class ReadViews:
     """Read and wait using explicit data sources; no task control or mutations."""
@@ -84,10 +146,36 @@ class ReadViews:
         self.changed = changed
         self.max_wait_seconds = max_wait_seconds
 
+    def list(self,p):
+        sid=p['scope']; limit=integer(p.get('limit',20),'limit',1,50)
+        offset=integer(p.get('offset',0),'offset',0,2**31-1)
+        order=p.get('sort','updated')
+        if order not in {'updated','created'}: raise AgentError('invalid_argument','sort must be updated or created')
+        selection='FROM agents a WHERE a.scope=?'; params=(sid,)
+        query=p.get('query','')
+        if query:
+            selection+=' AND (instr(lower(a.name),lower(?))>0 OR instr(lower(a.id),lower(?))>0)'
+            params+=(query,query)
+        total=self.store.one('SELECT COUNT(*) n FROM agents WHERE scope=?',(sid,))['n']
+        matched=self.store.one('SELECT COUNT(*) n '+selection,params)['n'] if query else total
+        rows=self.store.all("""SELECT a.id,a.name,a.state,a.created,a.updated,
+            COALESCE((SELECT state FROM runs WHERE id=a.current_run),
+                (SELECT state FROM runs WHERE agent_id=a.id AND state!='queued' ORDER BY created DESC LIMIT 1),'idle') agent_status
+            """+selection+f' ORDER BY a.{order} DESC,a.created DESC,a.id DESC LIMIT ? OFFSET ?',(*params,limit,offset))
+        agents=[]
+        for a in rows:
+            agents.append({**{k:a[k] for k in ('id','name','state','agent_status')},
+                **{k+'_at':datetime.fromtimestamp(a[k],timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z') for k in ('created','updated')}})
+        next_offset=offset+len(agents)
+        return {'scope':sid,'agents':agents,'total':total,'matched':matched,'omitted':max(0,matched-len(agents)),
+            'next_offset':next_offset,'has_more':next_offset<matched,
+            'outstanding':self.outstanding(sid,limit),'parent_notifications':parent.status(self.store,sid,compact=True)}
+
     def outstanding(self, sid, limit=20):
-        rows=self.store.all("""SELECT r.*, a.name FROM runs r JOIN agents a ON a.id=r.agent_id
-                             WHERE r.scope=? AND r.ack=0 ORDER BY r.created DESC LIMIT ?""",(sid,limit))
-        count=self.store.one("SELECT COUNT(*) n FROM runs WHERE scope=? AND ack=0",(sid,))['n']
+        selection="""FROM runs r LEFT JOIN parent_notifications n ON n.run_id=r.id AND n.kind='terminal'
+            WHERE r.scope=? AND (r.state NOT IN ('completed','failed','interrupted','crashed','cancelled','timed_out') OR COALESCE(n.handled,0)=0)"""
+        rows=self.store.all("SELECT r.*, (SELECT name FROM agents WHERE id=r.agent_id) name "+selection+" ORDER BY r.created DESC LIMIT ?",(sid,limit))
+        count=self.store.one("SELECT COUNT(*) n "+selection,(sid,))['n']
         return {'runs':[brief_run(r) for r in rows], 'total':count,'omitted':max(0,count-len(rows))}
 
     def inspect(self,p):
@@ -107,7 +195,7 @@ class ReadViews:
             result['run']={k:run[k] for k in ('id','state')}
             if detail=='full':
                 result['run'].update({k:run[k] for k in ('created','started','ended','idle_timeout_seconds')})
-                result['run'].update(artifact_path=run['result_path'],usage=json.loads(run['usage']),acknowledged=bool(run['ack']))
+                result['run'].update(artifact_path=run['result_path'],usage=json.loads(run['usage']))
         if detail=='full': result['parent_notifications']=parent.status(self.store,p['scope'])
         # Large diagnostic metadata must not consume the event page's budget.
         if len(dumps(result).encode())>budget:
@@ -148,11 +236,17 @@ class ReadViews:
         return result
 
     def result(self,p):
-        r=runs_for_ids(self.store,p['scope'],[identifier(p.get('run_id'),'run_id')])[0]
+        if ('run_id' in p)==('agent_id' in p): raise AgentError('invalid_argument','Choose exactly one of run_id or agent_id')
+        rid=identifier(p['run_id'],'run_id') if 'run_id' in p else agent_run_ids(self.store,p['scope'],[p['agent_id']])[0]
+        r=runs_for_ids(self.store,p['scope'],[rid])[0]
         if r['state'] not in TERMINAL: raise AgentError('not_terminal','Result is not ready; use wait')
         limit=integer(p.get('max_bytes',4096),'max_bytes',256,16384)
         offset=integer(p.get('offset',0),'offset',0,2**40)
-        return result_row(r,limit,offset)
+        if 'agent_id' in p and offset:
+            raise AgentError('invalid_offset','Continuation requires the returned run.id; an agent may have started a new task')
+        page=result_row(r,limit,offset); issues=input_issues(self.store,[rid])[rid]
+        if issues['total']: page['input_issues']=issues
+        return page
 
     async def wait(self,p):
         sid=p['scope']; limit=self.max_wait_seconds
@@ -169,23 +263,7 @@ class ReadViews:
                 failures=[r for r in done if r['state']!='completed']
                 ready=not ids or bool(attention) or (bool(done) if mode=='any' else len(done)==len(ids))
                 if ready or time.monotonic()>=until:
-                    # Share a fixed text budget across the page, never 100 full results.
-                    budget=8192; runs=[]; questions=[]
-                    for row in rows:
-                        item=brief_run(row)
-                        if row['state'] in TERMINAL and budget>=256:
-                            page=result_row(row,min(2048,budget))
-                            item['result']={k:page[k] for k in ('text','result_sha256','next_offset','has_more','total_bytes','result_truncated')}
-                            budget-=max(256,len(page['text'].encode()))
-                        elif row['state'] in TERMINAL:
-                            item['result']={'result_sha256':row['result_sha'],'next_offset':0,'has_more':True}
-                        if row['state']=='needs_input':
-                            worker=self.worker_for(row['agent_id'])
-                            if worker:
-                                questions.extend({**question,'agent_id':row['agent_id'],'run_id':row['id'],'name':item['name']}
-                                                 for question in list(worker.ui.values())[:4])
-                        runs.append(item)
                     reason='timeout' if not ready else 'needs_input' if attention else 'failed_or_stopped' if failures else 'completed' if done else 'empty' if not ids else 'timeout'
-                    return {'scope':sid,'timed_out':not ready,'reason':reason,'runs':runs,'questions':questions}
+                    return {'scope':sid,'timed_out':not ready,'reason':reason,**run_page(self.store,self.worker_for,rows)}
                 try: await asyncio.wait_for(self.changed.wait(),until-time.monotonic())
                 except asyncio.TimeoutError: pass

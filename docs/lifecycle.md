@@ -20,7 +20,7 @@ agent 状态包括 starting、running、needs_input、idle、stopping、dormant�
 
 主输入被 handled 且整条任务没有 assistant 结果时记为 failed，并继续排队的后继任务。SDK 异常同样产生明确终态。消息被接受不等于已经执行；正常完成不依赖 sleep、空闲轮询或 deadline。
 
-daemon 在 agent 锁内校验当前 Worker 身份、generation、run_id 和 stopping，终态幂等。迟到/重复完成不能结束另一个 run。结果包括该任务链的最后 assistant 文本和累计 usage，读取不确认结果，ack 必须绑定精确 SHA-256。
+daemon 在 agent 锁内校验当前 Worker 身份、generation、run_id 和 stopping，终态幂等。迟到/重复完成不能结束另一个 run。结果包括该任务链的最后 assistant 文本和累计 usage，wait / result 成功写出后自动消费通知，SHA-256 用于核对完整正文，结果文件继续保留。
 
 ## Spawn
 
@@ -28,7 +28,7 @@ daemon 在 agent 锁内校验当前 Worker 身份、generation、run_id 和 stop
 
 CLI spawn 未指定 scope 时按 cwd 自动打开 scope；其他 CLI 业务命令需要 --scope 或 PI_AGENTS_SCOPE。CLI scope open 不会改变现有 MCP 连接默认值。guard 启动插件自己的 SDK 入口，创建/恢复独立持久 Pi session。
 
-默认最多 4 个 resident agent，每个 scope 最多 16 个历史 agent。resident 上限满时自动 park 最久未活动的已结算 idle agent：无活动 run、无待答问题、generation 一致才入选，走核验过的 interrupt 路径并保留会话；cleanup 非 verified 时记为 orphaned 并尝试下一个候选，无可 park 候选才返回 capacity_exceeded。writer 独占同一或嵌套 cwd，跨 scope 检查；新 writer 可核验并卸载已结算、无问题的冲突 writer，活动或未核验的 writer 仍阻止准入。parent Codex 不受此锁约束。空闲 resident 默认 1800 秒后卸载；专用 idle 时间戳在结算或空闲消息写入时更新，读取和后台遥测不会续期，未 ACK 的持久结果不阻止卸载。
+默认最多 4 个 resident agent，每个 scope 最多 16 个历史 agent。resident 上限满时自动 park 最久未活动的已结算 idle agent：无活动 run、无待答问题、generation 一致才入选，走核验过的 interrupt 路径并保留会话；cleanup 非 verified 时记为 orphaned 并尝试下一个候选，无可 park 候选才返回 capacity_exceeded。writer 独占同一或嵌套 cwd，跨 scope 检查；新 writer 可核验并卸载已结算、无问题的冲突 writer，活动或未核验的 writer 仍阻止准入。parent Codex 不受此锁约束。空闲 resident 默认 1800 秒后卸载；专用 idle 时间戳在结算或空闲消息写入时更新，读取和后台遥测不会续期，未交付的持久结果不阻止卸载。
 
 ## Scope 与 worktree
 
@@ -44,7 +44,7 @@ subagent-pi scope open --cwd /absolute/path/to/project
 {"scope":"SCOPE_ID","cwd":"/absolute/path/to/project/.work/worktrees/fix-cache","name":"fix-cache","access":"write","task":"修复缓存失效；只修改相关模块及测试。完成后报告实际 diff 和验证，保留无关改动。","request_id":"fix-cache-1"}
 ```
 
-该 CLI 操作未绑定现有 MCP，所以后续 wait、message、result、ACK 也显式传原 scope；只有先通过管理 pi_context 绑定该 scope，或连接已经绑定它时，才可省略。仅传一个显式 scope 的 spawn 不会设置连接默认 scope。插件不创建或合并 worktree；父代理避免同时编辑子代理负责的文件。
+该 CLI 操作未绑定现有 MCP，所以后续 wait、message、result 也显式传原 scope；只有先通过管理 pi_context 绑定该 scope，或连接已经绑定它时，才可省略。仅传一个显式 scope 的 spawn 不会设置连接默认 scope。插件不创建或合并 worktree；父代理避免同时编辑子代理负责的文件。
 
 子代理读取原 scope 的 SUBAGENT-PI.md 和 Pi 全局上下文，不加载 child cwd/祖先的 AGENTS/CLAUDE。新建、唤醒和 respawn 重新读文件；驻留进程保留启动时快照。
 
@@ -91,7 +91,9 @@ SDK 不在 streaming、原生预处理尚未退出，或任务曾排入无法用
 
 ## Close 与 respawn
 
-普通 MCP discovery 只广告 10 个日常工具（含软 interrupt）；context、close、respawn、legacy send 保留为显式管理调用和 CLI 操作。close、容量/闲置卸载、静默超时和 shutdown 仍使用先 TERM 后 KILL 的核验清理。底层 legacy interrupt RPC 保留硬停止语义；CLI interrupt 映射到 soft_interrupt。`pi_send_input(interrupt=true, message=...)` 保留显式硬替换语义，只有 cleanup verified 后才启动新 generation。
+普通 MCP discovery 只广告 9 个日常工具（含软 interrupt）；context、close、respawn、legacy send 保留为显式管理调用和 CLI 操作。close、容量/闲置卸载、静默超时和 shutdown 仍使用先 TERM 后 KILL 的核验清理。底层 legacy interrupt RPC 保留硬停止语义；CLI interrupt 映射到 soft_interrupt。`pi_send_input(interrupt=true, message=...)` 保留显式硬替换语义，只有 cleanup verified 后才启动新 generation。
+
+Linux guard 作为 subreaper 回收 orphan 后代，包括 setsid 创建的独立进程组；正常 TERM 优先交给 guard，由它停止 Pi 并清理后代。owner.json 记录 descendants_cleanup=verified 才能作为后代退出证据。guard 被强杀或元数据丢失时保守返回 unknown，不凭空进程组允许恢复。
 
 respawn 是幂等的确保加载：worker 仍存活时不改变任何状态并返回当前 state（already_running；带 message 会替换活 writer，因此明确拒绝并指向 pi_send_input），需要启动时才要求旧 writer 已消失、退出结算已完成且会话存在；agent_id 不变、generation 增加。自然退出尚在结算时明确返回 worker_alive，不在内部自动重试。进程退出后最多等待 2 秒读取末尾事件；即使后代仍持有输出管道，旧 run 和队列也会结算，残留进程组的 cleanup 仍如实为 unknown。所有停止路径在允许换代前将旧队列取消；旧完成回调既不能改写新进程，也不能在死进程上推进队列。可附加新消息，不附加则恢复为 idle。CLI resume 是其别名。dormant/closed 且 cleanup verified 的 agent 可由日常 message/followup 或兼容 send/follow_up 唤醒（记录 auto_wake 事件，generation 增加）；orphaned、crashed、tainted 或 cleanup 未核验时不会自动唤醒；先诊断并按需 close 核验旧实例，再显式 respawn，清理未核验时仍会拒绝恢复。
 
@@ -101,7 +103,7 @@ respawn 是幂等的确保加载：worker 仍存活时不改变任何状态并�
 
 `pi_wait_agent` 用 daemon 的事件条件等待，不轮询进度。MCP 和 CLI 共用 `mode`：默认 `any` 在任一选中任务完成、失败、停止或需要输入时返回；显式 `all` 等本次选中的任务全部进入终态，失败、崩溃、取消或中断不会让它跳过仍在运行的任务。两种模式都在需要主 agent 回答问题时提前返回，避免问答互相等待；超时也会返回当前快照。返回的是当时选中任务的状态，以及所有已就绪结果的有界预览和问题；多个任务同时就绪时一并接收。
 
-并行协调时，每个 scope 保持一次默认 any wait，覆盖所有尚需处理的 run。返回后逐项读取、审核就绪结果并 ACK 精确 hash，再对剩余 run 等待；新后续任务产生的新 run ID 也加入后续集合。其他任务继续运行，无需为每个 agent 开一次 wait，也无需正常运行时轮询 list/inspect。未指定 run_ids 时选择当前 scope 最早的最多 100 个未 ACK run 并固定为本次快照；此前已读但未 ACK 的终态在 any 下仍会立即就绪，不动态订阅之后新建的 run，也不跨 scope 等待所有 agent。
+并行协调时，每个 scope 保持一次默认 any wait，覆盖所有尚需处理的 run。直接审核返回的完整结果；has_more 时补读，再等剩余 run。成功写出 wait / result 后自动标记该终态通知已交付，不再要求人工 ACK。省略 run_ids / agent_ids 时选择最早的最多 100 个活动或尚未交付 run，固定为本次快照，不动态订阅新任务。显式 run_ids 可重新读取已交付任务。agent_ids 接受名称或 ID，固定各 agent 当前或最近任务；存在多个活动/排队任务时返回 ambiguous_run，需改用明确 run_ids。两种选择不能同时传入。
 
 例如同时等待两个独立任务：
 
@@ -121,7 +123,7 @@ CLI 对应 `subagent-pi wait RUN_IDS... --scope ID --mode all`。all 的“全�
 
 `questions` 带 agent_id、run_id、问题 id、正文和选择项，供 `pi_answer_agent` 使用；模型可调用仅在受管子进程注册的 `ask_parent`，暂停工具执行直到显式回答。回答不会自动批准其他请求。标准安装使用 Codex 原生清单，为本插件设置 3630 秒 MCP 超时，覆盖一小时等待及传输余量；其他 MCP 客户端或手动使用通用清单时，仍需保证外层工具超时足够长。
 
-wait 的每个终态结果最多预读 2 KiB，整页文本共用 8 KiB 预算；`has_more` 时从 next_offset 调 result。读结果不 ack，仍需精确 hash 确认。result 仅返回 run 身份/状态/非空错误、正文、单个 result_sha256、分页、acknowledged 和截断标记；不回显 offset，不重复整数 ack。时间戳、用量和结果路径在 inspect(detail=full)，包括空闲 agent 的最近一次任务。list 的 outstanding 保留未确认任务身份、状态、total/omitted；不返回 revision。
+wait 整页结果正文共用 8 KiB UTF-8 预算，先完整提供小结果，再给较长结果分配剩余字节。has_more 时用返回的 run.id 和 next_offset 调 result；不能用 agent_id 翻后续页，以免后续任务替换结果。result 的 run_id / agent_id 必须二选一；返回任务身份、状态、非空错误、正文、单个 result_sha256、分页和截断标记。存在未确定消费或失败的输入时，wait / result 附带 input_issues：最多 5 条回执 ID/状态/更新时间，以及 total/omitted，不含消息正文。时间、用量和路径在 inspect(detail=full)。list 支持 query（名称/ID 的字面子串，ASCII 大小写不敏感）、sort=updated|created（默认 updated）、offset/next_offset/has_more；total 是 scope 历史总数，matched 是搜索命中数，outstanding 始终覆盖整个 scope，不受搜索影响。时间戳为 UTC ISO 8601。分页期间状态更新可能改变排序，适合恢复和定位，不是不可变快照。
 
 IPC 的连接、请求写入和响应读取共用调用预算；已写出结果后的交付回执最多等 1 秒，连接关闭最多再等 1 秒，不会因回执失败重复返回结果。daemon 响应写入和交付确认共用 10 秒预算。MCP stdout 非阻塞串行写入，单帧最多等 45 秒；半帧输出被取消或写失败时关闭该连接，避免后续 JSON 拼接损坏。上述传输失败不取消后台任务，不自动重发操作。
 
@@ -129,14 +131,14 @@ IPC 的连接、请求写入和响应读取共用调用预算；已写出结果�
 
 完成、失败、崩溃、取消、中断、超时或问题产生持久通知；插件调用 `codex queue --thread … --message …`，由原 Codex 进程读取队列。父会话已完成回合但仍加载时会自动开启后续回合；忙碌时等到空闲，跨进程检查通常约 10 秒。不会强制打断正在工作的父代理，也不会复活已经关闭或明确中断的父会话。通知只带任务定位和事件类型，明确标为自动子代理事件，不构成用户授权。
 
-同一父会话对指定 run 的 any wait 优先：等待期间暂缓对应通知。all 屏障在响应准备好前不接管单项完成通知，先完成的任务仍可通知父代理；准备交付响应时才接管对应通知并执行交接。入队不保证打断正在等待的父代理，因此日常逐批协调使用默认 any。发送任务实际启动前再次检查 wait/消费状态，防止使用调度时的旧快照。若事件先前已经入队，必须在写出 wait 结果前完成该回执的撤回（或确认已经离队）；发送尚未取得回执时也等待该交接。MCP/CLI 写出响应后通过 IPC 回执把该响应中的事件持久标为 observed，不再排队唤醒。取消、断连、写出失败或 10 秒内未收到交付回执时恢复尚未消费事件的通知资格；若旧入队项已成功撤回，可创建新的自动唤醒。observed 只证明适配器已写出响应，不代表模型已处理，也不等于结果 ack；另一父会话的读取不能抑制原父会话通知。问题和终态分别记录，收到问题不会隐藏后续完成。正常使用始终等待明确的剩余 run_ids；未指定时仍返回未 ack 的任务，包括此前已读的终态。
+同一父会话对指定 run 的 any wait 优先：等待期间暂缓对应通知。all 在响应准备好前允许部分完成通知，准备交付才接管。入队不保证打断阻塞调用，因此逐批协调使用 any。wait / result 成功写出后通过 IPC 回执把返回事件持久标为已交付；无须额外 ACK，也无需补读已有的完整正文。取消、断连、写出失败或 10 秒内未收到回执时，尚未消费的事件恢复通知资格。交付只证明适配器已写出响应，不代表主模型完成审核。另一父会话、无可信父身份的客户端不能消费已绑定父会话的通知；未绑定 scope 允许 CLI 成功输出时消费。list / inspect / interrupt 仅查看或操作状态，不消费结果关注。问题与终态分别记录，收到问题不会隐藏完成。
 
-queued 只是 Codex 入队回执。结果被精确 hash ack、同一父会话准备交付 wait 响应、或待答问题失效后，插件会用绑定的 CODEX_HOME 调用 Codex 现有的 `thread/queue/delete` 接口，只撤回该通知回执对应的消息 ID，不匹配内容、不清空队列，也不修改宿主代码或数据库。交付意图单独持久化；若此时还在发送，收到入队回执后继续撤回。wait 交接最多额外等 8 秒；未完成或失败时返回 notification_handoff_pending/notification_handoff_failed，不输出结果、不标为已消费。明确回执的撤回失败可再次 wait 重试，不确定的入队永不盲重发。仅读 result/list 不撤回通知。wait 交付不等于结果 ack。
+queued 只是 Codex 入队回执。原父会话准备交付 wait / result 响应，或问题失效时，用绑定的 CODEX_HOME 调用 thread/queue/delete，只撤回准确的 queued message ID。发送尚未取得回执时等待交接。交接最多额外等 8 秒；未完成或失败返回 notification_handoff_pending / notification_handoff_failed，不输出结果、不标为已消费。明确撤回失败可再次读取重试，不确定入队永不盲重发；list / inspect 不撤回通知。
 
-通知状态包括 pending/sending/observed/queued/failed/unknown/superseded，以及 recalling/recalled/delivered/recall_failed。recalled 表示宿主确认删除；delivered 表示消息已不在队列（可能已消费或被手动删除），不能擦除已显示的消息。撤回接口缺失、超时或返回无效数据时记录 recall_failed，迟到通知仍可能出现，应忽略已处理事件。ack 最多等待撤回 20 秒，仍未结束或失败时额外返回 `notification_recall=pending/failed`；结果确认本身保持有效，文件不删除。单次撤回最多 10 秒，另有有界子进程清理。
+通知状态包括 pending/sending/observed/queued/failed/unknown/superseded，以及 recalling/recalled/delivered/recall_failed。recalled 表示宿主确认删除；delivered 表示消息已不在队列，不能擦除已显示内容。撤回接口缺失、超时或无效返回记为 recall_failed，迟到通知仍可能出现，应忽略已处理事件。单次撤回最多 10 秒，另有有界子进程清理；结果文件始终保留。
 
-独立父会话最多四路投递，每个父会话串行；先处理待撤回通知，再处理待发问题和终态，单次发送最多 30 秒。未发送的问题若已回答、结果若已 ack，则标为 superseded。提交超时、异常退出或发送中的 daemon 重启记为 unknown，绝不盲重发；没有可信入队回执就无法安全撤回。重启只重试被中断的确切 ID 删除，并清理旧版本遗留的已 ack 排队通知；未消费的交接被中断后，旧项成功撤回才恢复自动唤醒，已消费事件不重发。无可信父身份时仍以 wait/list 收取结果。
+独立父会话最多四路投递，每个父会话串行；先处理待撤回通知，再处理问题和终态，发送最多 30 秒。已回答问题、已交付结果不再新建唤醒。提交超时、异常退出或发送中的 daemon 重启记为 unknown，不盲重发。重启只重试准确 ID 的删除；未消费交接被中断后，旧项成功撤回才恢复唤醒，已交付事件不重发。
 
 此机制要求 Codex 支持 queue，撤回另需 app-server 的 `thread/queue/delete`（均已用本地模拟模型验证）。使用绑定时的本地 CODEX_HOME；远程会话不在本机消息存储中时不能据此承诺唤醒。未修改 Pi/Codex 宿主，也不模拟键盘或重启用户会话。
 
-等待接口不再接受 timeout_ms / --timeout-ms。当前 IPC 协议为 v3；协议升级后需在旧任务清理完成时正常重启插件 daemon/MCP 连接，混用旧客户端或旧 daemon 会明确返回 version_mismatch，不自动停止用户进程。
+等待接口不接受 timeout_ms / --timeout-ms。0.6.0 IPC 为 v4、账本 schema 为 7，移除 pi_ack_result / CLI ack。先收取结果、关闭旧任务并停止旧 daemon，再同步客户端和安装缓存；混用旧客户端或 daemon 返回 version_mismatch，不自动停止用户进程。迁移将旧 ACK 状态转为通知交付状态，保留精确排队回执的撤回意图和结果文件。升级后不能直接用旧程序打开新账本。

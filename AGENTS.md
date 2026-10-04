@@ -6,7 +6,7 @@ Do not add hooks, automatic prompt injection, workflow engines or implicit model
 Keep SKILL.md <=35 lines; detailed guidance belongs in docs/.
 Never equate queued input with observed consumption, or idle Pi with verified process cleanup.
 Never replay an uncertain mutation automatically. Keep stable request and run identities.
-Read results without acknowledging; acknowledgement binds an exact result hash.
+Only successful wait/result transport delivery consumes attention; status reads do not. Keep results and exact hashes readable after delivery.
 New features need regression coverage at their real boundary (RPC, subprocess, IPC or packaging).
 Use the offline fake Pi for routine tests. Live model calls require explicit operator consent.
 Document limitations rather than silently weakening safety checks.

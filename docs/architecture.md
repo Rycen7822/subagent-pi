@@ -33,9 +33,9 @@ Python 3.11+ 与 Node 标准库，加载用户已安装的 Pi SDK，无额外模
 
 ## 数据结构
 
-scopes、agents、runs、requests、receipts、events 是独立表。执行终态不等于 ack。agent generation 用于过滤旧实例事件。操作 request_id 在 scope 内唯一，参数不同不能重用。
+scopes、agents、runs、requests、receipts、events 是独立表。执行终态不等于结果交付或任务验收。parent_notifications.handled 保存交付状态；wait / result 由传输回执确认，状态读取不消费。agent generation 用于过滤旧实例事件。操作 request_id 在 scope 内唯一，参数不同不能重用。
 
-账本 schema 版本由 `store.py` 的 `MIGRATIONS` 注册表按序号递进升级（当前 6）；比当前版本更新的数据库直接拒绝启动，不猜测、不降级。scopes.base_env 只保存非密级的基础环境键（PATH/HOME 等），使 worker 在 daemon 重启后仍能启动；其余绑定值只存在于内存。
+账本 schema 版本由 `store.py` 的 `MIGRATIONS` 注册表按序号递进升级（当前 7）；比当前版本更新的数据库直接拒绝启动，不猜测、不降级。scopes.base_env 只保存非密级的基础环境键（PATH/HOME 等），使 worker 在 daemon 重启后仍能启动；其余绑定值只存在于内存。
 
 正常完成、明确拒绝和合作式打断共用空闲结算，重置任务状态及驻留计时；排队启动被明确拒绝时继续检查后继任务，结果不确定时停止推进。最近任务、投递回执和通知使用 Store 的有界索引查询。历史 scopes.revision 列保留但不再写入或用于观察状态。
 
@@ -43,9 +43,9 @@ scopes、agents、runs、requests、receipts、events 是独立表。执行终�
 
 ## 服务端状态与主模型记忆
 
-账本不依赖主模型记住全部 agent。未确认任务通过 list/outstanding 可恢复，wait 返回有界结果与问题正文；默认 any 在首个终态或问题时返回，显式 all 等选中 run 全部终态，已有失败或停止不会跳过仍在运行的任务。两种模式都在提问或超时时返回。parent.py 将已绑定父会话的终态/问题投递到 Codex 官方消息队列；all 在响应准备好前仍允许部分完成通知，随后执行撤回与响应交接。通知账本与任务终态同事务持久化，等待输入事件同样去重记录。父会话继续由原 Codex 进程拥有，不创建 competing resume，也不修改宿主。
+账本不依赖主模型记住全部 agent。未交付任务通过 list/outstanding 可恢复，wait 返回有界结果与问题正文；默认 any 在首个终态或问题时返回，显式 all 等选中 run 全部终态，已有失败或停止不会跳过仍在运行的任务。两种模式都在提问或超时时返回。parent.py 将已绑定父会话的终态/问题投递到 Codex 官方消息队列；all 在响应准备好前仍允许部分完成通知，随后执行撤回与响应交接。通知账本与任务终态同事务持久化，等待输入事件同样去重记录。父会话继续由原 Codex 进程拥有，不创建 competing resume，也不修改宿主。
 
-工具 surface 是 10 个日常 MCP 工具，提供 V2 风格 message/followup/interrupt。管理工具不在 tools/list 广告，但显式调用及 CLI 保留。schema.py 同时提供 inputSchema/outputSchema；tools/call 的 structuredContent 与 text JSON 相同。list 分开提供 agent_status（最近任务）和 state（驻留状态）；有效 model/thinking 在 spawn/inspect，轨迹和清理细节在 inspect。输出只为可重试写操作声明 replayed 和可选 request_id（CLI 回显重试键，MCP 不回显）；读操作和嵌套摘要不声明重试字段。schema 不随 agent 列表变化。是否 deferred 取决于 Codex，不由 server 宣称。
+工具 surface 是 9 个日常 MCP 工具，提供 V2 风格 message/followup/interrupt。管理工具不在 tools/list 广告，但显式调用及 CLI 保留。schema.py 同时提供 inputSchema/outputSchema；tools/call 的 structuredContent 与 text JSON 相同。list 分开提供 agent_status（最近任务）和 state（驻留状态）；有效 model/thinking 在 spawn/inspect，轨迹和清理细节在 inspect。输出只为可重试写操作声明 replayed 和可选 request_id（CLI 回显重试键，MCP 不回显）；读操作和嵌套摘要不声明重试字段。schema 不随 agent 列表变化。是否 deferred 取决于 Codex，不由 server 宣称。
 
 ## 安全与限制
 
@@ -53,7 +53,7 @@ scopes、agents、runs、requests、receipts、events 是独立表。执行终�
 
 文件锁仅管理插件自己的 session。不会自动注入 Codex 沙箱、继承 approval policy 或替用户批准插件请求。审查结果不构成发布授权。
 
-进程组检查无法绝对证明主动 daemonize 的任意后代均已退出。原进程身份未知时保守阻止恢复，而不对一个猜测 PID 发信号。
+Linux guard 使用 subreaper 收养并清理脱离进程组的 orphan 工具后代；仅向内核确认的自身子进程发信号，并写入 descendants_cleanup 证据。guard 被强杀、owner 缺失或证据未知时，空进程组也不等于 verified；保守阻止恢复。它不是 OS 沙箱，不能约束非后代或其他用户进程。
 
 ## 有意不做
 

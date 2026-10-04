@@ -10,7 +10,7 @@ npm run setup
 npm run typecheck
 ```
 
-默认使用 fake 子进程验证 MCP/CLI → daemon → guard 的协议、任务身份、回执、持久化、进程清理、故障和恢复。Runtime 测试共享独立 fixture；schema 契约使用仅用于测试的 jsonschema 校验器，并通过真实 MCP/CLI 边界验证参数。Node 队列测试由 Python 套件调用，覆盖串行归属、异常退出、handled 输入和旧回调不能混入新任务。没有模型请求。多任务等待回归通过受控 gate 保持一个 run 活动，验证默认 any 在另一个正常完成时即返回、同批就绪结果全部可读且不会自动 ACK；另验证 MCP mode 默认值与合法参数、MCP/CLI all 屏障、失败或停止后仍等待其他任务、all 提问提前返回，以及部分完成通知与响应撤回交接。
+默认使用 fake 子进程验证 MCP/CLI → daemon → guard 的协议、任务身份、回执、持久化、进程清理、故障和恢复。Runtime 测试共享独立 fixture；schema 契约使用仅用于测试的 jsonschema 校验器，并通过真实 MCP/CLI 边界验证参数。Node 队列测试由 Python 套件调用，覆盖串行归属、异常退出、handled 输入和旧回调不能混入新任务。没有模型请求。多任务等待回归通过受控 gate 保持一个 run 活动，验证默认 any 在另一个正常完成时即返回、同批就绪结果全部可读，成功输出后自动消费通知；另验证 MCP mode 默认值与合法参数、MCP/CLI all 屏障、失败或停止后仍等待其他任务、all 提问提前返回，以及部分完成通知与响应撤回交接。
 
 资源回归使用隔离进程和真实 socket/stdio，覆盖 RPC/UI/IPC 背压与有界关闭、MCP 半帧取消、结果交付确认、Worker/锁回收和幂等记录保留。退出与替换并发用例验证旧任务完成清账、旧队列取消、迟到回调隔离和统一容量准入；后代保留管道时也要及时结算。Node 测试覆盖任务输入队列与输出通道的容量、进度合并、关键帧顺序和输出超时；真实 SDK 测试暂停自有 daemon 读取，验证大量工具进度后仍能提问、收取结果和执行后继任务，输入或关键输出过载则崩溃并取消队列。父通知与事件裁剪的积压测试检查有界扫描和跨短进程代际的保留上限。
 
@@ -44,7 +44,7 @@ GitHub CI 的 Python lane 跑默认离线套件；integration 固定最低支持
 
 ## 需要单独授权的验证
 
-真实模型请求可能计费，需要显式同意。离线 MCP 和 SDK 证明不等于已经安装到 Codex。安装后还需新建 Codex 会话确认代码、schema、skill/docs 版本一致，验证日常 spawn/message/followup/wait/result/ack/interrupt，以及实际使用的扩展组合；close/respawn 和 legacy steer/follow-up 另按管理路径验证。
+真实模型请求可能计费，需要显式同意。离线 MCP 和 SDK 证明不等于已经安装到 Codex。安装后还需新建 Codex 会话确认代码、schema、skill/docs 版本一致，验证日常 spawn/message/followup/wait/result/interrupt，以及实际使用的扩展组合；close/respawn 和 legacy steer/follow-up 另按管理路径验证。
 
 版本证据以 workflow 和具体测试日志为准，不推导未测试 Pi 版本或第三方扩展组合的兼容性。扩展自己创建的其他 SDK session、独立模型调用及脱离进程组的后代不受任务队列保证。
 

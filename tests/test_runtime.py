@@ -35,6 +35,101 @@ cwd = "servers/dir with space"
 '''
 
 class RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
+    async def test_history_search_and_paging_put_reused_agents_first(self):
+        older=await self.spawn('first',name='Review%Alpha'); await self.wait(older['run_id'])
+        newer=await self.spawn('second',name='review-beta'); await self.wait(newer['run_id'])
+        followup=await self.mutation('followup',older['agent_id'],message='third'); await self.wait(followup['run_id'])
+        async def listing(**extra):
+            return await self.rt.dispatch('list',{'scope':self.scope,'limit':1,**extra})
+        first=await listing()
+        self.assertEqual(first['agents'][0]['id'],older['agent_id'])
+        self.assertEqual(first['agents'][0]['agent_status'],'completed')
+        self.assertEqual((first['total'],first['matched'],first['omitted']),(2,2,1))
+        self.assertTrue(first['has_more'])
+        second=await listing(offset=first['next_offset'])
+        self.assertEqual(second['agents'][0]['id'],newer['agent_id']); self.assertFalse(second['has_more'])
+        self.assertLess(first['agents'][0]['created_at'],second['agents'][0]['created_at'])
+        self.assertGreater(first['agents'][0]['updated_at'],second['agents'][0]['updated_at'])
+        self.assertTrue(first['agents'][0]['updated_at'].endswith('Z'))
+        self.assertEqual((await listing(sort='created'))['agents'][0]['id'],newer['agent_id'])
+        for query in ('REVIEW%ALPHA','%',older['agent_id']):
+            found=await listing(query=query)
+            self.assertEqual([a['id'] for a in found['agents']],[older['agent_id']])
+            self.assertEqual((found['total'],found['matched'],found['omitted']),(2,1,0))
+            self.assertFalse(found['has_more'])
+            self.assertEqual(found['outstanding']['total'],3)
+        missing=await listing(query='absent')
+        self.assertEqual((missing['agents'],missing['total'],missing['matched'],missing['has_more']),([],2,0,False))
+        self.assertEqual(missing['outstanding']['runs'][0]['id'],followup['run_id'])
+        self.assertEqual(views.delivered_events('list',missing),[])
+        beyond=await listing(offset=20)
+        self.assertFalse(beyond['has_more']); self.assertEqual(beyond['agents'],[])
+
+    async def test_named_wait_freezes_task_and_result_preserves_byte_budget_and_input_issues(self):
+        a=await self.spawn('simple',name='review')
+        selection={'scope':self.scope,'agent_ids':['review']}
+        token=self.rt.parent_notifications.reserve_delivery('wait',selection,None)
+        foreign={'scope':self.scope,'agent_ids':['review']}
+        self.rt.store.execute('UPDATE scopes SET parent=? WHERE id=?',
+            (json.dumps({'thread_id':'owner','codex_home':'/owner'}),self.scope))
+        try:
+            self.assertIsNone(self.rt.parent_notifications.reserve_delivery('wait',foreign,None))
+        finally:
+            self.rt.store.execute('UPDATE scopes SET parent=NULL WHERE id=?',(self.scope,))
+        await self.wait(a['run_id'])
+        b=await self.mutation('followup','review',message='delay=120|next task')
+        frozen=await self.rt.dispatch('wait',{**selection,'timeout_seconds':0})
+        self.rt.parent_notifications.release_delivery(token,'wait')
+        self.assertEqual(frozen['runs'][0]['id'],a['run_id'])
+        self.assertEqual((await self.rt.dispatch('wait',{**foreign,'timeout_seconds':0}))['runs'][0]['id'],a['run_id'])
+        current=await self.rt.dispatch('wait',{'scope':self.scope,'agent_ids':['review'],'timeout_seconds':0})
+        self.assertEqual(current['runs'][0]['id'],b['run_id'])
+        queued=await self.mutation('send','review',message='queued task',mode='follow_up')
+        with self.assertRaises(AgentError) as ambiguous:
+            await self.rt.dispatch('wait',{'scope':self.scope,'agent_ids':['review'],'timeout_seconds':0})
+        self.assertEqual(ambiguous.exception.code,'ambiguous_run')
+        await self.mutation('interrupt','review')
+        self.assertEqual((await self.rt.dispatch('result',{'scope':self.scope,'agent_id':'review'}))['run']['id'],queued['run_id'])
+        # A small UTF-8 report must fit completely, even beside a much larger report.
+        owner=self.rt.store.agent(self.scope,a['agent_id'])
+        small=self.rt.add_run(owner,'small report'); large=self.rt.add_run(owner,'large report')
+        self.rt.store.finish(small,'completed','中'*1000); self.rt.store.finish(large,'completed','中'*5000)
+        for i in range(7):
+            self.rt.store.execute('INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?)',
+                (f'missed-{i}',a['agent_id'],small,self.scope,'private message','not_consumed',i,i))
+        page=await self.rt.dispatch('wait',{'scope':self.scope,'run_ids':[large,small],'timeout_seconds':0})
+        self.assertEqual(page['runs'][1]['result']['text'],'中'*1000)
+        self.assertFalse(page['runs'][1]['result']['has_more'])
+        self.assertLessEqual(sum(len(r['result']['text'].encode()) for r in page['runs']),8192)
+        self.assertTrue(page['runs'][0]['result']['has_more'])
+        issues=page['runs'][1]['input_issues']
+        self.assertEqual((issues['total'],len(issues['receipts']),issues['omitted']),(7,5,2))
+        self.assertEqual(issues['receipts'][0]['state'],'not_consumed')
+        self.assertNotIn('message',issues['receipts'][0])
+
+    async def test_killed_guard_cannot_claim_verified_cleanup(self):
+        s=await self.spawn('SPAWN_DETACHED_CHILD')
+        aid=s['agent_id']; w=self.rt.workers[aid]
+        events=await self.until(lambda:self.events(aid,'tool_execution_start'))
+        child=json.loads(events[0]['payload'])['args']['pid']
+        owner=json.loads((self.home/'agents'/aid/'owner.json').read_text())
+        identities={pid:process_identity(pid) for pid in (owner['pi_pid'],child)}
+        try:
+            os.kill(w.proc.pid,signal.SIGKILL)
+            await self.until(lambda:self.rt.store.run(self.scope,s['run_id'])['state']=='crashed',timeout=4)
+            self.assertEqual(self.rt.store.agent(self.scope,aid)['cleanup'],'unknown')
+            self.assertIsNotNone(process_identity(child))
+            (self.home/'agents'/aid/'owner.json').unlink()
+            with self.assertRaises(AgentError) as blocked:
+                await self.mutation('respawn',aid)
+            self.assertEqual(blocked.exception.code,'orphaned_worker')
+        finally:
+            for pid,identity in identities.items():
+                if process_identity(pid)==identity: os.kill(pid,signal.SIGKILL)
+            await self.until(lambda:all(process_identity(pid) is None for pid in identities))
+
+
+
     async def test_slash_prefixed_task_is_enveloped_before_it_reaches_pi(self):
         # A delegated task is data, never an extension command: text Pi would
         # parse as one is wrapped on the way in (spawn, respawn and send share
@@ -387,13 +482,12 @@ class RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(runs),2)
         terminal=[json.loads(e['payload']) for e in self.events(s['agent_id'],'run_terminal')]
         self.assertEqual([e['state'] for e in terminal],['completed','completed'])
-    async def test_spawn_wait_result_and_ack(self):
+    async def test_spawn_wait_result_is_repeatable(self):
         s=await self.spawn(); terminal=await self.wait(s['run_id'])
         self.assertFalse(terminal['timed_out']); self.assertEqual(terminal['runs'][0]['state'],'completed')
         r=await self.result(s['run_id']); self.assertEqual(r['text'],'Completed: simple')
-        self.assertFalse(r['acknowledged'])
-        await self.rt.dispatch('ack',{'scope':self.scope,'run_id':s['run_id'],'request_id':self.key(),'result_sha256':r['result_sha256']})
-        self.assertTrue((await self.result(s['run_id']))['acknowledged'])
+        self.assertEqual((await self.result(s['run_id']))['result_sha256'],r['result_sha256'])
+
     async def test_spawn_idempotency(self):
         p={'scope':self.scope,'request_id':'same','cwd':str(self.workspace),'task':'simple','access':'read'}
         a=await self.rt.dispatch('spawn',p); b=await self.rt.dispatch('spawn',p)
@@ -486,13 +580,12 @@ class RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
         await self.spawn('delay=2|writer',access='write')
         with self.assertRaises(AgentError) as cm: await self.spawn('writer2',access='write')
         self.assertEqual(cm.exception.code,'writer_conflict')
-    async def test_wrong_result_hash_rejected(self):
-        s=await self.spawn(); await self.wait(s['run_id'])
-        with self.assertRaises(AgentError): await self.rt.dispatch('ack',{'scope':self.scope,'run_id':s['run_id'],'request_id':self.key(),'result_sha256':'bad'})
-    async def test_result_read_does_not_ack(self):
+
+    async def test_internal_projection_does_not_consume_delivery(self):
         s=await self.spawn(); await self.wait(s['run_id']); await self.result(s['run_id'])
         listing=await self.rt.dispatch('list',{'scope':self.scope})
         self.assertEqual(listing['outstanding']['total'],1)
+
     async def test_result_utf8_pagination_and_hash(self):
         s=await self.spawn('BIG'); await self.wait(s['run_id'])
         cursor=0; chunks=[]
@@ -504,7 +597,7 @@ class RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
         body=''.join(chunks)
         self.assertEqual(hashlib.sha256(body.encode()).hexdigest(),r['result_sha256'])
         self.assertIn('\u2028',body)
-    async def test_wait_result_budget_and_pagination_preserve_exact_hash_without_ack(self):
+    async def test_wait_result_budget_and_pagination_preserve_exact_hash(self):
         agents=[]
         for _ in range(6):
             agent=await self.spawn('BIG'); agents.append(agent)
@@ -518,7 +611,7 @@ class RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
                 continuation=await self.result(run['id'],offset=offset)
                 text+=continuation['text']; more=continuation['has_more']; offset=continuation['next_offset']
             self.assertEqual(hashlib.sha256(text.encode()).hexdigest(),preview['result_sha256'])
-            self.assertFalse((await self.result(run['id']))['acknowledged'])
+
 
     async def test_wait_and_outstanding_use_bounded_scoped_reads(self):
         store=self.rt.store
@@ -582,8 +675,6 @@ class RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
             refs.append(weakref.ref(self.rt.workers[run['agent_id']]))
             await self.wait(run['run_id'])
             result=await self.result(run['run_id'])
-            await self.rt.dispatch('ack',{'scope':self.scope,'request_id':self.key(),'run_id':run['run_id'],
-                                          'result_sha256':result['result_sha256']})
             self.assertEqual((await self.mutation('close',run['agent_id']))['cleanup'],'verified')
             completed.append((params,run,result['result_sha256']))
         await self.until(lambda: not self.rt.workers,timeout=2)
@@ -598,6 +689,7 @@ class RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
         revived=await self.mutation('respawn',completed[0][1]['agent_id'],message='after retirement')
         await self.wait(revived['run_id'])
         self.assertEqual((await self.result(revived['run_id']))['text'],'Completed: after retirement')
+
 
     async def test_old_exit_cleanup_cannot_retire_a_replacement_worker(self):
         run=await self.spawn(); await self.wait(run['run_id'])
@@ -796,23 +888,22 @@ class RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
         r=await self.mutation('close',s['agent_id'])
         self.assertEqual(r['cleanup'],'verified'); self.assertEqual(group_members(pid),[])
     async def test_exited_guard_reconciles_even_if_descendant_keeps_pipes_open(self):
-        s=await self.spawn('SPAWN_CHILD')
-        aid=s['agent_id']; w=self.rt.workers[aid]; pgid=w.proc.pid
-        queued=await self.mutation('send',aid,mode='follow_up',message='MUST_NOT_RUN')
-        owner_file=self.home/'agents'/aid/'owner.json'
-        try:
-            await self.until(lambda: len(group_members(pgid))>=3)
-            owner=json.loads(owner_file.read_text())
-            os.kill(owner['pi_pid'],signal.SIGKILL)
-            await self.until(lambda: w.proc.returncode is not None)
-            await self.until(lambda: self.rt.store.run(self.scope,s['run_id'])['state']=='crashed',timeout=3)
-            self.assertEqual(self.rt.store.run(self.scope,queued['run_id'])['state'],'cancelled')
-            self.assertEqual(self.rt.store.agent(self.scope,aid)['cleanup'],'unknown')
-            await self.until(lambda: w.closed and all(t.done() for t in w.tasks),timeout=3)
-            self.assertNotIn(aid,self.rt.workers)
-        finally:
-            if group_members(pgid): os.killpg(pgid,signal.SIGKILL)
-            await asyncio.wait_for(w.tasks[2],5)
+        for task in ('SPAWN_CHILD','SPAWN_DETACHED_CHILD'):
+            with self.subTest(task=task):
+                s=await self.spawn(task)
+                aid=s['agent_id']; w=self.rt.workers[aid]; pgid=w.proc.pid
+                queued=await self.mutation('send',aid,mode='follow_up',message='MUST_NOT_RUN')
+                events=await self.until(lambda:self.events(aid,'tool_execution_start'))
+                child=json.loads(events[0]['payload'])['args']['pid']
+                owner=json.loads((self.home/'agents'/aid/'owner.json').read_text())
+                os.kill(owner['pi_pid'],signal.SIGKILL)
+                await self.until(lambda: self.rt.store.run(self.scope,s['run_id'])['state']=='crashed',timeout=3)
+                self.assertEqual(self.rt.store.run(self.scope,queued['run_id'])['state'],'cancelled')
+                self.assertEqual(self.rt.store.agent(self.scope,aid)['cleanup'],'verified')
+                self.assertIsNone(process_identity(child)); self.assertEqual(group_members(pgid),[])
+                await self.until(lambda: w.closed and all(t.done() for t in w.tasks),timeout=3)
+                self.assertNotIn(aid,self.rt.workers)
+
     async def test_needs_input_and_explicit_answer(self):
         s=await self.spawn('UI_CONFIRM'); r=await self.wait(s['run_id'])
         self.assertEqual(r['runs'][0]['state'],'needs_input')
@@ -961,7 +1052,16 @@ class RuntimeTests(RuntimeHarness, unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AgentError) as cm: await self.spawn()
         self.assertEqual(cm.exception.code,'pi_not_found')
     async def test_failed_worker_registration_only_stops_its_verified_guard(self):
-        with m.patch.object(self.rt,'make_worker',side_effect=RuntimeError('registration refused')):
+        start=worker.start_guard
+        async def ready_guard(directory,*args,**kwargs):
+            launched=await start(directory,*args,**kwargs)
+            owner=directory/'owner.json'
+            # The failure is after identity publication; a failure before this
+            # proof is now conservatively unknown, even with an empty group.
+            await self.until(lambda:owner.exists() and json.loads(owner.read_text()).get('pi_pid'))
+            return launched
+        with m.patch.object(worker,'start_guard',new=ready_guard), \
+             m.patch.object(self.rt,'make_worker',side_effect=RuntimeError('registration refused')):
             with self.assertRaisesRegex(RuntimeError,'registration refused'):
                 await self.spawn()
         agent=self.rt.store.one('SELECT * FROM agents WHERE scope=?',(self.scope,))
@@ -1152,12 +1252,12 @@ class RestartOwnershipVerdict(unittest.TestCase):
         finally:
             alive.kill(); alive.wait(); tmp.cleanup()
 
-    def test_dead_pid_without_owner_record_may_be_verified(self):
+    def test_dead_pid_without_owner_record_cannot_prove_detached_cleanup(self):
         tmp,home=seed_owner_row(pid=999999,identity='boot:gone')
         rt=Runtime(home)
         row=rt.store.one('SELECT * FROM agents WHERE id=?',('pi_seed',))
-        self.assertEqual(row['cleanup'],'verified')
-        tmp.cleanup()
+        self.assertEqual((row['state'],row['cleanup']),('orphaned','unknown'))
+        rt.store.close(); tmp.cleanup()
 
     def test_unreadable_owner_record_is_never_verified(self):
         tmp,home=seed_owner_row(pid=999999,identity='boot:gone')

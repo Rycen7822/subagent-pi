@@ -4,7 +4,7 @@
 
 让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、任务内消息和后续工作、检查工作轨迹、中断、卸载、恢复会话、收取结果。
 
-这是完整源码版 `0.5.0`，针对 **Linux / WSL2，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi ≥0.99.1 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
+这是完整源码版 `0.6.0`，针对 **Linux / WSL2，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi ≥0.99.1 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
 
 受管子进程使用原版 Pi 的公开 SDK，无需修改 Pi；版本证据和测试边界见 [测试指南](docs/testing.md)。主代理使用 V2 风格的消息、后续任务和软中断操作；中断通常保留进程，无法确认整个任务退出时核验并终止进程组。空闲进程默认 30 分钟后自动卸载，session 和结果保留。详见 [操作语义](docs/lifecycle.md)。
 
@@ -51,7 +51,7 @@ subagent-pi codex
 | 中断 / 卸载 | `pi_interrupt_agent` 取消任务并尽量保留进程；CLI close 显式清理进程组 |
 | 恢复 / respawn | 保留 agent ID，增加 generation，重新加载已持久化 Pi session |
 | 防重复执行 | scope + request_id + 参数摘要，持久保存已完成回执 |
-| 结果交接 | 读取不等于确认；按 run ID + SHA-256 显式确认 |
+| 结果交接 | wait / result 成功写出后自动消费通知；结果文件与 hash 保留供复核 |
 | MCP / CLI 互通 | 同一个 daemon、同一个 SQLite 账本 |
 | 父代理自动唤醒 | 完成、失败、停止、问题 → Codex 持久消息队列；list 返回启用/失败摘要，inspect(detail=full) 提供详情 |
 | 子代理询问父代理 | 模型 `ask_parent` 或扩展 UI 请求 → wait 返回问题 → `pi_answer_agent` 显式回答 |
@@ -64,7 +64,7 @@ subagent-pi codex
 
 > 使用 Subagent Pi，在当前项目创建一个只读子代理检查缓存失效逻辑。继续你的其他工作，必要时读取增量轨迹；完成后读取结果再确认收尾。
 
-日常 MCP 发现 10 个工具；context、close、respawn、legacy send 保留为显式管理调用和 CLI 操作。`pi_send_message` 活动时使用原生 steering，空闲时只写入 history；`pi_followup_task` 活动时加入同一 run，空闲时开始新 run。
+日常 MCP 发现 9 个工具；context、close、respawn、legacy send 保留为显式管理调用和 CLI 操作。`pi_send_message` 活动时使用原生 steering，空闲时只写入 history；`pi_followup_task` 活动时加入同一 run，空闲时开始新 run。
 
 CLI 对等示例：
 
@@ -78,8 +78,9 @@ subagent-pi inspect AGENT_ID --scope SCOPE_ID
 # 活动任务中接入消息；若已空闲，此操作只保存消息。
 subagent-pi send-message AGENT_ID --scope SCOPE_ID --message '优先检查索引刷新路径' --request-id cache-priority-1
 subagent-pi wait RUN_ID --scope SCOPE_ID --timeout-seconds 3600
-subagent-pi result RUN_ID --scope SCOPE_ID
-subagent-pi ack RUN_ID --scope SCOPE_ID --sha256 RESULT_SHA256 --request-id cache-ack-1
+# wait 正文完整时直接审核；需补读时可按名称取当前/最近任务。
+subagent-pi result --agent cache-review --scope SCOPE_ID
+subagent-pi list --scope SCOPE_ID --query cache --limit 10
 ```
 
 `AGENT_ID` 等是示意占位符，需替换为实际值；较大结果按 next_offset 分页。继续工作用 `followup-task`；取消当前任务用 `interrupt`；明确卸载用 `close`，闲置进程也会自动卸载。脚本调用可用 `subagent-pi call OP --json -` 从 stdin 传 JSON。重试复用相同 request_id 和参数。

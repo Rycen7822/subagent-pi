@@ -88,7 +88,8 @@ PREVIEW = output(
     },
     ["result_sha256", "next_offset", "has_more"],
 )
-WAIT_RUN = output({**RUN_FIELDS, "result": PREVIEW}, RUN["required"])
+INPUT_ISSUES = output({"receipts": ARR(MAP), "total": INT, "omitted": INT}, ["receipts", "total", "omitted"])
+WAIT_RUN = output({**RUN_FIELDS, "result": PREVIEW, "input_issues": INPUT_ISSUES}, RUN["required"])
 OUTSTANDING = output(
     {"runs": ARR(RUN), "total": INT, "omitted": INT}, ["runs", "total", "omitted"]
 )
@@ -162,6 +163,7 @@ OUTPUTS = {
             "previous_status": S,
             "runtime_retained": BOOL,
             "forced": BOOL,
+            "run_id": ID,
         },
         ["agent_id", "previous_status", "runtime_retained"],
         mutation=True,
@@ -189,16 +191,19 @@ OUTPUTS = {
             "scope": ID,
             "agents": ARR(
                 output(
-                    {"id": ID, "name": S, "state": S, "agent_status": S},
-                    ["id", "name", "state", "agent_status"],
+                    {"id": ID, "name": S, "state": S, "agent_status": S, "created_at": S, "updated_at": S},
+                    ["id", "name", "state", "agent_status", "created_at", "updated_at"],
                 )
             ),
             "total": INT,
+            "matched": INT,
             "omitted": INT,
+            "next_offset": INT,
+            "has_more": BOOL,
             "outstanding": OUTSTANDING,
             "parent_notifications": NOTIFICATIONS,
         },
-        ["scope", "agents", "total", "omitted", "outstanding", "parent_notifications"],
+        ["scope", "agents", "total", "matched", "omitted", "next_offset", "has_more", "outstanding", "parent_notifications"],
     ),
     "inspect": output(
         {
@@ -227,12 +232,12 @@ OUTPUTS = {
     "result": output(
         {
             "run": RUN,
+            "input_issues": INPUT_ISSUES,
             "text": S,
             "result_sha256": S,
             "next_offset": INT,
             "has_more": BOOL,
             "total_bytes": INT,
-            "acknowledged": BOOL,
             "result_truncated": BOOL,
         },
         [
@@ -242,14 +247,8 @@ OUTPUTS = {
             "next_offset",
             "has_more",
             "total_bytes",
-            "acknowledged",
             "result_truncated",
         ],
-    ),
-    "ack": output(
-        {"run_id": ID, "acknowledged": BOOL, "notification_recall": S},
-        ["run_id", "acknowledged"],
-        mutation=True,
     ),
     "answer": output(
         {"agent_id": ID, "sent": BOOL, "ui_request_id": S},
@@ -262,6 +261,7 @@ OUTPUTS["interrupt"] = output(
     ["agent_id", "state", "cleanup", "process_retained"],
     mutation=True,
 )
+
 TOOLS = [
     tool(
         "pi_spawn_agent",
@@ -306,11 +306,13 @@ TOOLS = [
     tool(
         "pi_wait_agent",
         "wait",
-        "Wait for selected runs. Default any returns on the first completion, failure, stop or question. Optional all waits for every run to reach a terminal state; questions still return early. Returns all ready bounded previews and hashes without acknowledgement. Settles earlier parent notifications before output. Cancelling the wait does not stop agents.",
+        "Wait for selected tasks: any returns on the first terminal state/question; all waits for every terminal state, with questions/timeouts returning early. Returns ready results; successful delivery consumes their notifications. Cancelling wait does not stop agents. Completed is not task acceptance.",
         {
             **SCOPE,
             "run_ids": {"type": "array", "items": ID, "maxItems": 100,
-                        "description": "Selected run IDs; omit for up to 100 currently unacknowledged runs in the bound scope."},
+                        "description": "Selected run IDs; omit for up to 100 active or not-yet-delivered runs in the bound scope."},
+            "agent_ids": {"type": "array", "items": LABEL, "maxItems": 100,
+                          "description": "Agent names/IDs instead of run_ids. Locks each current or latest task at call entry; multiple queued tasks require explicit run_ids."},
             "mode": {"type": "string", "enum": ["any", "all"], "default": "any"},
             "timeout_seconds": {
                 "type": "integer",
@@ -326,10 +328,13 @@ TOOLS = [
     tool(
         "pi_list_agents",
         "list",
-        "List agent identities, task/residency states and unacknowledged runs. Notification details: inspect with detail=full.",
+        "Search retained agent history by name/ID. Page with next_offset, keeping query/sort unchanged. total counts history; matched counts matches. Outstanding remains scope-wide; listing does not consume result attention. Notification details: inspect detail=full.",
         {
             **SCOPE,
             "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "query": {**S, "maxLength": LABEL_MAX_CHARS, "description": "Literal name/ID substring; ASCII case-insensitive. Omit to list all history."},
+            "sort": {**S, "enum": ["updated", "created"], "default": "updated"},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 2**31-1, "default": 0},
         },
         [],
         True,
@@ -337,7 +342,7 @@ TOOLS = [
     tool(
         "pi_inspect_agent",
         "inspect",
-        "Read bounded events and input receipts; pass next_cursor as after. full adds current/latest run diagnostics and notification details.",
+        "Read bounded events and input receipts; pass next_cursor as after. full adds current/latest run diagnostics and notification details. Status reads preserve result attention.",
         {
             **AGENT,
             "after": {"type": "integer", "minimum": 0},
@@ -351,22 +356,16 @@ TOOLS = [
     tool(
         "pi_agent_result",
         "result",
-        "Read UTF-8 byte pages of a terminal result without acknowledgement. Keep result_sha256 for ACK; paginate with next_offset.",
+        "Read a terminal result by agent name/ID or explicit run ID; choose exactly one. Paginate long results with next_offset and the returned run.id. Complete wait results need no extra read. Delivery consumes its notification automatically; results remain available for re-reading.",
         {
             **SCOPE,
             "run_id": ID,
+            "agent_id": LABEL,
             "offset": {"type": "integer", "minimum": 0},
             "max_bytes": {"type": "integer", "minimum": 256, "maximum": 16384},
         },
-        ["run_id"],
+        [],
         True,
-    ),
-    tool(
-        "pi_ack_result",
-        "ack",
-        "Acknowledge the exact result hash after incorporating or dismissing it. notification_recall reports pending/failed notification cleanup. Files remain.",
-        {**SCOPE, **REQ, "run_id": ID, "result_sha256": S},
-        ["request_id", "run_id", "result_sha256"],
     ),
     tool(
         "pi_answer_agent",
@@ -402,6 +401,7 @@ TOOLS = [
         ["agent_id", "request_id"],
     ),
 ]
+
 
 # Explicit recovery/legacy calls stay callable without discovery.
 MANAGEMENT = [

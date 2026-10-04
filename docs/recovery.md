@@ -23,7 +23,7 @@ subagent-pi followup-task AGENT_ID --scope SCOPE_ID \
   --message '继续检查索引刷新路径；先核实已完成的工作。' --request-id continue-index-1
 ```
 
-pi_followup_task / followup-task 在空闲时唤醒并启动新 run，活动时加入当前 run；pi_send_message / send-message 在空闲时只写入 history，不启动模型。正常软中断后通常仍是 idle；若已卸载则按上述路径恢复。未 ACK 的旧结果继续保留；读取并处理后按其精确 hash 确认。模型/推理深度沿用该 agent 已解析的选择。
+pi_followup_task / followup-task 在空闲时唤醒并启动新 run，活动时加入当前 run；pi_send_message / send-message 在空闲时只写入 history，不启动模型。正常软中断后通常仍是 idle；若已卸载则按上述路径恢复。旧结果继续保留；原父会话成功读取后自动消费通知，仍可按 run ID 和 hash 复核正文。模型/推理深度沿用该 agent 已解析的选择。
 
 ## 幂等和不确定结果
 
@@ -37,7 +37,7 @@ pi_followup_task / followup-task 在空闲时唤醒并启动新 run，活动时�
 
 新 daemon 不能重新附着旧匿名 stdin/stdout。它检查 owner.json、guard/Pi PID、Linux boot ID 与启动 tick。运行中 run 标为 crashed，queued run 标为 cancelled；这不是断言旧进程已经停止。
 
-owner.json 缺失时不视为"没有进程"：guard 可能在被 daemon 杀死前尚未写入该记录。只有当账本中记录的前导进程可证明已死、且其进程组无存活成员时，agent 才标为 dormant/verified；否则一律按 orphaned/unknown 保守处理，需先 close 验证身份。这与 close 的判据一致——同一行不会出现"重启说已清理、close 说无法证明"的分歧。
+owner.json 缺失时，已启动过的 worker 一律按 orphaned/unknown 处理：死 PID 和空进程组无法排除 detached 工具后代。只有未启动过的行，或有效 owner 记录证明领导进程、进程组和后代清理完成，才允许 verified。正常 guard 使用 Linux subreaper 接收并回收 orphan 后代，记录 descendants_cleanup；guard 被强杀或该证据未知时拒绝自动恢复。重启、close 和 respawn 共用这一判据。
 
 旧进程仍可确认活动时 agent 标为 orphaned。先用 close 验证身份并清理其进程组，再 respawn。没有活动旧进程且 session 可用时可以直接恢复。无法证明所有者状态时拒绝猜测。
 
@@ -62,6 +62,6 @@ subagent-pi respawn AGENT_ID --scope SCOPE_ID --message '先检查之前的修�
 
 ## 未处理结果
 
-结果先 fsync 写入，再用 SQLite 事务保存 terminal 状态和结果 hash。结果读取不会 ack。父会话中断后，未确认结果仍在 outstanding 集合。
+结果先 fsync 写入，再用 SQLite 事务保存 terminal 状态和结果 hash。wait / result 成功输出后自动消费该终态关注；输出失败、取消或无交付回执时继续保留在 outstanding。list / inspect 不消费关注。已经交付的结果文件仍可按 run ID 重新读取。
 
 极端故障中，artifact 已写但事务未提交可能留下孤立文件；它不会被当作正常完成的证据。原始 Pi session 可能包含更多部分信息。不要把恢复时的空结果解释为子代理从未产生副作用。

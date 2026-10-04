@@ -547,8 +547,12 @@ class Runtime:
                 w.run_id=None
             self.cancel_queued(a['id'],'Worker exited; queued task was not automatically retried')
             if a['state'] not in {'closed','dormant'}:
+                verdict=ownership(self.home/'agents'/a['id'],a)
+                proof=verdict['record'] or {}
+                verified=(verdict['status']=='gone' and proof.get('guard_pid')==w.proc.pid
+                    and proof.get('generation')==w.generation and proof.get('descendants_cleanup')=='verified')
                 self.store.agent_update(a['id'],state='crashed',current_run=None,
-                    cleanup='unknown' if group_members(w.proc.pid) else 'verified')
+                    cleanup='verified' if verified else 'unknown')
             self.notify()
 
     async def interrupt(self,a,terminal='interrupted',reason='Explicit interruption; filesystem effects may be partial'):
@@ -588,9 +592,9 @@ class Runtime:
             if stopped['cleanup']!='verified':
                 self.store.agent_update(a['id'],state='orphaned')
                 raise AgentError('cleanup_unconfirmed','Interrupt fallback could not verify process cleanup')
-            return {'agent_id':a['id'],'previous_status':previous,'runtime_retained':False,'forced':True}
+            return {'agent_id':a['id'],'previous_status':previous,'runtime_retained':False,'forced':True,'run_id':rid}
         self.finish_idle_run(w, 'interrupted', 'Explicit task interruption; filesystem effects may be partial')
-        return {'agent_id':a['id'],'previous_status':previous,'runtime_retained':True}
+        return {'agent_id':a['id'],'previous_status':previous,'runtime_retained':True,'run_id':rid}
 
     async def dispatch(self,op,p,source=None):
         if op=='ping': return {'version':__version__,'protocol':PROTOCOL_VERSION,'pid':os.getpid()}
@@ -626,7 +630,7 @@ class Runtime:
             return report
         sid=identifier(p.get('scope'),'scope'); scope=self.store.scope(sid)
         if op=='spawn' and 'cwd' not in p: p={**p,'cwd':scope['cwd']}
-        if op in {'spawn','send','message','followup','interrupt','soft_interrupt','close','respawn','ack','answer'}:
+        if op in {'spawn','send','message','followup','interrupt','soft_interrupt','close','respawn','answer'}:
             parent.bind(self.store,sid,source,allow_new=False)
             key=identifier(p.get('request_id'),'request_id')
             async with self.request_locks[(sid,key)]:
@@ -639,11 +643,7 @@ class Runtime:
                     self.store.request_end(sid,key,{'error':e.as_dict()}); raise
                 self.store.request_end(sid,key,result)  # other exceptions leave an uncertain record, never a silent replay
                 return result
-        if op=='list':
-            limit=integer(p.get('limit',20),'limit',1,50)
-            rows=self.store.all('SELECT * FROM agents WHERE scope=? ORDER BY created DESC LIMIT ?',(sid,limit))
-            total=self.store.one('SELECT COUNT(*) n FROM agents WHERE scope=?',(sid,))['n']
-            return {'scope':sid,'agents':[views.listed_agent(self.store,a,self.workers.get(a['id'])) for a in rows],'total':total,'omitted':max(0,total-len(rows)), 'outstanding':self.views.outstanding(sid,limit),'parent_notifications':parent.status(self.store,sid,compact=True)}
+        if op=='list': return self.views.list(p)
         if op=='inspect': return self.views.inspect(p)
         if op=='result': return self.views.result(p)
         if op=='wait': return await self.views.wait(p)
@@ -652,8 +652,6 @@ class Runtime:
     async def mutate(self, op, p):
         if op == 'spawn':
             return await self.spawn_agent(p)
-        if op == 'ack':
-            return await self.ack_result(p)
         aid = self.store.resolve_agent(p['scope'], label(p.get('agent_id'), 'agent_id'))['id']
         async with self.agent_locks[aid]:
             a = self.store.agent(p['scope'], aid)
@@ -711,15 +709,6 @@ class Runtime:
                     raise AgentError(e.code,e.message,agent_id=aid,run_id=rid)
             return {'agent_id':aid,'name':name,'run_id':rid,'scope':sid,'state':self.store.run(sid,rid)['state'],'cwd':cwd,
                     **views.model_settings(self.store.agent(sid,aid))}
-
-    async def ack_result(self, p):
-        sid = p['scope']
-        r=self.store.run(sid,identifier(p.get('run_id'),'run_id'))
-        if r['state'] not in TERMINAL: raise AgentError('not_terminal','Cannot acknowledge an active run')
-        if p.get('result_sha256')!=r['result_sha']: raise AgentError('result_version_mismatch','Read and acknowledge the exact result hash')
-        self.store.execute('UPDATE runs SET ack=1 WHERE id=?',(r['id'],))
-        recalled=await self.parent_notifications.acknowledge(sid,r['id'])
-        return {'run_id':r['id'],'acknowledged':True,**({'notification_recall':recalled} if recalled!='complete' else {})}
 
     async def close_agent(self, a, p):
         aid, sid = a['id'], a['scope']

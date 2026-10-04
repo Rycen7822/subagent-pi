@@ -112,8 +112,8 @@ codex plugin remove subagent-pi@subagent-pi-local
 codex plugin add subagent-pi@subagent-pi-local
 ```
 
-最后开启新会话。`subagent-pi --version` 和 `subagent-pi schemas` 只证明当前 CLI 的版本；还应检查新会话发现 `pi_send_message`、`pi_followup_task`、`pi_interrupt_agent` 等日常工具，并使用对应的 skill。运行中的连接和已载入 skill 不会因源码、marketplace 文件或 git 提交变化而刷新。
+最后开启新会话。`subagent-pi --version` 和 `subagent-pi schemas` 只证明当前 CLI 的版本；0.6.0 应发现 9 个工具且不含 pi_ack_result；还应检查新会话发现 `pi_send_message`、`pi_followup_task`、`pi_interrupt_agent` 等日常工具，并使用对应的 skill。运行中的连接和已载入 skill 不会因源码、marketplace 文件或 git 提交变化而刷新。
 
-升级保留状态目录，旧安装备份在 `plugins/subagent-pi.previous`。支持的历史账本会自动按迁移注册表升级；比当前程序更新的数据库拒绝打开，不自动降级或删除。IPC 版本不匹配时需先正常结束旧任务，再更新客户端与 daemon。
+升级保留状态目录，旧安装备份在 `plugins/subagent-pi.previous`。支持的历史账本会自动按迁移注册表升级；比当前程序更新的数据库拒绝打开，不自动降级或删除。0.6.0 使用 IPC v4 / schema 7，移除手工 ACK，并把旧 ACK 和通知交付状态迁移为统一关注状态，保留结果及排队撤回意图。IPC 版本不匹配时需先正常结束旧任务，再更新客户端与 daemon；旧版本不能打开升级后的账本。
 
-移除时先停止 daemon，再卸载 Codex 插件并按需移除安装目录及 CLI 链接。状态目录独立保留，可能含未确认结果和重要 session。
+移除时先停止 daemon，再卸载 Codex 插件并按需移除安装目录及 CLI 链接。状态目录独立保留，可能含未交付结果和重要 session。
