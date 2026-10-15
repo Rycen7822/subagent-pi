@@ -1,5 +1,7 @@
 # Subagent Pi — Codex 插件
 
+![Subagent Pi](assets/subagent-pi.gif)
+
 **MCP + 极薄 Skill + CLI + 一个持久化运行时。无 hooks。**
 
 让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、任务内消息和后续工作、检查工作轨迹、中断、卸载、恢复会话、收取结果。
