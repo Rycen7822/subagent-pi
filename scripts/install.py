@@ -71,7 +71,25 @@ def install(args):
         ps=bin_dir/'subagent-pi.ps1'
         if ps.exists() and not args.force: raise RuntimeError(f'{ps} already exists; use --force to replace it')
         quote=lambda value: "'"+str(value).replace("'","''")+"'"
-        ps.write_text('& '+quote(Path(sys.executable).resolve())+' '+quote(entry)+' @args\nexit $LASTEXITCODE\n',encoding='utf-8-sig')
+        # ProcessStartInfo bypasses Windows PowerShell's lossy native-argument
+        # binder. Quote each argument using the Windows CRT rules, including "".
+        ps.write_text('\n'.join([
+            '$start = New-Object System.Diagnostics.ProcessStartInfo',
+            '$start.FileName = '+quote(Path(sys.executable).resolve()),
+            '$start.Arguments = (@('+quote(entry)+') + $args | ForEach-Object {',
+            r'''    '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' ''',
+            "}) -join ' '",
+            # -File parses quotes differently from native programs. A .cmd
+            # invocation already carries a native command line: preserve it.
+            r'''if ([Environment]::CommandLine -match '(?s) -File "[^"\r\n]+subagent-pi\.ps1"(.*)$') {''',
+            '    $start.Arguments = '+quote('"'+entry+'" ')+' + $Matches[1]',
+            '}',
+            '$start.UseShellExecute = $false',
+            "$start.EnvironmentVariables['PYTHONUTF8'] = '1'",
+            '$child = [System.Diagnostics.Process]::Start($start)',
+            '$child.WaitForExit()',
+            'exit $child.ExitCode', ''
+        ]),encoding='utf-8-sig')
         link.write_text('@echo off\npowershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0subagent-pi.ps1" %*\n',encoding='ascii')
     else:
         link=bin_dir/'subagent-pi'

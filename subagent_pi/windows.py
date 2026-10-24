@@ -490,33 +490,39 @@ def _open_job(pid):
     raise JobUnavailable(f"Cannot open managed child job: {error}")
 
 
-def job_members(pid):
-    """Members of the job named for this guard PID.
+class Job:
+    """Hold one Job incarnation, even after its guard exits or its PID is reused."""
+    def __init__(self, pid):
+        self.handle = _open_job(pid)
 
-    [] means the job does not exist, so no member can have survived. A job that
-    exists but cannot be read raises instead of being reported as empty.
-    """
-    handle = _open_job(pid)
-    if handle is None:
-        return []
-    try:
-        return _members(handle)
-    finally:
-        kernel32.CloseHandle(handle)
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle is not None:
+            kernel32.CloseHandle(self.handle)
+
+    def members(self):
+        return [] if self.handle is None else _members(self.handle)
+
+    def terminate(self, exit_code):
+        if self.handle is None:
+            return False
+        if not kernel32.TerminateJobObject(self.handle, int(exit_code) & 0xFFFFFFFF):
+            raise JobUnavailable(f"Cannot terminate managed child job: {_last_error()}")
+        return True
+
+
+def job_members(pid):
+    """An absent Job is empty; an unreadable one raises."""
+    with Job(pid) as job:
+        return job.members()
 
 
 def terminate_job(pid, exit_code):
     """Terminate every member of a job whose owner identity the caller proved."""
-    handle = _open_job(pid)
-    if handle is None:
-        return False
-    try:
-        if not kernel32.TerminateJobObject(handle, int(exit_code) & 0xFFFFFFFF):
-            error = _last_error()
-            raise JobUnavailable(f"Cannot terminate managed child job: {error}")
-        return True
-    finally:
-        kernel32.CloseHandle(handle)
+    with Job(pid) as job:
+        return job.terminate(exit_code)
 
 
 # --- Local IPC pipe -----------------------------------------------------------

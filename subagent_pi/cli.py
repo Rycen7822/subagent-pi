@@ -5,9 +5,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 from . import __version__
-from .common import AgentError, DELIVERY_OPS, dumps, new_id, state_home
+from .common import AgentError, DELIVERY_OPS, IS_WINDOWS, dumps, new_id, state_home
 from .client import call_timeout, request
 
 DOC_ROOT=Path(__file__).resolve().parent.parent/'docs'
@@ -149,6 +150,8 @@ async def execute(args):
         print('Pi scope: '+opened['scope'],file=sys.stderr)
         from .executables import argv
         command=argv(exe,*rest)
+        if IS_WINDOWS:
+            raise SystemExit(subprocess.run(command,env=env).returncode)
         os.execvpe(command[0],command,env)
     data=vars(args).copy()
     for k in ('command','home'): data.pop(k,None)

@@ -22,7 +22,7 @@ ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.client import request
 from subagent_pi import PROTOCOL_VERSION, ipc
-from subagent_pi.common import AgentError, TERMINAL, group_members, socket_path
+from subagent_pi.common import AgentError, TERMINAL, group_members, socket_path, process_identity, live_identity
 
 class McpHarness:
     """MCP stdio boundary over a real daemon, shared by the fake-Pi IPC tests and
@@ -41,28 +41,27 @@ class McpHarness:
             try: await asyncio.wait_for(self.mcp.wait(),3)
             except asyncio.TimeoutError: self.mcp.kill(); await self.mcp.wait()
         if self.stderr_task: await asyncio.gather(self.stderr_task,return_exceptions=True)
-        daemon=None
-        if sys.platform=='win32':
-            from subagent_pi.common import process_identity,live_identity
-            with contextlib.suppress(AgentError):
-                pid=(await request(self.home,'ping',{},autostart=False))['pid']
-                daemon=(pid,process_identity(pid))
-        with contextlib.suppress(AgentError): await request(self.home,'shutdown',{'force':True},autostart=False)
-        if daemon:
-            until=asyncio.get_running_loop().time()+45
-            while live_identity(*daemon) is not False and asyncio.get_running_loop().time()<until: await asyncio.sleep(.05)
-            if live_identity(*daemon) is not False:
-                self.tmp._finalizer.detach()
-                self.fail('Owned daemon did not finish shutdown; retained '+str(self.home))
-        until=asyncio.get_running_loop().time()+8
-        while ipc.exists(self.home) and asyncio.get_running_loop().time()<until: await asyncio.sleep(.05)
-        if ipc.exists(self.home): self.fail('Daemon did not finish shutdown')
+        await self.stop_daemon()
         for attempt in range(40):
             try:
                 self.tmp.cleanup(); break
             except PermissionError:
                 if attempt==39: raise
                 await asyncio.sleep(.05)
+    async def stop_daemon(self):
+        try: pid=(await request(self.home,'ping',{},autostart=False))['pid']
+        except AgentError as exc:
+            if exc.code=='daemon_unavailable': return
+            raise
+        identity=process_identity(pid)
+        await request(self.home,'shutdown',{'force':True},autostart=False)
+        until=asyncio.get_running_loop().time()+45
+        while live_identity(pid,identity) is not False and asyncio.get_running_loop().time()<until:
+            await asyncio.sleep(.05)
+        if live_identity(pid,identity) is not False:
+            self.tmp._finalizer.detach()
+            self.fail('Owned daemon did not finish shutdown; retained '+str(self.home))
+        self.assertFalse(ipc.exists(self.home),'Daemon left its IPC endpoint behind')
     async def open_scope(self):
         return (await request(self.home,'scope_open',{'cwd':str(self.workspace)}))['scope']
     async def spawn(self,sid,task='delay=0.2|transport'):
@@ -542,9 +541,7 @@ class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         sid=await self.open_scope(); a=await self.spawn(sid)
         await request(self.home,'wait',{'scope':sid,'run_ids':[a['run_id']],'timeout_seconds':4})
         first=await request(self.home,'result',{'scope':sid,'run_id':a['run_id']})
-        await request(self.home,'shutdown',{'force':True})
-        until=asyncio.get_running_loop().time()+8
-        while ipc.exists(self.home) and asyncio.get_running_loop().time()<until: await asyncio.sleep(.05)
+        await self.stop_daemon()
         second=await request(self.home,'result',{'scope':sid,'run_id':a['run_id']})
         self.assertEqual(first['result_sha256'],second['result_sha256'])
         listing=await request(self.home,'list',{'scope':sid})
@@ -760,7 +757,7 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
             return json.loads(lines[-1].split(' ',2)[2])
 
         first=await start('context-first')
-        self.assertEqual(first['cwd'],str(other))
+        self.assertEqual(Path(first['cwd']),other.resolve())
         first_wire=latest_wire(first)
         initial=first_wire['forced']
         self.assertIn('GLOBAL_PI_CONTEXT_MARKER',initial,first_wire)

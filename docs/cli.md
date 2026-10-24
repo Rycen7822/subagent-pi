@@ -1,6 +1,6 @@
 # CLI reference
 
-Windows PowerShell 中使用安装器生成的 `subagent-pi.cmd`（或 `.ps1`），其余命令与参数相同；cwd 使用 Windows 绝对路径。详见 [原生安装](getting-started.md#windows-原生安装)。
+Windows PowerShell 中优先使用安装器生成的 `subagent-pi.ps1`，cmd.exe 中使用 `subagent-pi.cmd`；cwd 使用 Windows 绝对路径。Windows PowerShell 5 调用 `.cmd` 时自身会改变内嵌引号，JSON 参数可通过 `.ps1` 或 `call --json -` 从 stdin 传入。详见 [原生安装](getting-started.md#windows-原生安装)。
 
 业务命令 stdout 为单个 JSON 值；`--version` 和帮助输出例外。诊断写 stderr，错误退出码 2，用户中断 130。MCP 模式 stdout 为 JSON-RPC。CLI 与 MCP 共用 Runtime、schema 和账本。
 

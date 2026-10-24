@@ -185,21 +185,11 @@ else:
         run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'done','access':'read'})
         rows=await self.settled_notifications(sid,1)
         self.assertEqual(rows[0]['state'],'unknown'); self.assertIn('not retried',rows[0]['error'])
-        await request(self.home,'shutdown',{'force':True})
-        from subagent_pi.common import socket_path
-        until=asyncio.get_running_loop().time()+5
-        while ipc.exists(self.home) and asyncio.get_running_loop().time()<until: await asyncio.sleep(.02)
+        await self.stop_daemon()
         (self.codex_home/'reject').unlink()
         await self.tool('pi_list_agents',{'scope':sid})  # restarts daemon
         rows=await self.settled_notifications(sid,1)
         self.assertEqual(rows[0]['state'],'unknown'); self.assertEqual(len(self.queued()),1)
-
-    async def stop_daemon(self):
-        await request(self.home,'shutdown',{'force':True})
-        from subagent_pi.common import socket_path
-        until=asyncio.get_running_loop().time()+5
-        while ipc.exists(self.home) and asyncio.get_running_loop().time()<until: await asyncio.sleep(.02)
-        self.assertFalse(ipc.exists(self.home),'Old daemon did not finish shutdown')
 
     async def restart_daemon(self):
         await self.stop_daemon()
@@ -465,18 +455,23 @@ else:
         await self.wait_notice_state(sid,'delivered')
         self.assertEqual(len(self.queued()),1);self.assertEqual(len(self.recalls()),1)
 
-    async def test_active_parent_wait_delivers_once_and_preserves_rereads(self):
+    async def test_parent_wait_delivers_once_and_preserves_rereads(self):
         sid=await self.open_parent()
         run=await self.parent_tool('pi_spawn_agent',{'request_id':'finish','task':'delay=0.3|done','access':'read'})
         result=await self.parent_tool('pi_wait_agent',{'run_ids':[run['run_id']]})
         self.assertEqual(result['reason'],'completed')
         rows=await self.settled_notifications(sid,1)
-        self.assertEqual(rows[0]['state'],'observed'); self.assertEqual(self.queued(),[])
+        self.assertEqual(rows[0]['state'],'observed')
+        # Completion may precede admission of the wait on a busy runner. Its
+        # earlier wakeup must then be recalled before result delivery succeeds.
+        queued=self.queued()
+        self.assertLessEqual(len(queued),1)
+        self.assertEqual(self.recalls(),[{'threadId':self.parent,'queuedSubmissionId':n['id']} for n in queued])
         await self.restart_daemon()
         again=await self.parent_tool('pi_wait_agent',{'scope':sid,'run_ids':[run['run_id']],'timeout_seconds':0})
         self.assertEqual(again['runs'][0]['result']['result_sha256'],result['runs'][0]['result']['result_sha256'])
         self.assertEqual((await self.parent_tool('pi_agent_result',{'scope':sid,'run_id':run['run_id']}))['result_sha256'],result['runs'][0]['result']['result_sha256'])
-        self.assertEqual(self.queued(),[])
+        self.assertEqual(self.queued(),queued)
 
     async def test_question_receipt_does_not_hide_later_completion(self):
         sid=await self.open_parent()

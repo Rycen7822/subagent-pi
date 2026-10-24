@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from runtime_harness import RuntimeHarness
 from test_transport import ROOT
@@ -16,6 +17,32 @@ from subagent_pi import worker
 
 @unittest.skipUnless(IS_WINDOWS,'native Windows OS boundaries')
 class WindowsRuntime(RuntimeHarness,unittest.IsolatedAsyncioTestCase):
+
+    async def test_unset_scope_environment_does_not_inherit_daemon_settings(self):
+        with mock.patch.dict(os.environ,{'PI_CODING_AGENT_DIR':str(self.root/'daemon-only')}):
+            a=await self.spawn()
+        state=await self.rt.workers[a['agent_id']].rpc('get_state')
+        self.assertNotIn('PI_CODING_AGENT_DIR',state['env_probe'])
+
+    async def test_termination_keeps_one_job_handle_after_guard_exit(self):
+        from subagent_pi import windows
+        job=mock.MagicMock()
+        job.__enter__.return_value=job
+        job.members.side_effect=[[123],[]]
+        with mock.patch.object(windows,'Job',return_value=job) as opened, \
+             mock.patch.object(worker,'live_identity',side_effect=[True,False]):
+            self.assertEqual(await worker.stop_group(123,identity='original'),'verified')
+        opened.assert_called_once_with(123)
+        job.terminate.assert_called_with(1)
+        job.__exit__.assert_called_once()
+
+        job.members.side_effect=None
+        job.members.return_value=[456]  # A replacement guard's Job is untouched.
+        job.terminate.reset_mock()
+        with mock.patch.object(windows,'Job',return_value=job), \
+             mock.patch.object(worker,'live_identity',return_value=False):
+            self.assertEqual(await worker.stop_group(123,identity='original'),'unknown')
+        job.terminate.assert_not_called()
 
     async def test_close_reaps_detached_tool_descendant(self):
         a=await self.spawn('SPAWN_DETACHED_CHILD')
@@ -78,7 +105,10 @@ class WindowsExecutables(unittest.TestCase):
             shim=root/'tool.cmd'
             shim.write_text('@echo off\nnode "%dp0%\\cli.cjs" %*\n',encoding='ascii')
             args=['a & echo unsafe','%PATH%','quote"inside','中文 space','$(echo unsafe)']
-            result=subprocess.run(argv(str(shim),*args),capture_output=True,text=True,encoding='utf-8')
-            self.assertEqual(result.returncode,0,result.stderr)
-            self.assertEqual(json.loads(result.stdout),args)
+            with mock.patch.dict(os.environ,{'PATH':str(root)+os.pathsep+os.environ['PATH']}):
+                for command in (str(shim),'tool.cmd','tool'):
+                    with self.subTest(command=command):
+                        result=subprocess.run(argv(command,*args),capture_output=True,text=True,encoding='utf-8')
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        self.assertEqual(json.loads(result.stdout),args)
 

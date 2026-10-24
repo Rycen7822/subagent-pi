@@ -13,7 +13,7 @@ import sys
 import time
 
 from .common import (MAX_FRAME, AgentError, atomic_json, bounded, crop, dumps, group_members,
-    live_identity, new_id, now, private_dir, process_identity, read_frame, IS_WINDOWS, python_executable, BASE_ENV_KEYS)
+    live_identity, new_id, now, private_dir, process_identity, read_frame, IS_WINDOWS, python_executable)
 from . import locks
 if IS_WINDOWS:
     from . import windows
@@ -329,7 +329,7 @@ async def start_guard(directory, spec, guard_env, body, before_spawn):
         channel=await BootstrapChannel.open() if body is not None else None
         try:
             if channel: guard_env={**guard_env,'PI_AGENTS_BOOTSTRAP_PIPE':channel.name}
-            guard_env={**{k:os.environ[k] for k in BASE_ENV_KEYS if k in os.environ},**guard_env}
+            guard_env={**{k:os.environ[k] for k in ('SYSTEMROOT','WINDIR') if k in os.environ},**guard_env}
             before_spawn()
             proc=await asyncio.create_subprocess_exec(python_executable(),str(Path(__file__).with_name('worker_guard.py')),
                 str(directory/'launch.json'),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,
@@ -514,20 +514,24 @@ async def stop_group(pgid, graceful_guard=False, identity=None):
     explicit interruption terminates the Job, including detached descendants.
     """
     if IS_WINDOWS:
-        # The job is the only mechanism that covers detached descendants. A guard
-        # that has not created its job yet must not be mistaken for a settled one,
-        # so an absent job is only "gone" once the guard itself is dead.
+        # Open before checking identity, then retain that exact Job throughout
+        # termination. A later lookup by PID could resolve a replacement guard.
         until = time.monotonic() + 8.0
-        while time.monotonic() < until:
-            current = await asyncio.to_thread(members, pgid)
-            if current is None:
-                return "unknown"  # unreadable job: not proof of anything
-            gone = await asyncio.to_thread(live_identity, pgid, identity) is False
-            if current == [] and gone:
-                return "verified"
-            with contextlib.suppress(windows.JobUnavailable):
-                windows.terminate_job(pgid, 1)
-            await asyncio.sleep(0.05)
+        try:
+            while time.monotonic() < until:
+                with windows.Job(pgid) as job:
+                    match = await asyncio.to_thread(live_identity, pgid, identity)
+                    if match is not True:
+                        return "verified" if match is False and job.members() == [] else "unknown"
+                    if job.handle is not None:
+                        while time.monotonic() < until:
+                            job.terminate(1)
+                            if job.members() == [] and live_identity(pgid, identity) is False:
+                                return "verified"
+                            await asyncio.sleep(0.05)
+                await asyncio.sleep(0.05)  # Guard has not created its Job yet.
+        except (windows.JobUnavailable, OSError):
+            return "unknown"
         return "unknown"
     for sig, wait in ((signal.SIGTERM, 1.5), (signal.SIGKILL, 1.0)):
         if await asyncio.to_thread(members, pgid) == []:

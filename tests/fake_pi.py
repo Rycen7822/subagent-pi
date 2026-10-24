@@ -19,6 +19,10 @@ import shutil
 import subprocess
 import sys
 
+# Pi's RPC and session formats are UTF-8 regardless of the Windows code page.
+sys.stdin.reconfigure(encoding='utf-8')
+sys.stdout.reconfigure(encoding='utf-8')
+
 p=argparse.ArgumentParser(add_help=False)
 p.add_argument('--hold-eof',action='store_true'); p.add_argument('--session'); p.add_argument('--session-dir'); p.add_argument('--mode')
 p.add_argument('--skill',action='append'); p.add_argument('--extension',action='append'); p.add_argument('--exclude-tools'); p.add_argument('--no-extensions',action='store_true'); p.add_argument('--no-skills',action='store_true'); p.add_argument('--no-context-files',action='store_true')
@@ -130,8 +134,8 @@ def emit(e):
 def msg(role,body,**extra):
     m={'role':role,'content':[{'type':'text','text':body}],**extra}
     path.parent.mkdir(parents=True,exist_ok=True)
-    if not path.exists(): path.write_text(json.dumps({'type':'session','id':'fake-session','version':3})+'\n')
-    with path.open('a') as f: f.write(json.dumps({'type':'message','message':m},ensure_ascii=False)+'\n')
+    if not path.exists(): path.write_text(json.dumps({'type':'session','id':'fake-session','version':3})+'\n',encoding='utf-8')
+    with path.open('a',encoding='utf-8') as f: f.write(json.dumps({'type':'message','message':m},ensure_ascii=False)+'\n')
     emit({'type':'message_end','message':m})
 
 def response(r,success=True,data=None,error=None):
@@ -202,7 +206,7 @@ async def run(raw_task, rid):
             while queue: msg('user',queue.pop(0))
         else: queue.clear()
         if opts.get('after_tool'): await asyncio.sleep(float(opts['after_tool']))
-        output=Path(a.reply_file).read_text() if a.reply_file else ('汉字🙂\u2028\u2029'*3000) if task=='BIG' else 'Completed: '+task
+        output=Path(a.reply_file).read_text(encoding='utf-8') if a.reply_file else ('汉字🙂\u2028\u2029'*3000) if task=='BIG' else 'Completed: '+task
     if compact:
         # Pi compacts by itself: overflow ends the run with willRetry, the
         # transcript is replaced, then the retried run continues.

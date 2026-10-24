@@ -7,6 +7,8 @@ from .common import IS_WINDOWS, AgentError
 
 
 def argv(command, *args):
+    if IS_WINDOWS:
+        command=shutil.which(str(command)) or command
     if not IS_WINDOWS or Path(command).suffix.lower() not in ('.cmd','.bat'):
         return [str(command),*args]
     path=Path(command)

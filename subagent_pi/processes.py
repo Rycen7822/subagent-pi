@@ -28,10 +28,11 @@ async def finish(proc):
     if IS_WINDOWS:
         from . import windows
         # The old PID may already have been reused after a short queue client
-        # exited. The held subprocess handle still permits killing our guard,
-        # but never open a named Job for a different process incarnation.
-        if live_identity(proc.pid,proc._subagent_identity) is True:
-            with contextlib.suppress(windows.JobUnavailable): windows.terminate_job(proc.pid,1)
+        # exited. Open the Job before the identity check so termination retains
+        # that object rather than resolving the PID again after verification.
+        with contextlib.suppress(windows.JobUnavailable), windows.Job(proc.pid) as job:
+            if live_identity(proc.pid,proc._subagent_identity) is True:
+                job.terminate(1)
     elif group_members(proc.pid):
         import os
         with contextlib.suppress(ProcessLookupError): os.killpg(proc.pid,signal.SIGKILL)
