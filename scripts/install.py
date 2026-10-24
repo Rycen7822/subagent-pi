@@ -2,7 +2,6 @@
 """Install a self-contained local Codex marketplace. Never edits Pi config or registers hooks."""
 from __future__ import annotations
 import argparse
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -15,11 +14,12 @@ SOURCE=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(SOURCE))
 sys.path.insert(0,str(SOURCE/'scripts'))
 from ship_manifest import ship_files
-from subagent_pi import __version__
+from subagent_pi import __version__, locks
+from subagent_pi.common import IS_WINDOWS, AgentError
 from subagent_pi.common import atomic_json, atomic_write, state_home
 
 def install(args):
-    if not sys.platform.startswith('linux'): raise RuntimeError('Version 0.1 supports Linux/WSL2. Run this script inside WSL.')
+    if not (sys.platform.startswith('linux') or IS_WINDOWS): raise RuntimeError('Linux/WSL2 or Windows is required')
     if sys.version_info<(3,11): raise RuntimeError('Python 3.11 or newer is required')
     destination=args.dest.expanduser().resolve()
     if destination==SOURCE or destination.is_relative_to(SOURCE):
@@ -31,8 +31,7 @@ def install(args):
         lock=home/'daemon.lock'
         if lock.exists():
             with lock.open('r+') as f:
-                try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
-                except BlockingIOError: raise RuntimeError('Daemon is running. Close agents and run subagent-pi daemon stop before upgrading.')
+                if not locks.try_lock(f.fileno()): raise RuntimeError('Daemon is running. Close agents and run subagent-pi daemon stop before upgrading.')
     destination.mkdir(parents=True,exist_ok=True)
     (destination/'plugins').mkdir(exist_ok=True)
     stage=Path(tempfile.mkdtemp(prefix='.subagent-pi-stage-',dir=destination))
@@ -45,11 +44,12 @@ def install(args):
         entry=str(plugin/'bin/subagent-pi')
         # Portable commands must stay inside the plugin; pin Python in the launcher.
         launcher=stage/'payload/bin/subagent-pi'
-        launcher.write_text('#!'+str(Path(sys.executable).resolve())+'\n'+launcher.read_text().split('\n',1)[1])
+        launcher.write_text('#!'+str(Path(sys.executable).resolve())+'\n'+launcher.read_text().split('\n',1)[1],encoding='utf-8')
         from subagent_pi.common import MAX_WAIT_SECONDS
         server={'command':str(Path(sys.executable).resolve()),'args':[entry,'mcp'],'env':{'PI_AGENTS_HOME':str(home)},
                 'env_vars':['XDG_RUNTIME_DIR','CODEX_HOME'],'tool_timeout_sec':MAX_WAIT_SECONDS + 30}
-        portable={'$schema':'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json','mcpServers':{'subagent-pi':{'type':'stdio','command':'./bin/subagent-pi','args':['mcp'],'env':server['env']}}}
+        if IS_WINDOWS: server['env']['PYTHONUTF8']='1'
+        portable={'$schema':'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json','mcpServers':{'subagent-pi':{'type':'stdio','command':server['command'] if IS_WINDOWS else './bin/subagent-pi','args':server['args'] if IS_WINDOWS else ['mcp'],'env':server['env']}}}
         atomic_json(stage/'payload/mcp.json',portable)
         atomic_json(stage/'payload/.mcp.json',{'mcpServers':{'subagent-pi':server}})
         # Codex prefers the portable manifest, whose MCP schema has no timeout.
@@ -65,12 +65,21 @@ def install(args):
         os.chmod(plugin/'bin/subagent-pi',0o755)
     finally: shutil.rmtree(stage,ignore_errors=True)
     bin_dir=args.bin_dir.expanduser().resolve(); bin_dir.mkdir(parents=True,exist_ok=True)
-    link=bin_dir/'subagent-pi'
-    if link.exists() or link.is_symlink():
-        same=link.is_symlink() and link.resolve()==(plugin/'bin/subagent-pi').resolve()
-        if not same and not args.force: raise RuntimeError(f'{link} already exists. Refusing to replace it without --force.')
-        link.unlink()
-    link.symlink_to(plugin/'bin/subagent-pi')
+    if IS_WINDOWS:
+        link=bin_dir/'subagent-pi.cmd'
+        if link.exists() and not args.force: raise RuntimeError(f'{link} already exists; use --force to replace it')
+        ps=bin_dir/'subagent-pi.ps1'
+        if ps.exists() and not args.force: raise RuntimeError(f'{ps} already exists; use --force to replace it')
+        quote=lambda value: "'"+str(value).replace("'","''")+"'"
+        ps.write_text('& '+quote(Path(sys.executable).resolve())+' '+quote(entry)+' @args\nexit $LASTEXITCODE\n',encoding='utf-8-sig')
+        link.write_text('@echo off\npowershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0subagent-pi.ps1" %*\n',encoding='ascii')
+    else:
+        link=bin_dir/'subagent-pi'
+        if link.exists() or link.is_symlink():
+            same=link.is_symlink() and link.resolve()==(plugin/'bin/subagent-pi').resolve()
+            if not same and not args.force: raise RuntimeError(f'{link} already exists. Refusing to replace it without --force.')
+            link.unlink()
+        link.symlink_to(plugin/'bin/subagent-pi')
     market=destination/'.agents/plugins/marketplace.json'
     atomic_json(market,{'name':'subagent-pi-local','interface':{'displayName':'Subagent Pi Local'},'plugins':[
         {'name':'subagent-pi','source':{'source':'local','path':'./plugins/subagent-pi'},
@@ -89,12 +98,13 @@ def install(args):
     if args.register:
         codex=shutil.which('codex')
         if not codex: raise RuntimeError('Files are installed, but codex was not found. Register the marketplace later.')
-        subprocess.run([codex,'plugin','marketplace','add',str(destination)],check=True)
+        from subagent_pi.executables import argv
+        subprocess.run(argv(codex,'plugin','marketplace','add',str(destination)),check=True)
     else:
         import shlex
-        print('Register with: codex plugin marketplace add '+shlex.quote(str(destination)))
+        print('Register with: codex plugin marketplace add '+(quote(destination) if IS_WINDOWS else shlex.quote(str(destination))))
     print('Next: open /plugins in Codex, install Subagent Pi from Subagent Pi Local, then start a new session.')
-    print('Add your bin directory to PATH if needed: export PATH="'+str(bin_dir)+':$PATH"')
+    print('Add your bin directory to PATH: '+str(bin_dir))
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -105,6 +115,6 @@ def main():
     p.add_argument('--register',action='store_true',help='Also call codex plugin marketplace add')
     p.add_argument('--force',action='store_true',help='Explicitly replace an existing installation; refuses a live daemon')
     try: install(p.parse_args())
-    except (OSError,RuntimeError,subprocess.CalledProcessError) as e:
+    except (OSError,RuntimeError,AgentError,subprocess.CalledProcessError) as e:
         print('Install error: '+str(e),file=sys.stderr); sys.exit(1)
 if __name__=='__main__': main()

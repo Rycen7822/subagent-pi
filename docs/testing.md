@@ -40,7 +40,7 @@ sha256sum -c FILES.sha256
 
 重复打包必须得到相同 manifest/ZIP。包包含 SDK transport 和队列，不含 `.work`、node_modules 或宿主补丁。开发声明从当前 Pi 安装 stage，重复 setup 不得破坏符号链接目标。
 
-GitHub CI 的 Python lane 跑默认离线套件；integration 固定最低支持版本 Pi 0.99.1、Node 22.19.0，执行类型检查、完整 live 离线套件和打包检查。
+GitHub CI 的 Windows lane 在 Pi 0.99.1 / 1.4.0 上跑原生 subprocess、Named Pipe、Job 清理、打包、V2、父通知及离线 SDK 生命周期检查；SIGSTOP 故障注入留在 Linux lane。Python lane 跑默认离线套件；integration 固定最低支持版本 Pi 0.99.1、Node 22.19.0，执行类型检查、完整 live 离线套件和打包检查。
 
 ## 需要单独授权的验证
 
@@ -51,3 +51,11 @@ GitHub CI 的 Python lane 跑默认离线套件；integration 固定最低支持
 父代理唤醒集成：`SUBAGENT_PI_LIVE_CODEX=1 PYTHONPATH=tests python3 -m unittest test_parent_live`。真实 Codex 与 Pi SDK 使用隔离 HOME 和本地 mock 模型，验证父会话完成后由问题/完成通知重新开启同一会话；不使用真实认证或模型端点。
 
 长等待集成：`SUBAGENT_PI_LIVE_CODEX_WAIT=1 PYTHONPATH=tests python3 -m unittest test_wait_live`。隔离安装原生插件，由真实 Codex app-server 直接调用 MCP，等待 fake Pi 310 秒后完成；验证跨越宿主默认 300 秒限制及省略参数时的 IPC 预算，无模型调用。日常 MCP 回归则用一小时上限验证短任务/延后提问即时返回及取消等待不杀子代理。
+
+## Windows 原生验证
+
+PowerShell 使用 `python` 和 Windows npm Pi；`$env:SUBAGENT_PI_LIVE_PI='1'` 启用离线 SDK 测试，`$env:PYTHONPATH='tests'` 后运行 `python -m unittest test_windows test_package.ShipManifest test_v2 test_parent.ParentNotifications test_transport.LivePiLifecycleTests -v`。可用 `SUBAGENT_PI_LIVE_PI_BIN` 选择一份隔离 npm 安装的 pi.cmd。这些测试不请求真实模型。
+
+Windows 长期回归保护 npm 参数原样传递、MCP→Named Pipe→daemon、软中断与恢复、Job 后代清理、实际 builtin read/Bash 执行，以及私有 bootstrap/receipt 和 required stdio MCP 生命周期。中文/空格路径安装、完整多轮演练及打包后 Codex 加载属于临时验收，脚本与记录放在 `.work/`，不进入永久套件。SQLite 检查连接必须显式关闭；daemon shutdown 回应后还要等待实际进程退出再删除目录。
+
+本次开发在 Windows x64 / Python 3.12.10 / Node 24.19.0 上执行 Pi 0.99.1 和 1.4.0 的原生检查，并以隔离 Codex app-server 和本地 mock 模型验证父通知、撤回和结果交付。GitHub CI 是否通过以提交后的 workflow 为准。

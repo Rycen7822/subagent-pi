@@ -166,7 +166,10 @@ async def run(raw_task, rid):
         while not Path(opts['gate']).exists(): await asyncio.sleep(.01)
     if task=='CRASH': os._exit(9)
     if task in {'SPAWN_CHILD','SPAWN_DETACHED_CHILD'}:
-        proc=subprocess.Popen(['sleep','120'],start_new_session=task=='SPAWN_DETACHED_CHILD')
+        detached=task=='SPAWN_DETACHED_CHILD'
+        flags=(subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if sys.platform=='win32' and detached else 0
+        proc=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'],
+                              start_new_session=sys.platform!='win32' and detached,creationflags=flags)
         emit({'type':'tool_execution_start','toolName':'bash','toolCallId':'sleep','args':{'command':'sleep 120','pid':proc.pid}})
         await asyncio.sleep(120)
     if opts.get('model'):
@@ -237,7 +240,12 @@ async def run(raw_task, rid):
 async def main():
     global current
     surface_report()
-    reader=asyncio.StreamReader(); transport,_=await asyncio.get_running_loop().connect_read_pipe(lambda:asyncio.StreamReaderProtocol(reader),sys.stdin.buffer)
+    if sys.platform=='win32':
+        sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
+        from subagent_pi.stdio import ThreadReader
+        reader=ThreadReader(sys.stdin.fileno(),8*1024*1024); transport=None
+    else:
+        reader=asyncio.StreamReader(); transport,_=await asyncio.get_running_loop().connect_read_pipe(lambda:asyncio.StreamReaderProtocol(reader),sys.stdin.buffer)
     while line:=await reader.readline():
         r=json.loads(line); kind=r['type']
         if kind=='get_state':
@@ -303,6 +311,6 @@ async def main():
     if current and not current.done():
         current.cancel()
         with contextlib.suppress(asyncio.CancelledError): await current
-    transport.close()
+    if transport: transport.close()
 
 asyncio.run(main())

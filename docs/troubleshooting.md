@@ -48,7 +48,7 @@ Pi 的项目 trust、环境初始化或扩展装载行为可能影响 RPC 启动
 
 插件安装后开始新会话；确认没有同时通过全局 MCP 又注册同一个服务。使用 `/mcp` 检查连接，并实际尝试带 cwd 的 pi_spawn_agent。deferred/tool-search 能否发现属于 Codex 版本和 provider 行为，不是本插件保证。
 
-0.6.1 日常发现列表包含 9 个工具，包括 pi_send_message、pi_followup_task、pi_interrupt_agent；pi_context、pi_send_input、pi_close_agent、pi_respawn_agent 留在显式管理面。仅找不到这些管理工具不等于服务故障。如果 skill 仍要求先 pi_context、使用 pi_send_input，要求 pi_ack_result，或常规停止用 pi_close_agent，检查是否载入旧版本。
+0.7.0 日常发现列表包含 9 个工具，包括 pi_send_message、pi_followup_task、pi_interrupt_agent；pi_context、pi_send_input、pi_close_agent、pi_respawn_agent 留在显式管理面。仅找不到这些管理工具不等于服务故障。如果 skill 仍要求先 pi_context、使用 pi_send_input，要求 pi_ack_result，或常规停止用 pi_close_agent，检查是否载入旧版本。
 
 `subagent-pi --version`、`subagent-pi schemas` 只反映 PATH 对应 CLI。源码更新、git push 和重新复制 marketplace 文件不会刷新当前会话；需按 [升级步骤](getting-started.md#升级与移除) 同步安装代码、Codex 缓存、skill/docs，再开启新会话。不单独覆盖缓存中的 SKILL.md，以免新指引配旧 schema。
 
@@ -66,8 +66,10 @@ Pi 的项目 trust、环境初始化或扩展装载行为可能影响 RPC 启动
 
 ## Permission denied / sandbox
 
-Unix socket 与数据目录属于同一 OS 用户。Codex 宿主若阻止访问 socket 或启动进程，需要按宿主批准策略处理。不要自动关闭沙箱或使用提权参数。本插件不会复制 Codex 权限到 Pi，部署者应明确选择能接受的外部 worker 权限边界。
+Unix socket / Windows Named Pipe 与数据目录属于同一 OS 用户。Codex 宿主若阻止访问 socket 或启动进程，需要按宿主批准策略处理。不要自动关闭沙箱或使用提权参数。本插件不会复制 Codex 权限到 Pi，部署者应明确选择能接受的外部 worker 权限边界。
 
 ## 实际模型 smoke test
 
 `scripts/live_smoke.py --allow-model-call` 会建立临时测试目录，启动一次 Pi reader 并读一个 marker 文件，可能消耗额度。它不修改真实 repo，也不验证 Codex UI；测试后会关闭 worker。运行失败时查看该测试 scope，而不是无界重试。
+
+Windows 启动失败时先确认使用原生 Python/Node/Pi/Codex，且 Pi npm 安装包含 SDK。使用 `Get-Command pi.cmd` 定位入口。不要把 WSL 路径或 Linux 的 state/socket 路径传给 Windows 运行时。受管进程无法加入 Job、pipe 对端身份不可验证或 Job 归属未知时会明确失败，不会降级为无归属的进程控制。

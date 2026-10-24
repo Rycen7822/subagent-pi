@@ -6,9 +6,8 @@ import json
 import os
 from pathlib import Path
 import re
-import socket
+import sys
 import stat
-import struct
 import time
 import uuid
 
@@ -32,6 +31,13 @@ DELIVERY_OPS = frozenset({'wait','result'})
 # source itself. The scope snapshot captures these plus CODEX_HOME.
 BASE_ENV_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL', 'USER',
                  'LOGNAME', 'PI_CODING_AGENT_DIR')
+if sys.platform == 'win32':
+    BASE_ENV_KEYS += ('SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
+                 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP',
+                 'SystemRoot', 'windir', 'ComSpec', 'PathExt', 'UserProfile', 'HomeDrive',
+                 'HomePath', 'AppData', 'LocalAppData', 'Temp', 'Tmp',
+                 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432',
+                 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432')
 
 class AgentError(Exception):
     def __init__(self, code: str, message: str, **details):
@@ -113,7 +119,24 @@ def bounded(value, budget=4096):
         return out
     return value
 
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    from . import windows
+
+def python_executable() -> str:
+    """The interpreter process we actually get.
+
+    A Windows venv `python.exe` is a redirector that starts the base interpreter
+    as a child, so a spawned PID would not be the process running our code. Use
+    the base executable there and keep one identity for every owner we spawn.
+    """
+    if IS_WINDOWS:
+        return getattr(sys, "_base_executable", None) or sys.executable
+    return sys.executable
+
+
 def private_dir(path: Path):
+    if IS_WINDOWS: return windows.private_dir(path)
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     s = path.lstat()
     if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid():
@@ -121,6 +144,7 @@ def private_dir(path: Path):
     os.chmod(path, 0o700)
 
 def atomic_write(path: Path, data: bytes):
+    if IS_WINDOWS: return windows.atomic_write(path, data)
     private_dir(path.parent)
     tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
@@ -146,19 +170,16 @@ def socket_path(home: Path) -> Path:
     private_dir(base)
     return base / (hashlib.sha256(str(home).encode()).hexdigest()[:20] + ".sock")
 
-def check_peer(writer):
-    sock = writer.get_extra_info("socket")
-    if hasattr(socket, "SO_PEERCRED"):
-        _, uid, _ = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        if uid != os.getuid():
-            raise AgentError("permission_denied", "IPC peer belongs to another user")
 
 def process_identity(pid: int) -> str | None:
+    if IS_WINDOWS:
+        try: return windows.process_identity(pid)
+        except OSError: return "unknown"
     try:
-        raw = Path(f"/proc/{pid}/stat").read_text()
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         rest = raw[raw.rfind(")")+2:].split()
         if rest[0] == "Z": return None
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
         return boot + ":" + rest[19]
     except (FileNotFoundError, ProcessLookupError):
         return None
@@ -173,12 +194,15 @@ def live_identity(pid, identity) -> bool | None:
     return current == identity
 
 def group_members(pgid: int):
+    if IS_WINDOWS:
+        try: return windows.job_members(pgid)
+        except windows.JobUnavailable as exc: raise AgentError("ownership_unknown", str(exc)) from exc
     found = []
     for item in Path("/proc").iterdir():
         if not item.name.isdigit(): continue
         try:
             if item.stat().st_uid != os.getuid(): continue
-            raw = (item / "stat").read_text()
+            raw = (item / "stat").read_text(encoding="utf-8")
             fields = raw[raw.rfind(")")+2:].split()
             if fields[0] != "Z" and int(fields[2]) == pgid:
                 found.append(int(item.name))

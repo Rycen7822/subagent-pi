@@ -35,7 +35,7 @@ pi_followup_task / followup-task 在空闲时唤醒并启动新 run，活动时�
 
 ## Daemon 崩溃
 
-新 daemon 不能重新附着旧匿名 stdin/stdout。它检查 owner.json、guard/Pi PID、Linux boot ID 与启动 tick。运行中 run 标为 crashed，queued run 标为 cancelled；这不是断言旧进程已经停止。
+新 daemon 不能重新附着旧匿名 stdin/stdout。它检查 owner.json、guard/Pi PID、Linux boot ID 与启动 tick，或 Windows 进程创建时间和 Job 归属。运行中 run 标为 crashed，queued run 标为 cancelled；这不是断言旧进程已经停止。
 
 owner.json 缺失时，已启动过的 worker 一律按 orphaned/unknown 处理：死 PID 和空进程组无法排除 detached 工具后代。只有未启动过的行，或有效 owner 记录证明领导进程、进程组和后代清理完成，才允许 verified。正常 guard 使用 Linux subreaper 接收并回收 orphan 后代，记录 descendants_cleanup；guard 被强杀或该证据未知时拒绝自动恢复。重启、close 和 respawn 共用这一判据。
 
@@ -73,3 +73,5 @@ subagent-pi result RUN_ID --scope SCOPE_ID --peek
 --peek 不消费关注、不撤回或重放通知，也不意味着旧通知已安全处理。需要分页时继续带 --peek，使用返回的 run.id / next_offset。先用 inspect --detail full 查看通知错误，修正绑定或宿主问题后再处理正常交付；不要自动重试未知提交。旧 scope 的父绑定不会因修改安装清单而自动修复。
 
 极端故障中，artifact 已写但事务未提交可能留下孤立文件；它不会被当作正常完成的证据。原始 Pi session 可能包含更多部分信息。不要把恢复时的空结果解释为子代理从未产生副作用。
+
+Windows 使用 Job 的内核成员记录判断后代清理，并在 session 租约内发布 generation 对应的清理证明。Job 无法查询时保持 unknown；owner.json 缺失仍不能仅凭死 PID 恢复。daemon 已确认 shutdown 请求或 Named Pipe 已关闭，都不代表进程已退出、SQLite/租约句柄已释放；升级和删除状态前应等待实际退出。

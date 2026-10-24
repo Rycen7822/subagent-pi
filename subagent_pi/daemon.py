@@ -1,29 +1,28 @@
 from __future__ import annotations
 import asyncio
-import fcntl
 import json
 import os
 from pathlib import Path
 import signal
 import sys
-from .common import MAX_FRAME, DELIVERY_OPS, AgentError, check_peer, dumps, private_dir, read_frame, socket_path, close_writer
+from .common import MAX_FRAME, DELIVERY_OPS, AgentError, dumps, private_dir, read_frame, close_writer
 from .runtime import Runtime
+from .ipc import check_peer
 from .schema import validate_op
-from . import PROTOCOL_VERSION
+from . import PROTOCOL_VERSION, ipc, locks
+from .common import IS_WINDOWS
 
 async def serve(home: Path):
-    if not sys.platform.startswith('linux'): raise AgentError('unsupported_platform','Version 0.1 supports Linux/WSL2 only')
+    if not (sys.platform.startswith('linux') or IS_WINDOWS): raise AgentError('unsupported_platform','Linux/WSL2 or Windows is required')
     private_dir(home)
     fd=os.open(home/'daemon.lock',os.O_RDWR|os.O_CREAT,0o600)
-    try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-    except BlockingIOError:
+    if not locks.try_lock(fd):
         os.close(fd); return
-    sock=socket_path(home)
     runtime=None
     clients=set(); operations=set()
     try:
         runtime=Runtime(home)
-        sock.unlink(missing_ok=True)
+        ipc.remove(home)
         async def handle(reader,writer):
             current=asyncio.current_task(); clients.add(current)
             job=None; disconnected=None; reservation=None; delivered=None; op=None
@@ -75,10 +74,10 @@ async def serve(home: Path):
                 runtime.parent_notifications.release_delivery(reservation,op,delivered)
                 clients.discard(current)
                 await close_writer(writer)
-        server=await asyncio.start_unix_server(handle,str(sock),limit=MAX_FRAME)
-        os.chmod(sock,0o600)
+        server=await ipc.serve(handle,home)
         loop=asyncio.get_running_loop()
-        for sig in (signal.SIGINT,signal.SIGTERM): loop.add_signal_handler(sig,runtime.shutdown_requested.set)
+        if not IS_WINDOWS:
+            for sig in (signal.SIGINT,signal.SIGTERM): loop.add_signal_handler(sig,runtime.shutdown_requested.set)
         runtime.notify()  # Deliver durable pending attention, including restart reconciliation.
         watchdog=asyncio.create_task(runtime.idle_loop())
         async with server:
@@ -92,5 +91,5 @@ async def serve(home: Path):
         await runtime.shutdown()
         for t in list(clients): t.cancel()
     finally:
-        sock.unlink(missing_ok=True)
-        fcntl.flock(fd,fcntl.LOCK_UN); os.close(fd)
+        ipc.remove(home)
+        locks.unlock(fd); os.close(fd)

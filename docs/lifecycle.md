@@ -142,3 +142,5 @@ queued 只是 Codex 入队回执。原父会话准备交付 wait / result 响应
 此机制要求 Codex 支持 queue，撤回另需 app-server 的 `thread/queue/delete`（均已用本地模拟模型验证）。使用绑定时的本地 CODEX_HOME；远程会话不在本机消息存储中时不能据此承诺唤醒。未修改 Pi/Codex 宿主，也不模拟键盘或重启用户会话。
 
 等待接口不接受 timeout_ms / --timeout-ms。0.6.0 IPC 为 v4、账本 schema 为 7，移除 pi_ack_result / CLI ack。先收取结果、关闭旧任务并停止旧 daemon，再同步客户端和安装缓存；混用旧客户端或 daemon 返回 version_mismatch，不自动停止用户进程。迁移将旧 ACK 状态转为通知交付状态，保留精确排队回执的撤回意图和结果文件。升级后不能直接用旧程序打开新账本。
+
+Windows guard 在启动 Pi 前加入独立 Job Object，后代继承 Job；强制停止会终止整个 Job。进程创建时间用于排除 PID 复用，清理证明必须绑定 generation 并在 session 租约下发布。正常任务中断继续使用 SDK abort，不通过杀 Job 实现。

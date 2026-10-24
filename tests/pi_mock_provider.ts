@@ -93,6 +93,14 @@ export default function (pi) {
         message.content = [{ type: "toolCall", id: "block-1", name: "mock_block", arguments: {} }] as any;
         message.stopReason = "toolUse";
       }
+      if (env.PI_MOCK_BUILTIN_TOOLS) {
+        const probes = [{ name: "read", arguments: { path: "native marker.txt" } },
+          { name: "bash", arguments: { command: "printf 'NATIVE_BASH_OK\\n'" } }];
+        if (call <= probes.length) {
+          message.content = [{ type: "toolCall", id: `builtin-${call}`, ...probes[call - 1] }] as any;
+          message.stopReason = "toolUse";
+        } else message.content = [{ type: "text", text: "BUILTIN_RESULTS=" + JSON.stringify(context.messages.filter(m => m.role === "toolResult")) }];
+      }
       if (env.PI_MOCK_FAIL) { message.stopReason = "error"; (message as any).errorMessage = "Mock provider failed"; }
       let ended = false, timer;
       const finish = () => {

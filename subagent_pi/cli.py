@@ -13,7 +13,7 @@ from .client import call_timeout, request
 DOC_ROOT=Path(__file__).resolve().parent.parent/'docs'
 
 def parser():
-    p=argparse.ArgumentParser(prog='subagent-pi',description='Persistent Pi subagents: MCP + CLI, Linux/WSL2, no hooks.')
+    p=argparse.ArgumentParser(prog='subagent-pi',description='Persistent Pi subagents: MCP + CLI, Linux/WSL2/Windows, no hooks.')
     p.add_argument('--version',action='version',version=__version__)
     p.add_argument('--home',type=Path,help='State directory (or PI_AGENTS_HOME)')
     sub=p.add_subparsers(dest='command',required=True)
@@ -89,7 +89,7 @@ def source_snapshot(home):
 def guide(args):
     files={p.stem:p for p in DOC_ROOT.glob('*.md')}
     if args.topic not in files: raise AgentError('unknown_topic','Available guide topics: '+', '.join(sorted(files)))
-    content=files[args.topic].read_text()
+    content=files[args.topic].read_text(encoding="utf-8")
     if args.section:
         lines=content.splitlines(keepends=True); found=[]; capturing=False; level=0
         for line in lines:
@@ -147,7 +147,9 @@ async def execute(args):
         opened=await request(home,'scope_open',{'cwd':cwd,'label':'Codex CLI',**({'scope':os.environ['PI_AGENTS_SCOPE']} if os.environ.get('PI_AGENTS_SCOPE') else {})},source=source_snapshot(home))
         env=os.environ.copy(); env.update(PI_AGENTS_SCOPE=opened['scope'],PI_AGENTS_CWD=cwd,PI_AGENTS_HOME=str(home))
         print('Pi scope: '+opened['scope'],file=sys.stderr)
-        os.execvpe(exe,[exe,*rest],env)
+        from .executables import argv
+        command=argv(exe,*rest)
+        os.execvpe(command[0],command,env)
     data=vars(args).copy()
     for k in ('command','home'): data.pop(k,None)
     peek=data.pop('peek',False)

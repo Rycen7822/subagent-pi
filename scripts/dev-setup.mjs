@@ -6,21 +6,25 @@
  * resolve `@earendil-works/pi-coding-agent`, `typebox` and Node's types.
  * Nothing here is packaged, cached at runtime, or downloaded by the product.
  */
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { existsSync, realpathSync, lstatSync, mkdirSync, cpSync, rmSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 
 const which = (cmd) => {
-  try { return execSync(`command -v ${cmd}`, { shell: '/bin/bash' }).toString().trim(); }
+  try { return process.platform === 'win32'
+    ? execFileSync('where.exe',[cmd],{encoding:'utf8'}).trim().split(/\r?\n/).find(path=>/\.cmd$/i.test(path))
+    : execSync(`command -v ${cmd}`, { shell: '/bin/bash' }).toString().trim(); }
   catch { return null; }
 };
 const exe = which('pi');
 if (!exe) throw new Error('pi executable not found; install Pi first');
 const real = realpathSync(exe);
 let piDir = null;
-for (const parent of [real, ...Array(8).fill().map((_, i) => real.split('/').slice(0, -(i + 1)).join('/'))]) {
-  if (existsSync(join(parent, 'dist', 'index.d.ts'))) { piDir = parent; break; }
+for (let parent=dirname(real), depth=0; depth<8; depth++,parent=dirname(parent)) {
+  const candidates=[parent,join(parent,'node_modules','@earendil-works','pi-coding-agent')];
+  piDir=candidates.find(path=>existsSync(join(path,'dist','index.d.ts')));
+  if(piDir) break;
 }
 if (!piDir) throw new Error('could not locate the Pi distribution (dist/index.d.ts) from ' + real);
 const require = createRequire(join(piDir, 'package.json'));

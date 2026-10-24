@@ -15,8 +15,42 @@ concurrency:
 
 env:
   PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUTF8: "1"
 
 jobs:
+  windows:
+    name: Windows native (Pi ${{ matrix.pi-version }})
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-version: ["0.99.1", "1.4.0"]
+    env:
+      SUBAGENT_PI_LIVE_PI: "1"
+      PYTHONPATH: tests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.19.0"
+      - name: Install Pi SDK and test dependencies
+        shell: pwsh
+        run: |
+          npm.cmd install --global --ignore-scripts "@earendil-works/pi-coding-agent@${{ matrix.pi-version }}"
+          python -m pip install -r tests/requirements.txt
+      - name: Native subprocess, IPC, lifecycle and notification contracts
+        run: python -m unittest test_windows test_package.ShipManifest test_v2 test_parent.ParentNotifications test_transport.LivePiLifecycleTests -v
+      - name: Package structure and archive
+        run: |
+          python scripts/validate_package.py
+          New-Item -ItemType Directory -Force .work/package | Out-Null
+          python scripts/package.py --output .work/package/subagent-pi.zip
+          python -m zipfile -t .work/package/subagent-pi.zip
+
   python-core:
     name: Python core (${{ matrix.python-version }})
     runs-on: ubuntu-24.04

@@ -1,5 +1,7 @@
 # CLI reference
 
+Windows PowerShell 中使用安装器生成的 `subagent-pi.cmd`（或 `.ps1`），其余命令与参数相同；cwd 使用 Windows 绝对路径。详见 [原生安装](getting-started.md#windows-原生安装)。
+
 业务命令 stdout 为单个 JSON 值；`--version` 和帮助输出例外。诊断写 stderr，错误退出码 2，用户中断 130。MCP 模式 stdout 为 JSON-RPC。CLI 与 MCP 共用 Runtime、schema 和账本。
 
 ## 通用
@@ -12,7 +14,7 @@ subagent-pi schemas
 subagent-pi call OP --json JSON_OR_DASH
 ```
 
-`--home` 放在子命令之前；`PI_AGENTS_HOME` 可指定同一状态目录。`schemas` 输出当前 CLI 对应的 10 个日常 MCP 工具的输入/输出定义，不能证明运行中的 Codex 连接已采用该版本。`call --json -` 从 stdin 读原始操作参数，适合脚本；其操作名以实际 schema/Runtime 为准。
+`--home` 放在子命令之前；`PI_AGENTS_HOME` 可指定同一状态目录。`schemas` 输出当前 CLI 对应的 9 个日常 MCP 工具的输入/输出定义，不能证明运行中的 Codex 连接已采用该版本。`call --json -` 从 stdin 读原始操作参数，适合脚本；其操作名以实际 schema/Runtime 为准。
 
 带 `--request-id` 的 CLI 任务控制操作省略该参数时会生成并回显 ID。可靠重试应从首次调用就显式指定同一个 key，并保持参数不变；结果不确定先查账本。带 request_id 字段的 MCP 工具要求显式提供，成功回执不重复回显它；管理 pi_context 没有该字段，不使用这套请求账本。规则见 [recovery.md](recovery.md)。
 

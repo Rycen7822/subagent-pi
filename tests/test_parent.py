@@ -1,5 +1,6 @@
 """Parent identity and durable attention through real MCP/IPC/subprocess boundaries."""
 import asyncio
+import contextlib
 import json
 import os
 import sqlite3
@@ -10,7 +11,7 @@ import unittest
 import uuid
 from unittest import mock
 
-from subagent_pi import parent
+from subagent_pi import parent, ipc
 from subagent_pi.client import request
 from subagent_pi.common import AgentError, dumps, group_members
 from subagent_pi.runtime import Runtime
@@ -51,6 +52,10 @@ else:
         print(json.dumps({'id':request['id'],'result':result}),flush=True)
 """)
         command.chmod(0o755)
+        if sys.platform=='win32':
+            node=bindir/'codex.cjs'
+            node.write_text("const {spawnSync}=require('node:child_process'); const r=spawnSync("+json.dumps(sys.executable)+",["+json.dumps(str(command))+",...process.argv.slice(2)],{stdio:'inherit'}); process.exit(r.status??1);",encoding='utf-8')
+            (bindir/'codex.cmd').write_text('@echo off\nnode "%dp0%\\codex.cjs" %*\n',encoding='ascii')
         self.mcp_env={'CODEX_HOME':str(self.codex_home),'HOME':str(self.root),
                       'PATH':str(bindir)+os.pathsep+os.environ['PATH']}
         self.parent=str(uuid.uuid4())
@@ -69,7 +74,7 @@ else:
         out,err=await asyncio.wait_for(proc.communicate(),20)
         self.assertEqual(proc.returncode,0,err.decode()+out.decode())
         self.assertIn('Real Pi smoke passed',out.decode())
-        with sqlite3.connect(self.home/'registry.sqlite') as db:
+        with contextlib.closing(sqlite3.connect(self.home/'registry.sqlite')) as db, db:
             self.assertEqual(db.execute('SELECT state,handled FROM parent_notifications').fetchall(),
                              [('observed',1)])
             self.assertEqual(json.loads(db.execute('SELECT parent FROM scopes').fetchone()[0])['thread_id'],self.parent)
@@ -183,7 +188,7 @@ else:
         await request(self.home,'shutdown',{'force':True})
         from subagent_pi.common import socket_path
         until=asyncio.get_running_loop().time()+5
-        while socket_path(self.home).exists() and asyncio.get_running_loop().time()<until: await asyncio.sleep(.02)
+        while ipc.exists(self.home) and asyncio.get_running_loop().time()<until: await asyncio.sleep(.02)
         (self.codex_home/'reject').unlink()
         await self.tool('pi_list_agents',{'scope':sid})  # restarts daemon
         rows=await self.settled_notifications(sid,1)
@@ -193,8 +198,8 @@ else:
         await request(self.home,'shutdown',{'force':True})
         from subagent_pi.common import socket_path
         until=asyncio.get_running_loop().time()+5
-        while socket_path(self.home).exists() and asyncio.get_running_loop().time()<until: await asyncio.sleep(.02)
-        self.assertFalse(socket_path(self.home).exists(),'Old daemon did not finish shutdown')
+        while ipc.exists(self.home) and asyncio.get_running_loop().time()<until: await asyncio.sleep(.02)
+        self.assertFalse(ipc.exists(self.home),'Old daemon did not finish shutdown')
 
     async def restart_daemon(self):
         await self.stop_daemon()
@@ -215,7 +220,7 @@ else:
         # Reconstruct the on-disk state of a daemon killed after enqueue but
         # before receipt persistence. The external side effect already happened.
         import sqlite3
-        with sqlite3.connect(self.home/'registry.sqlite') as db:
+        with contextlib.closing(sqlite3.connect(self.home/'registry.sqlite')) as db, db:
             db.execute("UPDATE parent_notifications SET state='sending',queued_id=NULL")
         await self.restart_daemon()
         rows=await self.settled_notifications(sid,1)
@@ -229,7 +234,7 @@ else:
         # recording the host response. Retrying this exact deletion is safe.
         await self.stop_daemon()
         import sqlite3
-        with sqlite3.connect(self.home/'registry.sqlite') as db:
+        with contextlib.closing(sqlite3.connect(self.home/'registry.sqlite')) as db, db:
             db.execute("UPDATE parent_notifications SET state='recalling',handled=1")
         await request(self.home,'ping',{})
         await self.wait_notice_state(sid,'recalled')
@@ -244,7 +249,7 @@ else:
         # Reconcile the persisted row while no old notification callback can run.
         await self.stop_daemon()
         import sqlite3
-        with sqlite3.connect(self.home/'registry.sqlite') as db:
+        with contextlib.closing(sqlite3.connect(self.home/'registry.sqlite')) as db, db:
             db.execute('UPDATE parent_notifications SET handled=1')
         await request(self.home,'ping',{})
         await self.wait_notice_state(sid,'recalled')
@@ -257,7 +262,7 @@ else:
         notice=(await self.settled_notifications(sid,1))[0]
         hold=self.codex_home/'hold-recall'; hold.touch()
         import sqlite3
-        with sqlite3.connect(self.home/'registry.sqlite') as db:
+        with contextlib.closing(sqlite3.connect(self.home/'registry.sqlite')) as db, db:
             db.execute('UPDATE parent_notifications SET handled=1')
         # Closing the idle worker schedules the consumed notification's recall.
         await self.parent_tool('pi_close_agent',{'scope':sid,'agent_id':run['agent_id'],'request_id':'close-before-restart'})
@@ -277,7 +282,7 @@ else:
         await self.parent_tool('pi_spawn_agent',{'request_id':'done','task':'done','access':'read'})
         notice=(await self.settled_notifications(sid,1))[0]
         import sqlite3
-        with sqlite3.connect(self.home/'registry.sqlite') as db:
+        with contextlib.closing(sqlite3.connect(self.home/'registry.sqlite')) as db, db:
             db.execute("UPDATE parent_notifications SET state='recalling',handled=0")
         await self.restart_daemon()
         rows=await self.wait_notice_state(sid,'queued')
@@ -438,7 +443,7 @@ else:
             self.assertEqual(result['run']['id'],run['run_id'])
             self.assertEqual(result['text'],'Completed: done')
         import sqlite3
-        with sqlite3.connect(self.home/'registry.sqlite') as db:
+        with contextlib.closing(sqlite3.connect(self.home/'registry.sqlite')) as db, db:
             self.assertEqual(db.execute('SELECT state,handled FROM parent_notifications WHERE run_id=?',
                                        (run['run_id'],)).fetchone(),(failure,0))
         self.assertEqual((len(self.queued()),len(self.recalls())),before)

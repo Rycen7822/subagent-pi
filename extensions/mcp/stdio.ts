@@ -1,12 +1,16 @@
 /** Newline JSON-RPC and ownership of an inherited MCP process tree. */
 import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { McpConnection, CancelledError, LEGACY_INIT, rpcResult, classifyProtocolError, assertDiscoverResult,
   type ServerCfg, type JsonRpcResponse } from "./connection";
 
 const MAX_STDIN_BUFFER = 8 * 1024 * 1024;
 const MAX_LINE = 1024 * 1024;
-const BASE_ENV = ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"];
+const BASE_ENV = ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR",
+  ...(process.platform === "win32" ? ["SYSTEMROOT", "SystemRoot", "WINDIR", "windir", "COMSPEC", "ComSpec",
+    "PATHEXT", "PathExt", "USERPROFILE", "UserProfile", "APPDATA", "AppData", "LOCALAPPDATA", "LocalAppData",
+    "TEMP", "TMP", "PROGRAMFILES", "ProgramFiles", "PROGRAMFILES(X86)", "ProgramFiles(x86)", "PROGRAMW6432", "ProgramW6432"] : [])];
 const SELF_BINARY = "subagent-pi";
 const SELF_MODULE = "subagent_pi";
 
@@ -92,7 +96,7 @@ export class StdioConnection extends McpConnection {
     // args (the installer generates `python <...>/bin/subagent-pi mcp`) and
     // `-m subagent_pi` module forms.
     const args = this.cfg.args ?? [];
-    const base = (p: string) => p.split("/").pop();
+    const base = (p: string) => p.replace(/\\/g,"/").split("/").pop()?.toLowerCase().replace(/\.(cmd|exe|bat)$/," ").trim();
     const selfReferencing =
       base(this.cfg.command) === SELF_BINARY ||
       args.some((a) => a === "-m" && args[args.indexOf(a) + 1] === SELF_MODULE) ||
@@ -102,7 +106,12 @@ export class StdioConnection extends McpConnection {
     const env: Record<string, string> = {};
     for (const key of BASE_ENV) if (process.env[key]) env[key] = process.env[key] as string;
     Object.assign(env, this.cfg.env ?? {});
-    const child = spawn(this.cfg.command, args, {
+    const windows=process.platform === "win32";
+    const python=process.env.PI_AGENTS_PYTHON;
+    if(windows && !python) throw new Error("Managed Windows Python location is missing");
+    const guard=fileURLToPath(new URL("../../subagent_pi/process_guard.py",import.meta.url));
+    const child = spawn(windows ? python! : this.cfg.command, windows ? [guard,this.cfg.command,...args] : args, {
+      windowsHide: true,
       cwd: this.cfg.cwd || undefined,
       env,
       stdio: ["pipe", "pipe", "pipe"],

@@ -149,8 +149,14 @@ class ShipManifest(unittest.TestCase):
     def test_selection_is_deterministic_and_unique(self):
         m=self.ship()
         files=m.ship_files(ROOT)
-        self.assertEqual(files,sorted(files))
+        self.assertEqual(files,sorted(files,key=lambda path: path.relative_to(ROOT).parts))
         self.assertEqual(len(files),len(set(files)))
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            for name in ('assets/banner.gif','README.md','bin/entry'):
+                path=root/name; path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(b'x')
+            self.assertEqual([path.relative_to(root).as_posix() for path in m.ship_files(root)],
+                             ['README.md','assets/banner.gif','bin/entry'])
 
 class RuntimeModuleBoundaries(unittest.TestCase):
     """runtime.py orchestrates state; the process, binding and projection mechanics
