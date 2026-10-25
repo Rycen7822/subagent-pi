@@ -15,12 +15,12 @@ p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--output',type=Path,default=ROOT.parent/f'subagent-pi-{__version__}.zip')
 a=p.parse_args()
 files=ship_files(ROOT)
-checks=''.join(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+str(f.relative_to(ROOT))+'\n' for f in files)
-(ROOT/'FILES.sha256').write_text(checks)
+checks=''.join(hashlib.sha256(f.read_bytes()).hexdigest()+'  '+f.relative_to(ROOT).as_posix()+'\n' for f in files)
+(ROOT/'FILES.sha256').write_text(checks,encoding='utf-8',newline='\n')
 files.append(ROOT/'FILES.sha256')
 with zipfile.ZipFile(a.output,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
-    for f in sorted(files):
-        info=zipfile.ZipInfo('subagent-pi/'+str(f.relative_to(ROOT)),date_time=(2026,9,14,0,0,0))
+    for f in sorted(files,key=lambda path: path.relative_to(ROOT).parts):
+        info=zipfile.ZipInfo('subagent-pi/'+f.relative_to(ROOT).as_posix(),date_time=(2026,9,14,0,0,0))
         info.create_system=3
         executable=f.name=='subagent-pi' or f.parent.name=='scripts' and f.suffix=='.py'
         info.external_attr=((0o100755 if executable else 0o100644)<<16)

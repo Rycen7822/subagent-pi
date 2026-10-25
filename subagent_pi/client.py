@@ -6,8 +6,9 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from .common import MAX_FRAME, DEFAULT_WAIT_SECONDS, DELIVERY_OPS, AgentError, dumps, private_dir, read_frame, socket_path, close_writer
-from . import PROTOCOL_VERSION
+from .common import MAX_FRAME, DEFAULT_WAIT_SECONDS, DELIVERY_OPS, AgentError, dumps, private_dir, read_frame, close_writer
+from . import PROTOCOL_VERSION, ipc
+from .common import IS_WINDOWS, python_executable
 
 BASE_TIMEOUT = 45
 # Booting or reaping a worker can legitimately outlast BASE_TIMEOUT: spawn and
@@ -40,8 +41,7 @@ def call_timeout(op, params, home=None):
     return max(BASE_TIMEOUT, (seconds or 0) + 10)
 
 async def connect_daemon(home,autostart):
-    sock=socket_path(home)
-    async def connect(): return await asyncio.open_unix_connection(str(sock),limit=MAX_FRAME)
+    async def connect(): return await ipc.connect(home)
     try: reader,writer=await connect()
     except (FileNotFoundError,ConnectionRefusedError):
         if not autostart: raise AgentError('daemon_unavailable','Daemon is not running')
@@ -52,8 +52,10 @@ async def connect_daemon(home,autostart):
         entry=Path(__file__).resolve().parent.parent/'bin/subagent-pi'
         env=os.environ.copy(); env['PI_AGENTS_HOME']=str(home)
         with log.open('ab') as f:
-            subprocess.Popen([sys.executable,str(entry),'daemon','run'],stdin=subprocess.DEVNULL,
-                             stdout=f,stderr=f,start_new_session=True,env=env,close_fds=True)
+            options=({'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS}
+                     if IS_WINDOWS else {'start_new_session': True})
+            subprocess.Popen([python_executable(),str(entry),'daemon','run'],stdin=subprocess.DEVNULL,
+                             stdout=f,stderr=f,env=env,cwd=home,close_fds=True,**options)
         until=time.monotonic()+8
         while True:
             try: reader,writer=await connect(); break

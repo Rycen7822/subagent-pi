@@ -6,9 +6,9 @@
 
 让 Codex 把本地 Pi coding agent 当成可控制的外部子代理：异步启动、任务内消息和后续工作、检查工作轨迹、中断、卸载、恢复会话、收取结果。
 
-这是完整源码版 `0.6.1`，针对 **Linux / WSL2，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi ≥0.99.1 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
+这是完整源码版 `0.7.0`，针对 **Linux / WSL2 / Windows 原生，Python 3.11+**。运行时使用 Python 标准库、Node.js 22.19+ 和已安装 Pi ≥0.99.1 的 SDK，无额外 pip/npm 构建依赖；Pi 和 Codex 需要你已自行安装。它不进入 Codex 原生 `/agents`；父代理唤醒使用 Codex 官方消息队列，无需 hooks，适用范围见下文。
 
-受管子进程使用原版 Pi 的公开 SDK，无需修改 Pi；版本证据和测试边界见 [测试指南](docs/testing.md)。主代理使用 V2 风格的消息、后续任务和软中断操作；中断通常保留进程，无法确认整个任务退出时核验并终止进程组。空闲进程默认 30 分钟后自动卸载，session 和结果保留。详见 [操作语义](docs/lifecycle.md)。
+受管子进程使用原版 Pi 的公开 SDK，无需修改 Pi；版本证据和测试边界见 [测试指南](docs/testing.md)。主代理使用 V2 风格的消息、后续任务和软中断操作；中断通常保留进程，无法确认整个任务退出时核验并终止进程组或 Windows Job。空闲进程默认 30 分钟后自动卸载，session 和结果保留。详见 [操作语义](docs/lifecycle.md)。
 
 受管子代理加载 Pi 自身的全局/项目 extensions、packages、skills、prompt templates、themes 与 settings（SDK 的 settings 更新仅在子进程内存中保存）；`ambient_extensions`/`ambient_skills` 默认 `true`。上下文文件单独处理：保留 Pi 配置目录的全局 `AGENTS.md`，不加载子代理工作目录及其父目录的 `AGENTS.md`；改为读取打开 scope 的 Codex 工作目录下的 `SUBAGENT-PI.md`。新建与 respawn 时重新读取，即使子代理在另一个 cwd 执行也一样。Pi 配置目录沿用打开 scope 的客户端进程里的 `PI_CODING_AGENT_DIR`（未设置即 Pi 默认 `$HOME/.pi/agent`，跨 daemon 重启保持）。在此之上按需继承 Codex 全局 skills（`~/.codex/skills`）与 MCP（`~/.codex/config.toml` 的 `mcp_servers`）；普通 `pi` 不受影响。
 
@@ -27,6 +27,16 @@ python3 scripts/install.py --pi "$(command -v pi)" --register
 export PATH="$HOME/.local/bin:$PATH"
 subagent-pi doctor
 ```
+
+Windows PowerShell（安装 Node、Python、官方 npm 版 Pi 和 Codex 后）：
+
+```powershell
+python scripts/install.py --pi (Get-Command pi.cmd).Source --register
+$env:Path = "$HOME\.local\bin;$env:Path"
+subagent-pi.cmd doctor
+```
+
+Windows 的 Codex、插件和 Pi 均原生运行；Pi 默认使用 Git Bash，也可配置 PowerShell 工具。安装、启动器和兼容边界见 [入门指南](docs/getting-started.md#windows-原生安装)。
 
 然后在 Codex 输入 `/plugins`，从 **Subagent Pi Local** 安装 **Subagent Pi**，并开始一个新会话。脚本注册的是本地 marketplace，不会替你点击插件安装或授权。
 

@@ -7,6 +7,7 @@ import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { bootstrap } from './bootstrap.mjs';
 import { TaskQueue } from './task-queue.mjs';
 import { createProtocolOutput } from './protocol-output.mjs';
 
@@ -17,6 +18,7 @@ const output = createProtocolOutput(process.stdout, { fail(error) {
   process.exit(74); // Let the daemon record a crash; never fake delivery or replay.
 } });
 process.stdout.write = process.stderr.write.bind(process.stderr);
+await bootstrap();
 const [sdkPath, ...argv] = process.argv.slice(2);
 const sdk = await import(pathToFileURL(sdkPath).href);
 // Validate explicit thinking against the loaded model, not parseArgs' global list.

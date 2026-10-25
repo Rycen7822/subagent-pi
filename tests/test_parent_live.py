@@ -50,9 +50,10 @@ class LiveParentWakeup(McpHarness, unittest.IsolatedAsyncioTestCase):
             'pi_command='+json.dumps([self.pi])+'\nrpc_timeout_seconds=20\nstartup_timeout_seconds=60\n'
             '[inheritance]\nenabled=false\n[profiles.reader]\nprovider="pi-mock-offline"\nmodel="mock"\nextensions='
             +json.dumps([str(ROOT/'tests/pi_mock_provider.ts')])+'\n[profiles.reader.env]\nPI_OFFLINE="1"\nPI_MOCK_ASK_PARENT="1"\n')
-        self.mcp_env={'HOME':str(self.root),'CODEX_HOME':str(self.codex_home),'PI_CODING_AGENT_DIR':str(agent_dir)}
-        env={'HOME':str(self.root),'CODEX_HOME':str(self.codex_home),'PATH':os.environ['PATH'],'LANG':'C.UTF-8'}
-        self.app=await asyncio.create_subprocess_exec(self.codex,'app-server','--stdio',env=env,
+        self.mcp_env={**{k:v for k,v in os.environ.items() if k.upper() in {'SYSTEMROOT','WINDIR','COMSPEC','PATHEXT','USERPROFILE','APPDATA','LOCALAPPDATA','TEMP','TMP'}},'HOME':str(self.root),'CODEX_HOME':str(self.codex_home),'PI_CODING_AGENT_DIR':str(agent_dir)}
+        env={**{k:v for k,v in os.environ.items() if k.upper() in {'SYSTEMROOT','WINDIR','COMSPEC','PATHEXT','USERPROFILE','APPDATA','LOCALAPPDATA','TEMP','TMP'}},'HOME':str(self.root),'CODEX_HOME':str(self.codex_home),'PATH':os.environ['PATH'],'LANG':'C.UTF-8'}
+        from subagent_pi.executables import argv
+        self.app=await asyncio.create_subprocess_exec(*argv(self.codex,'app-server','--stdio'),env=env,
             stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,limit=8*1024*1024)
         self.app_stderr=asyncio.create_task(self.app.stderr.read())
         self.pending={}; self.notices=asyncio.Queue(); self.seq=0

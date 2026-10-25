@@ -4,7 +4,7 @@
 
 ```text
 Codex -> MCP stdio adapter --+
-                            +-> Unix socket -> daemon -> guard -> plugin SDK child -> Pi SDK
+                            +-> Unix socket / Windows Named Pipe -> daemon -> guard -> plugin SDK child -> Pi SDK
 Human/script -> CLI --------+                   |
                                                 +-> SQLite + session/result files
 ```
@@ -49,7 +49,7 @@ scopes、agents、runs、requests、receipts、events 是独立表。执行终�
 
 ## 安全与限制
 
-作用域隔离是防串会话的正确性约束。Unix socket mode 0600、父目录0700、同 UID peer 检查不是针对同一用户恶意 worker 的安全沙箱。Pi 仍可能执行任意该用户能执行的 bash；reader 工具策略也不能限制路径到 cwd。
+作用域隔离是防串会话的正确性约束。Linux 的 Unix socket mode 0600、父目录0700、同 UID peer 检查，以及 Windows 的私有 DACL 和双向 SID 检查不是针对同一用户恶意 worker 的安全沙箱。Pi 仍可能执行任意该用户能执行的 bash；reader 工具策略也不能限制路径到 cwd。
 
 文件锁仅管理插件自己的 session。不会自动注入 Codex 沙箱、继承 approval policy 或替用户批准插件请求。审查结果不构成发布授权。
 
@@ -60,3 +60,5 @@ Linux guard 使用 subreaper 收养并清理脱离进程组的 orphan 工具后�
 没有 hooks、native /agents、自动 mailbox、自动review、scheduler、递归 fan-out、worktree 管理、多 harness backend、fork/clone、自动预算裁决、无限 transcript dump。
 
 这一版不是 nicobailon/pi-subagents 的 fork，也没有把它作为隐含安装依赖。借鉴其控制回执、session 独占、进程终态与有界观察原则，但实现针对独立 Pi SDK 子进程 和无 hooks 的 Codex 宿主。
+
+Windows 的平台边界集中在 `windows.py`（私有目录、原子替换、创建时间、Job 和 Named Pipe OS 调用）、`ipc.py`、`locks.py` 和 `stdio.py`；CLI 与 MCP 继续共用 Runtime/schema。guard 在启动 Pi 前加入独立 kill-on-close Job；daemon 在 session 租约下确认对应 generation 的 Job 清空并发布清理回执。Codex 通知和继承的 stdio MCP 也使用受管 Job。Windows bootstrap 使用一次性私有 pipe，按 SID 与 guard Job 成员验证客户端，配置保留在内存，结构化 receipt 绑定 agent/generation。Linux 保留原有 FD bootstrap 和 subreaper。

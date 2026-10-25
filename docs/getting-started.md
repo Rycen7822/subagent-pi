@@ -2,7 +2,7 @@
 
 ## 环境
 
-本版针对 Linux / WSL2，依赖 Python 3.11+、Node.js 22.19+、已安装并配置好模型/认证的 Pi ≥0.99.1，以及支持本地插件或 MCP 的 Codex CLI。WSL 状态目录使用 Linux 本地文件系统；文件锁和 SQLite WAL 不适合网络文件系统。
+本版支持 Linux / WSL2 和 Windows 原生，依赖 Python 3.11+、Node.js 22.19+、已安装并配置好模型/认证的 Pi ≥0.99.1，以及支持本地插件或 MCP 的 Codex CLI。状态目录使用对应系统的本地文件系统：WSL 使用 Linux 文件系统，Windows 使用本地 NTFS。文件锁和 SQLite WAL 不适合网络文件系统。
 
 先确认：
 
@@ -42,6 +42,28 @@ codex plugin marketplace add "$HOME/.local/share/subagent-pi-marketplace"
 ```
 
 安装脚本会创建 CLI 链接；复制源码或 git push 不会更新已有安装。模型和推理深度按 [configuration.md](configuration.md) 选择。
+
+## Windows 原生安装
+
+在 Windows 原生 PowerShell 中使用 Python 3.11+、Node.js 22.19+ 和官方 npm 安装的 Pi ≥0.99.1；Codex 也安装在 Windows。插件需要 Pi 的公开 SDK，单独的打包版 pi.exe 不保证附带 SDK。Pi 的 Bash 工具需要 Git for Windows；Git 安装在非默认目录时，旧 Pi SDK 需要在自己的 settings.json 中显式设置 `shellPath`（例如 `D:/app/Git/bin/bash.exe`），插件不会自动替换 shell；支持 PowerShell 工具的 Pi 版本也可按 Pi 官方配置选择它，插件不会替你修改 Pi 设置。
+
+```powershell
+python --version
+node --version
+pi --version
+codex --version
+python scripts/install.py --pi (Get-Command pi.cmd).Source --register
+$env:Path = "$HOME\.local\bin;$env:Path"
+subagent-pi.cmd doctor
+```
+
+默认目录与上文相同，`~` 展开为 Windows 用户目录。安装器为 Codex 固定 python.exe、Python 入口和状态目录；CLI 生成 `.cmd` / `.ps1`，无需创建符号链接。命令入口支持中文和空格路径。只对该启动器进程设置 PowerShell 执行策略，不修改用户执行策略。跨盘符或反斜杠路径按原生 Windows 路径传入；JSON/TOML 中使用正斜杠或正确转义反斜杠。
+
+```powershell
+subagent-pi.cmd codex -C 'D:\project\my repo'
+```
+
+daemon 使用私有 Named Pipe，worker 使用独立 Job Object 追踪和清理后代。中断仍优先取消任务并保留 Pi，close 才卸载；权限不足或归属无法证明时继续拒绝自动恢复。现有 npm Node `.cmd` 入口会解析为 Node + 脚本，不通过 shell 拼接参数；任意自定义 batch 启动器不受支持，改为显式可执行程序及 args。Windows 与 WSL 的运行时、路径和状态目录各自独立。
 
 ## 首次使用与 scope
 
@@ -112,7 +134,7 @@ codex plugin remove subagent-pi@subagent-pi-local
 codex plugin add subagent-pi@subagent-pi-local
 ```
 
-最后开启新会话。`subagent-pi --version` 和 `subagent-pi schemas` 只证明当前 CLI 的版本；0.6.1 应发现 9 个工具且不含 pi_ack_result；还应检查新会话发现 `pi_send_message`、`pi_followup_task`、`pi_interrupt_agent` 等日常工具，并使用对应的 skill。运行中的连接和已载入 skill 不会因源码、marketplace 文件或 git 提交变化而刷新。
+最后开启新会话。`subagent-pi --version` 和 `subagent-pi schemas` 只证明当前 CLI 的版本；0.7.0 应发现 9 个工具且不含 pi_ack_result；还应检查新会话发现 `pi_send_message`、`pi_followup_task`、`pi_interrupt_agent` 等日常工具，并使用对应的 skill。运行中的连接和已载入 skill 不会因源码、marketplace 文件或 git 提交变化而刷新。
 
 升级保留状态目录，旧安装备份在 `plugins/subagent-pi.previous`。支持的历史账本会自动按迁移注册表升级；比当前程序更新的数据库拒绝打开，不自动降级或删除。0.6.0 使用 IPC v4 / schema 7，移除手工 ACK，并把旧 ACK 和通知交付状态迁移为统一关注状态，保留结果及排队撤回意图。IPC 版本不匹配时需先正常结束旧任务，再更新客户端与 daemon；旧版本不能打开升级后的账本。
 

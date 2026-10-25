@@ -47,4 +47,5 @@ def ship_files(root: Path):
         for name in names:
             path = Path(directory) / name
             if path.is_file() and not excluded(path, root): files.append(path)
-    return sorted(files)
+    # WindowsPath ordering folds case; release order must match POSIX exactly.
+    return sorted(files, key=lambda path: path.relative_to(root).parts)

@@ -20,6 +20,8 @@ const MAX_PAYLOAD = 8 * 1024 * 1024;
 interface ReceiptServer { name: string; status: "ready" | "failed" | "lazy"; required: boolean; error?: string }
 
 function writeReceipt(fdEnv: string | undefined, payload: Record<string, unknown>): void {
+  const send=(globalThis as Record<string, unknown>).__subagentPiBridgeReceipt;
+  if (typeof send === "function") { send(payload); return; }
   if (!fdEnv || !/^\d+$/.test(fdEnv)) return;
   const fd = parseInt(fdEnv, 10);
   try {

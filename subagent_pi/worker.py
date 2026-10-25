@@ -8,11 +8,15 @@ import os
 import re
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
 
 from .common import (MAX_FRAME, AgentError, atomic_json, bounded, crop, dumps, group_members,
-    live_identity, new_id, now, private_dir, process_identity, read_frame)
+    live_identity, new_id, now, private_dir, process_identity, read_frame, IS_WINDOWS, python_executable)
+from . import locks
+if IS_WINDOWS:
+    from . import windows
 
 RESULT_CAP = 1024 * 1024
 BOOTSTRAP_MAX = 4 * 1024 * 1024
@@ -144,7 +148,7 @@ class Worker:
         parts = (self.surface_buf + chunk).split(b'\n')
         self.surface_buf = parts.pop()[-4096:]
         for raw in parts:
-            line = raw.decode('utf-8','replace')
+            line = raw.decode('utf-8','replace').rstrip('\r')
             if line == CONTEXT_READY:
                 self.context_ready.set()
                 continue
@@ -180,6 +184,8 @@ def close_quietly(fd):
     """The fd owner closes exactly once; a second close or an already-gone pipe is
     never an error here."""
     if fd is None: return
+    if IS_WINDOWS and not isinstance(fd,int):
+        fd.close(); return
     with contextlib.suppress(OSError): os.close(fd)
 
 def _skill_file(path: str) -> Path:
@@ -267,10 +273,17 @@ def managed_command(argv):
     """
     import shutil
     executable = Path(argv[0]).resolve()
-    for directory in list(executable.parents)[:5]:
+    roots=list(executable.parents)[:5]
+    if IS_WINDOWS:
+        from .executables import argv as executable_argv
+        resolved=executable_argv(str(executable))
+        if len(resolved)>1:
+            roots=list(Path(resolved[1]).resolve().parents)[:5]+roots
+        roots=[candidate for directory in roots for candidate in (directory,directory/'node_modules/@earendil-works/pi-coding-agent')]
+    for directory in roots:
         manifest = directory/'package.json'
         if not manifest.is_file(): continue
-        try: package = json.loads(manifest.read_text())
+        try: package = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError): continue
         if package.get('name') != '@earendil-works/pi-coding-agent': continue
         version = package.get('version')
@@ -311,6 +324,22 @@ def bootstrap_body(payload):
 
 async def start_guard(directory, spec, guard_env, body, before_spawn):
     """Own launch pipes until handoff; returned fds belong to the caller."""
+    if IS_WINDOWS:
+        from .bootstrap import BootstrapChannel
+        channel=await BootstrapChannel.open() if body is not None else None
+        try:
+            if channel: guard_env={**guard_env,'PI_AGENTS_BOOTSTRAP_PIPE':channel.name}
+            guard_env={**{k:os.environ[k] for k in ('SYSTEMROOT','WINDIR') if k in os.environ},**guard_env}
+            before_spawn()
+            proc=await asyncio.create_subprocess_exec(python_executable(),str(Path(__file__).with_name('worker_guard.py')),
+                str(directory/'launch.json'),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,limit=MAX_FRAME,cwd=spec['cwd'],env=guard_env,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            if channel: channel.pid=proc.pid
+            return proc,channel,channel
+        except BaseException:
+            if channel: channel.close()
+            raise
     bootstrap_r=bootstrap_w=receipt_r=receipt_w=None
     try:
         if body is not None:
@@ -336,6 +365,8 @@ async def write_bootstrap(fd, data):
     it when the write finishes or breaks; a timeout abandons the wait, never the
     write mid-close (closing an fd another thread still uses risks writing into
     a reused descriptor)."""
+    if IS_WINDOWS:
+        return await fd.send(data)
     def _write_and_close():
         try:
             with os.fdopen(fd, 'wb') as pipe:
@@ -355,6 +386,9 @@ async def read_receipt(fd, aid, generation, timeout):
     malformed receipt, required-server failure, timeout, cancellation,
     transport-creation failure). The caller must not close it again — a second
     close during failure cleanup could hit an fd another connection reclaimed."""
+    if IS_WINDOWS:
+        receipt=await fd.read(timeout)
+        return validate_receipt(receipt,aid,generation)
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
@@ -378,6 +412,9 @@ async def read_receipt(fd, aid, generation, timeout):
         receipt = json.loads(line)
     except ValueError:
         raise AgentError('bridge_unavailable', 'Managed MCP bridge receipt was malformed')
+    return validate_receipt(receipt,aid,generation)
+
+def validate_receipt(receipt,aid,generation):
     if not isinstance(receipt, dict) or receipt.get('kind') != 'subagent-pi-bridge-receipt':
         raise AgentError('bridge_unavailable', 'Managed MCP bridge receipt was malformed')
     if receipt.get('agent') != aid or receipt.get('generation') != generation:
@@ -393,6 +430,49 @@ def check_receipt(receipt):
     if receipt.get('state') != 'ready':
         raise AgentError('bridge_unavailable', 'Managed MCP bridge reported failure to start; inspect the agent stderr log')
 
+def members(pgid):
+    """Live members of one owned group/job, or None when that cannot be proved.
+
+    An unreadable job is not an empty one: only None (unknown) is returned, so no
+    caller can turn a permission or OS error into "cleanup verified"."""
+    try:
+        return group_members(pgid)
+    except (AgentError, OSError):
+        return None
+
+
+def publish_job_cleanup(directory: Path, generation):
+    """Persist Windows job proof for one dead generation.
+
+    POSIX still needs the guard's receipt: an empty PGID cannot prove that
+    descendants which detached from that group have exited.
+    """
+    if not IS_WINDOWS or generation is None:
+        return None
+    try:
+        with open(directory / "session.lock", "a+b") as lease:
+            if not locks.try_lock(lease.fileno()):
+                return None
+            try:
+                record = json.loads((directory / "owner.json").read_text(encoding="utf-8"))
+                if record.get("generation") != generation or not record.get("guard_pid"):
+                    return None
+                if any(live_identity(record.get(k + "_pid"), record.get(k + "_identity")) is not False
+                       for k in ("guard", "pi")) or members(record["guard_pid"]) != []:
+                    return None
+                updated = {
+                    **record, "spawning": False, "descendants_cleanup": "verified",
+                    "cleanup_proof": "job-empty",
+                    "cleanup_confirmation": {"generation": generation, "by": "daemon", "at": time.time()},
+                }
+                atomic_json(directory / "owner.json", updated)
+                return updated
+            finally:
+                locks.unlock(lease.fileno())
+    except (OSError, ValueError):
+        return None
+
+
 def ownership(directory: Path, a) -> dict:
     """The one owner-record verdict for reaping, reconciliation and terminate:
     'gone' | 'live' | 'unknown'. A missing or unreadable record proves nothing
@@ -400,7 +480,7 @@ def ownership(directory: Path, a) -> dict:
     process group and recorded descendants are gone. A launched worker without
     its owner record stays unknown; only positively matched identities are live."""
     try:
-        record = json.loads((directory/'owner.json').read_text())
+        record = json.loads((directory/'owner.json').read_text(encoding="utf-8"))
     except FileNotFoundError:
         record = None
     except (ValueError, OSError):
@@ -412,44 +492,97 @@ def ownership(directory: Path, a) -> dict:
             return {'status': 'unknown', 'reason': 'Owner record missing and the launch may have forked; manual process inspection required', 'record': None}
         return {'status': 'unknown', 'reason': 'Owner record missing; manual process inspection required', 'record': None}
     matches = {k: live_identity(record.get(k+'_pid'),record.get(k+'_identity')) for k in ('guard','pi')}
+    if IS_WINDOWS and all(v is False for v in matches.values()) and (record.get('spawning') or record.get('descendants_cleanup')=='pending'):
+        record=publish_job_cleanup(directory,record.get('generation')) or record
     if record.get('spawning') or any(v is None for v in matches.values()):
         return {'status': 'unknown', 'reason': 'Cannot safely prove orphan process identity', 'record': record}
     if any(matches.values()):
         return {'status': 'live', 'reason': 'A verified session owner is still running', 'record': record}
-    if record.get('guard_pid') and group_members(record['guard_pid']):
+    survivors=members(record['guard_pid']) if record.get('guard_pid') else []
+    if survivors is None:
+        return {'status':'unknown','reason':'Cannot query the old process group/job','record':record}
+    if survivors:
         return {'status': 'unknown', 'reason': 'A process group remains but its leaders cannot be verified; manual inspection required', 'record': record}
     if record.get('descendants_cleanup','verified')!='verified':
         return {'status': 'unknown', 'reason': 'Guard exited without confirming descendant cleanup; manual inspection required', 'record': record}
     return {'status': 'gone', 'reason': 'Verified leaders are dead and no process group remains', 'record': record}
 
-async def stop_group(pgid,graceful_guard=False):
-    """Signal and verify a group whose ownership the caller has already proved."""
-    for sig,wait in ((signal.SIGTERM,1.5),(signal.SIGKILL,1.0)):
-        if not group_members(pgid): break
+async def stop_group(pgid, graceful_guard=False, identity=None):
+    """Stop and verify an already-owned group.
+
+    graceful_guard selects POSIX signal forwarding only. Windows has no TERM;
+    explicit interruption terminates the Job, including detached descendants.
+    """
+    if IS_WINDOWS:
+        # Open before checking identity, then retain that exact Job throughout
+        # termination. A later lookup by PID could resolve a replacement guard.
+        until = time.monotonic() + 8.0
+        try:
+            while time.monotonic() < until:
+                with windows.Job(pgid) as job:
+                    match = await asyncio.to_thread(live_identity, pgid, identity)
+                    if match is not True:
+                        return "verified" if match is False and job.members() == [] else "unknown"
+                    if job.handle is not None:
+                        while time.monotonic() < until:
+                            job.terminate(1)
+                            if job.members() == [] and live_identity(pgid, identity) is False:
+                                return "verified"
+                            await asyncio.sleep(0.05)
+                await asyncio.sleep(0.05)  # Guard has not created its Job yet.
+        except (windows.JobUnavailable, OSError):
+            return "unknown"
+        return "unknown"
+    for sig, wait in ((signal.SIGTERM, 1.5), (signal.SIGKILL, 1.0)):
+        if await asyncio.to_thread(members, pgid) == []:
+            break
         # A current guard forwards TERM and reaps tools; avoid sending Pi a
         # duplicate signal while its once-only shutdown handler is disposing.
         with contextlib.suppress(ProcessLookupError):
-            if graceful_guard and sig==signal.SIGTERM: os.kill(pgid,signal.SIGCONT)
-            (os.kill if graceful_guard and sig==signal.SIGTERM else os.killpg)(pgid,sig)
-        until=time.monotonic()+wait
-        while group_members(pgid) and time.monotonic()<until: await asyncio.sleep(.025)
-    return 'unknown' if group_members(pgid) else 'verified'
+            if graceful_guard and sig == signal.SIGTERM:
+                os.kill(pgid, signal.SIGCONT)
+            (os.kill if graceful_guard and sig == signal.SIGTERM else os.killpg)(pgid, sig)
+        until = time.monotonic() + wait
+        while time.monotonic() < until:
+            current = await asyncio.to_thread(members, pgid)
+            if current == []:
+                break
+            if current is None:
+                return "unknown"
+            await asyncio.sleep(0.025)
+    return "verified" if await asyncio.to_thread(members, pgid) == [] else "unknown"
 
 async def stop_owned_process(directory, agent, proc):
     """A just-spawned guard still needs identity proof before group signalling."""
-    pgid=proc.pid
-    owned=live_identity(pgid,agent.get('identity')) is True
+    pgid = proc.pid
+    # The daemon spawned this process, so its PID is the owner even before the
+    # ledger row is updated with it. Without a recorded identity only an owner
+    # record naming exactly this PID can prove the group is ours.
+    agent = {**agent, "pid": agent.get("pid") or pgid}
+    owned = live_identity(pgid, agent.get("identity")) is True
+    record = ownership(directory, agent).get("record") or {}
+    identity = record.get("guard_identity") if record.get("guard_pid") == pgid else agent.get("identity")
     if not owned:
-        owned=ownership(directory,agent)['status']=='live'
-    if not owned and group_members(pgid):
-        return 'unknown',False
-    record=ownership(directory,agent)['record'] or {}
-    guarded=(record.get('guard_pid')==pgid and 'descendants_cleanup' in record
-        and live_identity(pgid,record.get('guard_identity')) is True)
-    cleanup=await stop_group(pgid,graceful_guard=guarded)
-    with contextlib.suppress(asyncio.TimeoutError): await asyncio.wait_for(proc.wait(),2)
-    if cleanup=='verified' and ownership(directory,agent)['status']!='gone': cleanup='unknown'
-    return cleanup,True
+        owned = record.get("guard_pid") == pgid and live_identity(pgid, identity) is True
+    if not owned and await asyncio.to_thread(members, pgid) != []:
+        return "unknown", False
+    guarded = (
+        record.get("guard_pid") == pgid
+        and "descendants_cleanup" in record
+        and live_identity(pgid, identity) is True
+    )
+    cleanup = await stop_group(pgid, graceful_guard=guarded, identity=identity)
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(proc.wait(), 2)
+    # An empty group whose leader is still alive proves nothing (on Windows the
+    # job may simply not exist yet), so require the owner itself to be gone.
+    if cleanup == "verified" and live_identity(pgid, identity) is not False:
+        cleanup = "unknown"
+    if cleanup == "verified":
+        publish_job_cleanup(directory, record.get("generation"))
+        if ownership(directory, agent)["status"] != "gone":
+            cleanup = "unknown"
+    return cleanup, True
 
 async def terminate(directory, w):
     w.stopping=True
@@ -466,5 +599,6 @@ async def reap_orphan(directory, a):
     if not pgid: raise AgentError('ownership_unknown','No verified process group')
     record=verdict['record']
     guarded=('descendants_cleanup' in record and live_identity(pgid,record.get('guard_identity')) is True)
-    cleanup=await stop_group(pgid,graceful_guard=guarded)
+    cleanup=await stop_group(pgid,graceful_guard=guarded,identity=record.get('guard_identity'))
+    if cleanup=='verified': publish_job_cleanup(directory,record.get('generation'))
     return cleanup if ownership(directory,a)['status']=='gone' else 'unknown'

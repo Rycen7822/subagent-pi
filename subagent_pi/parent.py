@@ -4,16 +4,14 @@ each invocation, so retrying could start two parent turns.
 """
 from __future__ import annotations
 import asyncio
-import contextlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import uuid
 
-from .common import AgentError, dumps, group_members, read_frame
+from .common import AgentError, dumps, read_frame
 
 QUEUE_TIMEOUT_SECONDS=30
 RECALL_TIMEOUT_SECONDS=10
@@ -225,16 +223,24 @@ class ParentNotifications:
                                (outcome,queued_id,error,notice['id']))
 
 
+def notification_environment(parent):
+    from .common import IS_WINDOWS
+    base={k:v for k,v in os.environ.items() if k.upper() in {
+        'SYSTEMROOT','WINDIR','COMSPEC','PATHEXT','USERPROFILE','APPDATA','LOCALAPPDATA','TEMP','TMP'}} if IS_WINDOWS else {}
+    return {**base,'HOME':parent['home'],'CODEX_HOME':parent['codex_home'],'PATH':parent['path'],
+            'LANG':os.environ.get('LANG','C.UTF-8')}
+
+
 async def enqueue(parent, message):
     """Submit one Codex queue message and verify its receipt; uncertain sends are never retried."""
     proc=None; outcome='unknown'; queued_id=None; error=None
     try:
         if not parent['command']: raise FileNotFoundError('Codex executable was not found when the scope opened')
-        env={'HOME':parent['home'],'CODEX_HOME':parent['codex_home'],'PATH':parent['path'],
-             'LANG':os.environ.get('LANG','C.UTF-8')}
-        proc=await asyncio.create_subprocess_exec(parent['command'],'queue','--thread',parent['thread_id'],'--message',message,
+        env=notification_environment(parent)
+        from .processes import spawn
+        proc=await spawn(parent['command'],'queue','--thread',parent['thread_id'],'--message',message,
             cwd=parent['home'],env=env,stdin=asyncio.subprocess.DEVNULL,stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,start_new_session=True)
+            stderr=asyncio.subprocess.DEVNULL)
         output,_=await asyncio.wait_for(proc.communicate(),QUEUE_TIMEOUT_SECONDS)
         match=re.search(rb'Queued message ([^\s]+) for thread ([^\s]+)\.',output)
         if proc.returncode==0 and match and match[2].decode()==parent['thread_id']:
@@ -255,12 +261,12 @@ async def recall(parent, queued_id):
     proc=None
     try:
         if not parent['command'] or not queued_id: raise ValueError('No trusted queue receipt')
-        env={'HOME':parent['home'],'CODEX_HOME':parent['codex_home'],'PATH':parent['path'],
-             'LANG':os.environ.get('LANG','C.UTF-8')}
+        env=notification_environment(parent)
         async with asyncio.timeout(RECALL_TIMEOUT_SECONDS):
-            proc=await asyncio.create_subprocess_exec(parent['command'],'app-server','--stdio',
+            from .processes import spawn
+            proc=await spawn(parent['command'],'app-server','--stdio',
                 cwd=parent['home'],env=env,stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,start_new_session=True)
+                stderr=asyncio.subprocess.DEVNULL)
             async def rpc(identifier, method, params):
                 proc.stdin.write((dumps({'id':identifier,'method':method,'params':params})+'\n').encode())
                 await proc.stdin.drain()
@@ -283,15 +289,5 @@ async def recall(parent, queued_id):
 
 
 async def finish_process(proc):
-    if not proc: return
-    # Both queue and recall own their process groups, including wrapper children.
-    if group_members(proc.pid):
-        with contextlib.suppress(ProcessLookupError): os.killpg(proc.pid,signal.SIGKILL)
-    try:
-        await asyncio.wait_for(proc.communicate(),2)
-    except (asyncio.TimeoutError,RuntimeError):
-        for fd in (1,2):
-            pipe=proc._transport.get_pipe_transport(fd)
-            if pipe: pipe.close()
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(proc.wait(),1)
+    from .processes import finish
+    await finish(proc)

@@ -6,7 +6,7 @@ description: Delegate bounded work to persistent Pi agents; message, follow up, 
 # Subagent Pi
 
 Use advertised Pi MCP tools for daily control; CLI for scope management, explicit unloading and recovery. Legacy tools are explicit management calls, not the daily catalog.
-On an unbound connection, pi_spawn_agent with the actual absolute Codex workspace cwd opens/binds a scope. To resume or address another scope, pass its ID explicitly; this does not replace the connection default. Another parent's results remain readable, but new work uses your own scope. Never infer cwd from the server.
+On an unbound connection, pi_spawn_agent with the actual absolute Codex workspace cwd opens/binds a scope. To resume or address another scope, pass its ID explicitly; this does not replace the connection default. Another parent's results remain readable, but new work uses your own scope. Never infer cwd from the server. Use absolute paths native to the runtime (Windows or Linux/WSL); see installation guidance for Windows CLI launchers.
 Children read the scope's SUBAGENT-PI.md and Pi global context, even when child cwd differs; a new boot reloads them.
 Follow the user's delegation policy; do not add automatic reviews.
 Choose a scope-unique role/task name. Operations accept ID or name; ambiguity is rejected.

@@ -2,8 +2,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import array
-import fcntl
-import termios
 import json
 import os
 import re
@@ -16,12 +14,15 @@ import struct
 import sys
 import tempfile
 import unittest
+if sys.platform != "win32":
+    import fcntl
+    import termios
 from unittest import mock
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
 from subagent_pi.client import request
-from subagent_pi import PROTOCOL_VERSION
-from subagent_pi.common import AgentError, TERMINAL, group_members, socket_path
+from subagent_pi import PROTOCOL_VERSION, ipc
+from subagent_pi.common import AgentError, TERMINAL, group_members, socket_path, process_identity, live_identity
 
 class McpHarness:
     """MCP stdio boundary over a real daemon, shared by the fake-Pi IPC tests and
@@ -40,10 +41,27 @@ class McpHarness:
             try: await asyncio.wait_for(self.mcp.wait(),3)
             except asyncio.TimeoutError: self.mcp.kill(); await self.mcp.wait()
         if self.stderr_task: await asyncio.gather(self.stderr_task,return_exceptions=True)
-        with contextlib.suppress(AgentError): await request(self.home,'shutdown',{'force':True},autostart=False)
-        until=asyncio.get_running_loop().time()+8
-        while socket_path(self.home).exists() and asyncio.get_running_loop().time()<until: await asyncio.sleep(.05)
-        self.tmp.cleanup()
+        await self.stop_daemon()
+        for attempt in range(40):
+            try:
+                self.tmp.cleanup(); break
+            except PermissionError:
+                if attempt==39: raise
+                await asyncio.sleep(.05)
+    async def stop_daemon(self):
+        try: pid=(await request(self.home,'ping',{},autostart=False))['pid']
+        except AgentError as exc:
+            if exc.code=='daemon_unavailable': return
+            raise
+        identity=process_identity(pid)
+        await request(self.home,'shutdown',{'force':True},autostart=False)
+        until=asyncio.get_running_loop().time()+45
+        while live_identity(pid,identity) is not False and asyncio.get_running_loop().time()<until:
+            await asyncio.sleep(.05)
+        if live_identity(pid,identity) is not False:
+            self.tmp._finalizer.detach()
+            self.fail('Owned daemon did not finish shutdown; retained '+str(self.home))
+        self.assertFalse(ipc.exists(self.home),'Daemon left its IPC endpoint behind')
     async def open_scope(self):
         return (await request(self.home,'scope_open',{'cwd':str(self.workspace)}))['scope']
     async def spawn(self,sid,task='delay=0.2|transport'):
@@ -523,9 +541,7 @@ class TransportTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         sid=await self.open_scope(); a=await self.spawn(sid)
         await request(self.home,'wait',{'scope':sid,'run_ids':[a['run_id']],'timeout_seconds':4})
         first=await request(self.home,'result',{'scope':sid,'run_id':a['run_id']})
-        await request(self.home,'shutdown',{'force':True})
-        until=asyncio.get_running_loop().time()+8
-        while socket_path(self.home).exists() and asyncio.get_running_loop().time()<until: await asyncio.sleep(.05)
+        await self.stop_daemon()
         second=await request(self.home,'result',{'scope':sid,'run_id':a['run_id']})
         self.assertEqual(first['result_sha256'],second['result_sha256'])
         listing=await request(self.home,'list',{'scope':sid})
@@ -628,7 +644,16 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         await super().asyncSetUp()
         self.pi_home=self.root/'userhome'; self.pi_home.mkdir()
         self.pi_agent=self.root/'agent'; self.pi_agent.mkdir()
-        (self.pi_agent/'settings.json').write_text(json.dumps({'compaction':{'enabled':False},'retry':{'enabled':False}}))
+        settings={'compaction':{'enabled':False},'retry':{'enabled':False}}
+        if sys.platform=='win32':
+            standard=[Path(os.environ[key])/'Git/bin/bash.exe' for key in ('PROGRAMFILES','PROGRAMFILES(X86)') if os.environ.get(key)]
+            git=shutil.which('git')
+            # Old SDKs require explicit settings for nonstandard Git installs.
+            # Keep that host setup inside this fixture's isolated Pi directory.
+            if not any(path.is_file() for path in standard) and git:
+                bash=Path(git).parent.parent/'bin/bash.exe'
+                if bash.is_file(): settings['shellPath']=str(bash)
+        (self.pi_agent/'settings.json').write_text(json.dumps(settings))
         self.enterContext(mock.patch.dict(os.environ, {
             'HOME':str(self.pi_home), 'PI_CODING_AGENT_DIR':str(self.pi_agent)}))
 
@@ -671,6 +696,42 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.05)
         raise AssertionError(f'{text!r} x{count} not observed in {path} within {timeout}s')
 
+    async def test_builtin_read_and_bash_execute_in_the_managed_environment(self):
+        self.write_config(PI_MOCK_BUILTIN_TOOLS='"1"')
+        config=self.home/'config.toml'
+        config.write_text(config.read_text().replace('[profiles.reader]\n','[profiles.reader]\ntools=["read","bash"]\n'))
+        (self.workspace/'native marker.txt').write_text('NATIVE_READ_OK 中文',encoding='utf-8')
+        await self.initialize()
+        run=await self.tool('pi_spawn_agent',{'cwd':str(self.workspace),'access':'write','profile':'reader',
+            'task':'offline builtin tools','request_id':'builtins'})
+        await self.finished_runs([run['run_id']])
+        result=await self.tool('pi_agent_result',{'run_id':run['run_id']})
+        records=json.loads(result['text'].split('BUILTIN_RESULTS=',1)[1])
+        self.assertEqual([r['toolName'] for r in records],['read','bash'])
+        for record,marker in zip(records,['NATIVE_READ_OK 中文','NATIVE_BASH_OK']):
+            self.assertFalse(record.get('isError'),record)
+            self.assertIn(marker,'\n'.join(c.get('text','') for c in record['content']))
+
+    async def test_required_inherited_mcp_uses_private_bootstrap_and_owned_process(self):
+        self.write_config()
+        config=self.home/'config.toml'
+        config.write_text(config.read_text().replace('enabled = false','enabled = true'))
+        codex=self.root/'codex'; codex.mkdir()
+        events=self.root/'inherited-events.jsonl'
+        (codex/'config.toml').write_text('[mcp_servers.local]\ncommand = '+json.dumps(sys.executable)+'\nargs = '+json.dumps([str(ROOT/'tests/fake_mcp_stdio.py')])+'\nrequired = true\n[mcp_servers.local.env]\nFAKE_MCP_EVENTS = '+json.dumps(str(events))+'\n',encoding='utf-8')
+        self.mcp_env={'CODEX_HOME':str(codex)}
+        await self.initialize()
+        a=await self.tool('pi_spawn_agent',{'cwd':str(self.workspace),'task':'offline inherited MCP','access':'read','request_id':'inherited'})
+        await self.finished_runs([a['run_id']])
+        rows=[json.loads(line) for line in events.read_text().splitlines()]
+        self.assertTrue(any(e.get('event')=='tools-list-received' for e in rows),rows)
+        pid=next(e['pid'] for e in rows if e['event']=='server-start')
+        from subagent_pi.common import process_identity,live_identity
+        stamp=process_identity(pid)
+        self.assertIsNotNone(stamp)
+        await self.tool('pi_close_agent',{'agent_id':a['agent_id'],'request_id':'inherited-close'})
+        self.assertIs(live_identity(pid,stamp),False)
+
     async def test_managed_context_uses_codex_scope_and_refreshes_on_new_boot(self):
         self.write_config(PI_MOCK_WIRE='"1"')
         other=self.root/'other-workspace'; other.mkdir()
@@ -696,7 +757,7 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
             return json.loads(lines[-1].split(' ',2)[2])
 
         first=await start('context-first')
-        self.assertEqual(first['cwd'],str(other))
+        self.assertEqual(Path(first['cwd']),other.resolve())
         first_wire=latest_wire(first)
         initial=first_wire['forced']
         self.assertIn('GLOBAL_PI_CONTEXT_MARKER',initial,first_wire)
@@ -712,7 +773,7 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
 
         await self.tool('pi_close_agent',{'scope':scope,'agent_id':first['agent_id'],'request_id':'context-close'})
         # Simulate an agent whose durable launch snapshot predates this policy.
-        with sqlite3.connect(self.home/'registry.sqlite') as db:
+        with contextlib.closing(sqlite3.connect(self.home/'registry.sqlite')) as db, db:
             old=json.loads(db.execute('SELECT launch FROM agents WHERE id=?',(first['agent_id'],)).fetchone()[0])
             context_path=str(ROOT/'extensions/managed-context.ts')
             index=old['argv'].index(context_path)
@@ -865,6 +926,7 @@ class LivePiLifecycleTests(McpHarness, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kinds.count('agent_end'),2)
         self.assertEqual(kinds.count('run_terminal'),2)
 
+    @unittest.skipIf(sys.platform=='win32','POSIX SIGSTOP fault injection; bounded protocol output is checked separately')
     async def sdk_output_backpressure(self,critical):
         release=self.root/'release-tool'; report=self.root/'output-buffer.json'
         self.write_config(PI_MOCK_TOOL_MS='"10"',PI_MOCK_TOOL_RELEASE=json.dumps(str(release)),
